@@ -149,6 +149,13 @@ pub fn build(b: *std.Build) void {
     module_bls.linkLibrary(dep_blst.artifact("blst"));
     b.modules.put(b.dupe("bls"), module_bls) catch @panic("OOM");
 
+    const module_discv5 = b.createModule(.{
+        .root_source_file = b.path("src/discv5/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.modules.put(b.dupe("discv5"), module_discv5) catch @panic("OOM");
+
     const module_state_transition = b.createModule(.{
         .root_source_file = b.path("src/state_transition/root.zig"),
         .target = target,
@@ -680,6 +687,20 @@ pub fn build(b: *std.Build) void {
     const tls_run_test_bls = b.step("test:bls", "Run the bls test");
     tls_run_test_bls.dependOn(&run_test_bls.step);
     tls_run_test.dependOn(&run_test_bls.step);
+
+    const test_discv5 = b.addTest(.{
+        .name = "discv5",
+        .root_module = module_discv5,
+        .filters = b.option([][]const u8, "discv5.filters", "discv5 test filters") orelse &[_][]const u8{},
+    });
+    const install_test_discv5 = b.addInstallArtifact(test_discv5, .{});
+    const tls_install_test_discv5 = b.step("build-test:discv5", "Install the discv5 test");
+    tls_install_test_discv5.dependOn(&install_test_discv5.step);
+
+    const run_test_discv5 = b.addRunArtifact(test_discv5);
+    const tls_run_test_discv5 = b.step("test:discv5", "Run the discv5 test");
+    tls_run_test_discv5.dependOn(&run_test_discv5.step);
+    tls_run_test.dependOn(&run_test_discv5.step);
 
     const test_state_transition = b.addTest(.{
         .name = "state_transition",
