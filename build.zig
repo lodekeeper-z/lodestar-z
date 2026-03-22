@@ -503,6 +503,29 @@ pub fn build(b: *std.Build) void {
     const tls_run_exe_bench_process_epoch = b.step("run:bench_process_epoch", "Run the bench_process_epoch executable");
     tls_run_exe_bench_process_epoch.dependOn(&run_exe_bench_process_epoch.step);
 
+
+    const module_bench_stfn = b.createModule(.{
+        .root_source_file = b.path("bench/state_transition/stfn.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.modules.put(b.dupe("bench_stfn"), module_bench_stfn) catch @panic("OOM");
+
+    const exe_bench_stfn = b.addExecutable(.{
+        .name = "bench_stfn",
+        .root_module = module_bench_stfn,
+    });
+
+    const install_exe_bench_stfn = b.addInstallArtifact(exe_bench_stfn, .{});
+
+    const tls_install_exe_bench_stfn = b.step("build-exe:bench_stfn", "Install the bench_stfn executable");
+    tls_install_exe_bench_stfn.dependOn(&install_exe_bench_stfn.step);
+    b.getInstallStep().dependOn(&install_exe_bench_stfn.step);
+
+    const run_exe_bench_stfn = b.addRunArtifact(exe_bench_stfn);
+    if (b.args) |args| run_exe_bench_stfn.addArgs(args);
+    const tls_run_exe_bench_stfn = b.step("run:bench_stfn", "Run the bench_stfn executable");
+    tls_run_exe_bench_stfn.dependOn(&run_exe_bench_stfn.step);
     const module_bindings = b.createModule(.{
         .root_source_file = b.path("bindings/napi/root.zig"),
         .target = target,
@@ -905,6 +928,20 @@ pub fn build(b: *std.Build) void {
     tls_run_test_bench_process_epoch.dependOn(&run_test_bench_process_epoch.step);
     tls_run_test.dependOn(&run_test_bench_process_epoch.step);
 
+    const test_bench_stfn = b.addTest(.{
+        .name = "bench_stfn",
+        .root_module = module_bench_stfn,
+        .filters = b.option([][]const u8, "bench_stfn.filters", "bench_stfn test filters") orelse &[_][]const u8{},
+    });
+    const install_test_bench_stfn = b.addInstallArtifact(test_bench_stfn, .{});
+    const tls_install_test_bench_stfn = b.step("build-test:bench_stfn", "Install the bench_stfn test");
+    tls_install_test_bench_stfn.dependOn(&install_test_bench_stfn.step);
+
+    const run_test_bench_stfn = b.addRunArtifact(test_bench_stfn);
+    const tls_run_test_bench_stfn = b.step("test:bench_stfn", "Run the bench_stfn test");
+    tls_run_test_bench_stfn.dependOn(&run_test_bench_stfn.step);
+    tls_run_test.dependOn(&run_test_bench_stfn.step);
+
     const test_bindings = b.addTest(.{
         .name = "bindings",
         .root_module = module_bindings,
@@ -1151,6 +1188,15 @@ pub fn build(b: *std.Build) void {
     module_bench_process_epoch.addImport("persistent_merkle_tree", module_persistent_merkle_tree);
     module_bench_process_epoch.addImport("download_era_options", options_module_download_era_options);
     module_bench_process_epoch.addImport("era", module_era);
+
+    module_bench_stfn.addImport("state_transition", module_state_transition);
+    module_bench_stfn.addImport("fork_types", module_fork_types);
+    module_bench_stfn.addImport("consensus_types", module_consensus_types);
+    module_bench_stfn.addImport("config", module_config);
+    module_bench_stfn.addImport("zbench", dep_zbench.module("zbench"));
+    module_bench_stfn.addImport("persistent_merkle_tree", module_persistent_merkle_tree);
+    module_bench_stfn.addImport("download_era_options", options_module_download_era_options);
+    module_bench_stfn.addImport("era", module_era);
 
     module_bindings.addImport("bls", module_bls);
     module_bindings.addImport("persistent_merkle_tree", module_persistent_merkle_tree);
