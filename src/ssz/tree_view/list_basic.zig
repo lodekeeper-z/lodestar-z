@@ -1001,3 +1001,54 @@ test "ListBasicTreeView - sliceTo and serialize" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2 }, serialized);
     try std.testing.expectEqual(@as(usize, 2), try sliced.length());
 }
+
+test "transfer_cache repeated clone-modify-commit-deinit preserves seed (list basic)" {
+    // Regression test: verifies that clone(transfer_cache=true) followed by
+    // modification, commit, and deinit of the clone does not corrupt the seed's
+    // backing tree. Previously, clearChildrenNodesCache would incorrectly free
+    // pool nodes with refcount 0 that were still reachable from the seed's root
+    // via structural sharing.
+    const allocator = std.testing.allocator;
+    var pool = try Node.Pool.init(allocator, 10_000);
+    defer pool.deinit();
+
+    const Uint64 = UintType(64);
+    const ListType = FixedListType(Uint64, 128);
+
+    // Build seed list
+    var list_value: ListType.Type = .empty;
+    defer list_value.deinit(allocator);
+    for (0..8) |i| try list_value.append(allocator, @intCast(i * 10));
+
+    const root = try ListType.tree.fromValue(&pool, &list_value);
+    var seed = try ListType.TreeView.init(allocator, &pool, root);
+    defer seed.deinit();
+
+    // Warm the cache — access all elements
+    for (0..8) |i| _ = try seed.get(i);
+
+    // Commit to establish the seed's root
+    try seed.commit();
+    const seed_root = seed.chunks.state.root.getRoot(&pool).*;
+
+    // Clone-modify-commit-deinit loop
+    for (0..5) |iteration| {
+        var cloned = try seed.clone(.{ .transfer_cache = true });
+        errdefer cloned.deinit();
+
+        // Modify some elements
+        try cloned.set(0, @as(u64, 1000 + @as(u64, @intCast(iteration))));
+        try cloned.set(3, @as(u64, 2000 + @as(u64, @intCast(iteration))));
+        try cloned.commit();
+        cloned.deinit();
+
+        // Verify seed's root hash is preserved
+        const current_root = seed.chunks.state.root.getRoot(&pool).*;
+        try std.testing.expectEqualSlices(u8, &seed_root, &current_root);
+
+        // Verify seed values are still correct
+        try std.testing.expectEqual(@as(u64, 0), try seed.get(0));
+        try std.testing.expectEqual(@as(u64, 30), try seed.get(3));
+        try std.testing.expectEqual(@as(u64, 70), try seed.get(7));
+    }
+}

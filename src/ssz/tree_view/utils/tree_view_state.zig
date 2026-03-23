@@ -48,6 +48,13 @@ pub const TreeViewState = struct {
     }
 
     pub fn setChildNode(self: *TreeViewState, gindex: Gindex, node: Node.Id) !void {
+        // Check if this gindex was already marked changed BEFORE marking it.
+        // If it was, the old node in children_nodes was placed by a prior setChildNode
+        // call (an uncommitted newly-allocated node) and is now orphaned — free it.
+        // If it wasn't, the old node was placed by getChildNode (a borrowed reference
+        // navigated from the tree) and must NOT be freed — its lifetime is managed
+        // by the tree structure, not individual refcounts.
+        const was_changed = self.changed.contains(gindex);
         try self.changed.put(self.allocator, gindex, {});
         const opt_old_node = try self.children_nodes.fetchPut(
             self.allocator,
@@ -55,7 +62,7 @@ pub const TreeViewState = struct {
             node,
         );
         if (opt_old_node) |old_node| {
-            if (old_node.value.getState(self.pool).getRefCount() == 0) {
+            if (was_changed) {
                 self.pool.unref(old_node.value);
             }
         }
@@ -89,10 +96,14 @@ pub const TreeViewState = struct {
     }
 
     pub fn clearChildrenNodesCache(self: *TreeViewState) void {
-        var value_iter = self.children_nodes.valueIterator();
-        while (value_iter.next()) |node_id_ptr| {
-            const node_id = node_id_ptr.*;
-            if (node_id.getState(self.pool).getRefCount() == 0) {
+        // Only unref nodes that were placed by setChildNode (tracked in `changed`)
+        // and haven't been committed yet. These are owned, uncommitted nodes.
+        // Nodes placed by getChildNode are borrowed references navigated from the
+        // tree — their lifetime is managed by the tree structure (parent→child refs),
+        // not by individual refcounts. Freeing them corrupts live trees that share
+        // those subtrees via structural sharing.
+        for (self.changed.keys()) |gindex| {
+            if (self.children_nodes.get(gindex)) |node_id| {
                 self.pool.unref(node_id);
             }
         }

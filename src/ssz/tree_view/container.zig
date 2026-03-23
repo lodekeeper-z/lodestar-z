@@ -974,3 +974,119 @@ test "ContainerTreeView - serialize (with nested list)" {
     const expected_root = [_]u8{ 0xdc, 0x36, 0x19, 0xcb, 0xbc, 0x5e, 0xf0, 0xe0, 0xa3, 0xb3, 0x8e, 0x3c, 0xa5, 0xd3, 0x1c, 0x2b, 0x16, 0x86, 0x8e, 0xac, 0xb6, 0xe4, 0xbc, 0xf8, 0xb4, 0x51, 0x09, 0x63, 0x35, 0x43, 0x15, 0xf5 };
     try std.testing.expectEqualSlices(u8, &expected_root, &hash_root);
 }
+
+test "transfer_cache repeated clone-modify-commit-deinit preserves seed" {
+    const allocator = std.testing.allocator;
+    var pool = try Node.Pool.init(allocator, 100_000);
+    defer pool.deinit();
+
+    const Uint64 = UintType(64);
+    const Roots = FixedVectorType(Uint64, 64);
+
+    const TestState = FixedContainerType(struct {
+        slot: Uint64,
+        state_roots: Roots,
+        block_roots: Roots,
+    });
+
+    // Create initial state
+    var initial_value: TestState.Type = undefined;
+    initial_value.slot = 100;
+    for (&initial_value.state_roots) |*r| r.* = 0;
+    for (&initial_value.block_roots) |*r| r.* = 0;
+
+    const root = try TestState.tree.fromValue(&pool, &initial_value);
+    var seed = try TestState.TreeView.init(allocator, &pool, root);
+    defer seed.deinit();
+
+    // Warm: modify and commit (like processSlots warmup)
+    {
+        var state_roots = try seed.get("state_roots");
+        try state_roots.set(0, 0xAA);
+        var block_roots = try seed.get("block_roots");
+        try block_roots.set(0, 0xBB);
+        try seed.set("slot", 101);
+    }
+    try seed.commit();
+
+    const seed_hash = seed.root.getRoot(&pool).*;
+
+    // Clone-modify-commit-deinit loop with transfer_cache=true
+    for (0..5) |i| {
+        var cloned = try seed.clone(.{ .transfer_cache = true });
+        errdefer cloned.deinit();
+
+        // Modify like processSlot
+        try cloned.set("slot", @as(u64, 101 + @as(u64, @intCast(i)) + 1));
+        var cloned_state_roots = try cloned.get("state_roots");
+        try cloned_state_roots.set(@intCast(1 + i), @as(u64, @intCast(i + 1)));
+
+        try cloned.commit();
+        cloned.deinit();
+
+        // Verify seed integrity
+        const current_seed_hash = seed.root.getRoot(&pool).*;
+        try std.testing.expectEqualSlices(u8, &seed_hash, &current_seed_hash);
+
+        // Verify seed slot still correct
+        const current_slot = try seed.get("slot");
+        try std.testing.expectEqual(@as(u64, 101), current_slot);
+    }
+}
+
+test "transfer_cache with composite children preserves seed" {
+    const allocator = std.testing.allocator;
+    var pool = try Node.Pool.init(allocator, 100_000);
+    defer pool.deinit();
+
+    const Uint64 = UintType(64);
+
+    const Inner = FixedContainerType(struct {
+        x: Uint64,
+        y: Uint64,
+    });
+
+    const Outer = FixedContainerType(struct {
+        slot: Uint64,
+        header: Inner,
+    });
+
+    var initial_value: Outer.Type = .{ .slot = 100, .header = .{ .x = 1, .y = 2 } };
+    const root = try Outer.tree.fromValue(&pool, &initial_value);
+    var seed = try Outer.TreeView.init(allocator, &pool, root);
+    defer seed.deinit();
+
+    // Warm: access composite child, modify, commit
+    {
+        var header = try seed.get("header");
+        try header.set("x", 10);
+        try seed.set("slot", 101);
+    }
+    try seed.commit();
+
+    const seed_hash = seed.root.getRoot(&pool).*;
+
+    // Clone-modify-commit-deinit loop
+    for (0..5) |i| {
+        var cloned = try seed.clone(.{ .transfer_cache = true });
+        errdefer cloned.deinit();
+
+        try cloned.set("slot", @as(u64, 101 + @as(u64, @intCast(i)) + 1));
+        var cloned_header = try cloned.get("header");
+        try cloned_header.set("y", @as(u64, 100 + @as(u64, @intCast(i))));
+
+        try cloned.commit();
+        cloned.deinit();
+
+        // Verify seed integrity
+        const current_seed_hash = seed.root.getRoot(&pool).*;
+        try std.testing.expectEqualSlices(u8, &seed_hash, &current_seed_hash);
+
+        const current_slot = try seed.get("slot");
+        try std.testing.expectEqual(@as(u64, 101), current_slot);
+
+        var header = try seed.get("header");
+        const x_val = try header.get("x");
+        try std.testing.expectEqual(@as(u64, 10), x_val);
+    }
+}
