@@ -880,3 +880,8 @@ pub const EpochCache = struct {
         return self.epoch >= self.config.chain.ELECTRA_FORK_EPOCH;
     }
 };
+
+// Pull in unit tests from the companion test file.
+comptime {
+    _ = @import("epoch_cache_test.zig");
+}
