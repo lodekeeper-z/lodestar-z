@@ -630,6 +630,13 @@ pub const BeaconMetrics = struct {
     processor_queue_depth: GaugeVec(u64, ProcessorQueueLabels),
     processor_items_processed_total: CounterVec(u64, ProcessorWorkTypeLabels),
     processor_processing_time_ns_total: CounterVec(u64, ProcessorWorkTypeLabels),
+    p2p_runtime_current_stage: GaugeU64,
+    p2p_runtime_current_stage_started_awake_ns: GaugeU64,
+    p2p_runtime_current_stage_started_unix_ms: GaugeU64,
+    p2p_runtime_last_completed_stage: GaugeU64,
+    p2p_runtime_last_stage_duration_ns: GaugeU64,
+    p2p_runtime_stage_entries_total: Counter(u64),
+    p2p_runtime_stage_completions_total: Counter(u64),
 
     // Block production.
     block_production_requests_total: CounterVec(u64, BlockProductionModeLabels),
@@ -2288,6 +2295,41 @@ pub const BeaconMetrics = struct {
                 .{ .help = "Cumulative processor handling time in nanoseconds by work type." },
                 ro,
             ),
+            .p2p_runtime_current_stage = GaugeU64.init(
+                "beacon_p2p_runtime_current_stage",
+                .{ .help = "Current main P2P runtime loop stage id; zero means idle between stages." },
+                ro,
+            ),
+            .p2p_runtime_current_stage_started_awake_ns = GaugeU64.init(
+                "beacon_p2p_runtime_current_stage_started_awake_ns",
+                .{ .help = "Awake monotonic timestamp when the current main P2P runtime loop stage started." },
+                ro,
+            ),
+            .p2p_runtime_current_stage_started_unix_ms = GaugeU64.init(
+                "beacon_p2p_runtime_current_stage_started_unix_ms",
+                .{ .help = "Unix timestamp in milliseconds when the current main P2P runtime loop stage started." },
+                ro,
+            ),
+            .p2p_runtime_last_completed_stage = GaugeU64.init(
+                "beacon_p2p_runtime_last_completed_stage",
+                .{ .help = "Most recently completed main P2P runtime loop stage id." },
+                ro,
+            ),
+            .p2p_runtime_last_stage_duration_ns = GaugeU64.init(
+                "beacon_p2p_runtime_last_stage_duration_ns",
+                .{ .help = "Duration of the most recently completed main P2P runtime loop stage in nanoseconds." },
+                ro,
+            ),
+            .p2p_runtime_stage_entries_total = Counter(u64).init(
+                "beacon_p2p_runtime_stage_entries_total",
+                .{ .help = "Total main P2P runtime loop stage entries." },
+                ro,
+            ),
+            .p2p_runtime_stage_completions_total = Counter(u64).init(
+                "beacon_p2p_runtime_stage_completions_total",
+                .{ .help = "Total main P2P runtime loop stage completions." },
+                ro,
+            ),
 
             .block_production_requests_total = try CounterVec(u64, BlockProductionModeLabels).init(
                 allocator,
@@ -3067,6 +3109,29 @@ pub const BeaconMetrics = struct {
         elapsed_seconds: f64,
     ) void {
         self.kzg_verification_data_column_batch_seconds.observe(elapsed_seconds);
+    }
+
+    pub fn observeP2pRuntimeStageEnter(
+        self: *BeaconMetrics,
+        stage_id: u64,
+        started_awake_ns: u64,
+        started_unix_ms: u64,
+    ) void {
+        self.p2p_runtime_current_stage.set(stage_id);
+        self.p2p_runtime_current_stage_started_awake_ns.set(started_awake_ns);
+        self.p2p_runtime_current_stage_started_unix_ms.set(started_unix_ms);
+        self.p2p_runtime_stage_entries_total.incr();
+    }
+
+    pub fn observeP2pRuntimeStageComplete(
+        self: *BeaconMetrics,
+        stage_id: u64,
+        duration_ns: u64,
+    ) void {
+        self.p2p_runtime_current_stage.set(0);
+        self.p2p_runtime_last_completed_stage.set(stage_id);
+        self.p2p_runtime_last_stage_duration_ns.set(duration_ns);
+        self.p2p_runtime_stage_completions_total.incr();
     }
 
     pub fn setGossipProcessorQueueDepth(

@@ -72,6 +72,54 @@ const PeerStatusResponse = struct {
     earliest_available_slot: ?u64 = null,
 };
 
+pub const P2pRuntimeStage = enum(u16) {
+    idle = 0,
+    discovery_ingress = 1,
+    discovery_dial_completions = 2,
+    reqresp_completions = 3,
+    execution_queues = 4,
+    pending_state_work = 5,
+    gossip_bls = 6,
+    beacon_processor = 7,
+    validation_draining = 8,
+    sync_tick = 9,
+    sync_batches = 10,
+    sync_by_root = 11,
+    linked_chain_imports = 12,
+    gossip_ingress = 13,
+    proposer_payload_prep = 14,
+    sync_committee_pruning = 15,
+    advance_chain_clock = 16,
+};
+
+pub const P2pRuntimeHeartbeat = struct {
+    current_stage: P2pRuntimeStage = .idle,
+    current_stage_started_ns: u64 = 0,
+    last_completed_stage: P2pRuntimeStage = .idle,
+    last_stage_duration_ns: u64 = 0,
+    stage_entries_total: u64 = 0,
+    stage_completions_total: u64 = 0,
+
+    pub fn enter(self: *P2pRuntimeHeartbeat, stage: P2pRuntimeStage, now_ns: u64) void {
+        self.current_stage = stage;
+        self.current_stage_started_ns = now_ns;
+        self.stage_entries_total +|= 1;
+    }
+
+    pub fn complete(self: *P2pRuntimeHeartbeat, stage: P2pRuntimeStage, now_ns: u64) void {
+        self.last_completed_stage = stage;
+        self.last_stage_duration_ns = now_ns -| self.current_stage_started_ns;
+        self.stage_completions_total +|= 1;
+        self.current_stage = .idle;
+        self.current_stage_started_ns = now_ns;
+    }
+
+    pub fn currentStageAgeNs(self: P2pRuntimeHeartbeat, now_ns: u64) u64 {
+        if (self.current_stage == .idle) return 0;
+        return now_ns -| self.current_stage_started_ns;
+    }
+};
+
 const PeerMetadataResponse = struct {
     metadata: MetadataV2.Type,
     custody_group_count: ?u64 = null,
@@ -1761,17 +1809,34 @@ fn runPeerManagerMaintenance(self: *BeaconNode, io: std.Io, svc: *networking.P2p
 fn runRealtimeP2pTick(self: *BeaconNode, io: std.Io, svc: *networking.P2pService) bool {
     var did_work = false;
 
+    enterP2pRuntimeStage(self, io, .discovery_ingress);
     if (self.discovery_service) |ds| {
         did_work = ds.pollIngress() or did_work;
     }
+    completeP2pRuntimeStage(self, io, .discovery_ingress);
 
+    enterP2pRuntimeStage(self, io, .discovery_dial_completions);
     did_work = drainCompletedDiscoveryDials(self, io, svc) or did_work;
+    completeP2pRuntimeStage(self, io, .discovery_dial_completions);
+
+    enterP2pRuntimeStage(self, io, .reqresp_completions);
     did_work = drainCompletedPeerReqResp(self, io, svc) or did_work;
+    completeP2pRuntimeStage(self, io, .reqresp_completions);
+
+    enterP2pRuntimeStage(self, io, .execution_queues);
     did_work = self.processPendingExecutionForkchoiceUpdates() or did_work;
     did_work = self.processPendingExecutionPayloadVerifications() or did_work;
-    did_work = self.processPendingBlockStateWork() or did_work;
-    did_work = self.processPendingGossipBlsBatch() or did_work;
+    completeP2pRuntimeStage(self, io, .execution_queues);
 
+    enterP2pRuntimeStage(self, io, .pending_state_work);
+    did_work = self.processPendingBlockStateWork() or did_work;
+    completeP2pRuntimeStage(self, io, .pending_state_work);
+
+    enterP2pRuntimeStage(self, io, .gossip_bls);
+    did_work = self.processPendingGossipBlsBatch() or did_work;
+    completeP2pRuntimeStage(self, io, .gossip_bls);
+
+    enterP2pRuntimeStage(self, io, .beacon_processor);
     if (self.beacon_processor) |bp| {
         const dispatched = bp.tick(128);
         did_work = dispatched > 0 or did_work;
@@ -1785,9 +1850,13 @@ fn runRealtimeP2pTick(self: *BeaconNode, io: std.Io, svc: *networking.P2pService
             did_work = bp.totalQueued() > 0;
         }
     }
+    completeP2pRuntimeStage(self, io, .beacon_processor);
 
+    enterP2pRuntimeStage(self, io, .validation_draining);
     did_work = self.drainCompletedGossipValidations(io, svc) or did_work;
+    completeP2pRuntimeStage(self, io, .validation_draining);
 
+    enterP2pRuntimeStage(self, io, .sync_tick);
     if (self.sync_service_inst) |sync_svc| {
         if (currentNetworkSlot(self, io)) |slot| sync_svc.onClockSlot(slot);
         sync_svc.tick() catch |err| {
@@ -1803,20 +1872,60 @@ fn runRealtimeP2pTick(self: *BeaconNode, io: std.Io, svc: *networking.P2pService
     maybeHandleForkTransition(self, io, svc);
 
     did_work = processPendingSyncGossipSubscriptionUpdates(self, io, svc) or did_work;
+    completeP2pRuntimeStage(self, io, .sync_tick);
+
+    enterP2pRuntimeStage(self, io, .sync_batches);
     processSyncBatches(self, io, svc);
+    completeP2pRuntimeStage(self, io, .sync_batches);
+
+    enterP2pRuntimeStage(self, io, .sync_by_root);
     processSyncByRootRequests(self, io, svc);
     if (shouldDriveUnknownChainSync(self)) self.unknown_chain_sync.tick();
+    completeP2pRuntimeStage(self, io, .sync_by_root);
+
+    enterP2pRuntimeStage(self, io, .linked_chain_imports);
     if (self.unknownChainSyncEnabled()) processPendingLinkedChainImports(self, io, svc);
+    completeP2pRuntimeStage(self, io, .linked_chain_imports);
 
     // Sync must not wait behind gossip ingress. During range sync gossip is
     // gated anyway, and once synced the next tick still drains gossip promptly.
+    enterP2pRuntimeStage(self, io, .gossip_ingress);
     did_work = gossip_ingress_mod.processEvents(self, io, svc) > 0 or did_work;
+    completeP2pRuntimeStage(self, io, .gossip_ingress);
 
+    enterP2pRuntimeStage(self, io, .proposer_payload_prep);
     maybePrepareProposerPayload(self, io);
+    completeP2pRuntimeStage(self, io, .proposer_payload_prep);
+
+    enterP2pRuntimeStage(self, io, .sync_committee_pruning);
     pruneSyncCommitteePools(self);
+    completeP2pRuntimeStage(self, io, .sync_committee_pruning);
+
+    enterP2pRuntimeStage(self, io, .advance_chain_clock);
     advanceChainClock(self, io);
+    completeP2pRuntimeStage(self, io, .advance_chain_clock);
 
     return did_work;
+}
+
+fn enterP2pRuntimeStage(self: *BeaconNode, io: std.Io, stage: P2pRuntimeStage) void {
+    const now_ns = timestampNowNs(io);
+    const now_ms = currentUnixTimeMs(io);
+    self.p2p_runtime_heartbeat.enter(stage, now_ns);
+    if (self.metrics) |metrics| {
+        metrics.observeP2pRuntimeStageEnter(@intFromEnum(stage), now_ns, now_ms);
+    }
+}
+
+fn completeP2pRuntimeStage(self: *BeaconNode, io: std.Io, stage: P2pRuntimeStage) void {
+    const now_ns = timestampNowNs(io);
+    self.p2p_runtime_heartbeat.complete(stage, now_ns);
+    if (self.metrics) |metrics| {
+        metrics.observeP2pRuntimeStageComplete(
+            @intFromEnum(stage),
+            self.p2p_runtime_heartbeat.last_stage_duration_ns,
+        );
+    }
 }
 
 fn processPendingSyncStatusRefreshes(
@@ -5969,4 +6078,28 @@ test "handleDataAvailabilityReadyBlock ignores null ready block" {
     var ctx = TestCtx{};
     try handleDataAvailabilityReadyBlock(null, &ctx, TestCtx.complete);
     try testing.expectEqual(@as(usize, 0), ctx.called);
+}
+
+test "runtime loop heartbeat records stage entry and completion" {
+    var heartbeat = P2pRuntimeHeartbeat{};
+
+    heartbeat.enter(.beacon_processor, 100);
+    try std.testing.expectEqual(P2pRuntimeStage.beacon_processor, heartbeat.current_stage);
+    try std.testing.expectEqual(@as(u64, 100), heartbeat.current_stage_started_ns);
+    try std.testing.expectEqual(@as(u64, 1), heartbeat.stage_entries_total);
+    try std.testing.expectEqual(@as(u64, 0), heartbeat.stage_completions_total);
+
+    heartbeat.complete(.beacon_processor, 250);
+    try std.testing.expectEqual(P2pRuntimeStage.idle, heartbeat.current_stage);
+    try std.testing.expectEqual(P2pRuntimeStage.beacon_processor, heartbeat.last_completed_stage);
+    try std.testing.expectEqual(@as(u64, 150), heartbeat.last_stage_duration_ns);
+    try std.testing.expectEqual(@as(u64, 1), heartbeat.stage_completions_total);
+}
+
+test "runtime loop stage ids remain stable for metrics dashboards" {
+    try std.testing.expectEqual(@as(u16, 0), @intFromEnum(P2pRuntimeStage.idle));
+    try std.testing.expectEqual(@as(u16, 7), @intFromEnum(P2pRuntimeStage.beacon_processor));
+    try std.testing.expectEqual(@as(u16, 10), @intFromEnum(P2pRuntimeStage.sync_batches));
+    try std.testing.expectEqual(@as(u16, 12), @intFromEnum(P2pRuntimeStage.linked_chain_imports));
+    try std.testing.expectEqual(@as(u16, 16), @intFromEnum(P2pRuntimeStage.advance_chain_clock));
 }
