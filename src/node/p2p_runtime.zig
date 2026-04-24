@@ -120,6 +120,93 @@ pub const P2pRuntimeHeartbeat = struct {
     }
 };
 
+pub const SyncByRootPhase = enum(u16) {
+    idle = 0,
+    pop_request = 1,
+    fetch_block_open = 10,
+    fetch_block_write = 11,
+    fetch_block_close_write = 12,
+    fetch_block_read = 14,
+    ensure_da_plan = 20,
+    fetch_blobs_by_root_open = 30,
+    fetch_blobs_by_root_read = 31,
+    fetch_columns_by_root_open = 40,
+    fetch_columns_by_root_read = 41,
+    prepare_block = 60,
+    callback = 70,
+    failed = 90,
+};
+
+pub const SyncByRootHeartbeat = struct {
+    current_phase: SyncByRootPhase = .idle,
+    current_request_kind: u16 = 0,
+    current_method: u16 = 0,
+    current_root_prefix: u32 = 0,
+    current_phase_started_ns: u64 = 0,
+    current_phase_started_unix_ms: u64 = 0,
+    last_completed_phase: SyncByRootPhase = .idle,
+    last_error_phase: SyncByRootPhase = .idle,
+    last_phase_duration_ns: u64 = 0,
+    phase_entries_total: u64 = 0,
+    phase_completions_total: u64 = 0,
+    phase_errors_total: u64 = 0,
+
+    pub fn enter(
+        self: *SyncByRootHeartbeat,
+        phase: SyncByRootPhase,
+        request_kind: @import("sync_bridge.zig").PendingByRootRequestKind,
+        method: networking.Method,
+        root: [32]u8,
+        now_ns: u64,
+        now_unix_ms: u64,
+    ) void {
+        self.current_phase = phase;
+        self.current_request_kind = syncByRootRequestKindId(request_kind);
+        self.current_method = syncByRootMethodId(method);
+        self.current_root_prefix = syncByRootRootPrefix(root);
+        self.current_phase_started_ns = now_ns;
+        self.current_phase_started_unix_ms = now_unix_ms;
+        self.phase_entries_total +|= 1;
+    }
+
+    pub fn complete(self: *SyncByRootHeartbeat, phase: SyncByRootPhase, now_ns: u64) void {
+        self.last_completed_phase = phase;
+        self.last_phase_duration_ns = now_ns -| self.current_phase_started_ns;
+        self.phase_completions_total +|= 1;
+        self.current_phase = .idle;
+        self.current_phase_started_ns = now_ns;
+    }
+
+    pub fn fail(self: *SyncByRootHeartbeat, phase: SyncByRootPhase, now_ns: u64) void {
+        self.last_error_phase = phase;
+        self.last_phase_duration_ns = now_ns -| self.current_phase_started_ns;
+        self.phase_errors_total +|= 1;
+        self.current_phase = .failed;
+        self.current_phase_started_ns = now_ns;
+    }
+};
+
+fn syncByRootRootPrefix(root: [32]u8) u32 {
+    return std.mem.readInt(u32, root[0..4], .big);
+}
+
+fn syncByRootRequestKindId(kind: @import("sync_bridge.zig").PendingByRootRequestKind) u16 {
+    return switch (kind) {
+        .unknown_block_parent => 1,
+        .unknown_block_gossip => 2,
+        .unknown_chain_header => 3,
+    };
+}
+
+fn syncByRootMethodId(method: networking.Method) u16 {
+    return switch (method) {
+        .beacon_blocks_by_root => 2,
+        .blob_sidecars_by_root => 3,
+        .data_column_sidecars_by_root => 4,
+        else => @intCast(@intFromEnum(method)),
+    };
+}
+
 const PeerMetadataResponse = struct {
     metadata: MetadataV2.Type,
     custody_group_count: ?u64 = null,
@@ -888,11 +975,13 @@ pub fn processSyncByRootRequests(self: *BeaconNode, io: std.Io, svc: *networking
 
         const peer_id = req.peerId();
         const root = req.root;
+        enterSyncByRootPhase(self, io, .pop_request, req.kind, .beacon_blocks_by_root, root);
+        completeSyncByRootPhase(self, io, .pop_request);
         log.debug("processSyncByRoot: fetching {s} root {x:0>2}{x:0>2}{x:0>2}{x:0>2}... from peer {s}", .{
             @tagName(req.kind), root[0], root[1], root[2], root[3], peer_id,
         });
 
-        const block_ssz = fetchBlockByRoot(self, io, svc, peer_id, root) catch |err| {
+        const block_ssz = fetchBlockByRoot(self, io, svc, peer_id, root, req.kind) catch |err| {
             reportReqRespFetchFailure(self, io, peer_id, .beacon_blocks_by_root, err);
             log.debug("processSyncByRoot: fetch failed for {s} root {x:0>2}{x:0>2}{x:0>2}{x:0>2}...: {}", .{
                 @tagName(req.kind), root[0], root[1], root[2], root[3], err,
@@ -908,7 +997,7 @@ pub fn processSyncByRootRequests(self: *BeaconNode, io: std.Io, svc: *networking
 
         switch (req.kind) {
             .unknown_block_parent => {
-                ensureByRootDataAvailability(self, io, svc, peer_id, block_ssz) catch |err| {
+                ensureByRootDataAvailability(self, io, svc, peer_id, root, req.kind, block_ssz) catch |err| {
                     log.debug("processSyncByRoot: DA prefetch failed for root {x:0>2}{x:0>2}{x:0>2}{x:0>2}...: {}", .{
                         root[0], root[1], root[2], root[3], err,
                     });
@@ -916,20 +1005,27 @@ pub fn processSyncByRootRequests(self: *BeaconNode, io: std.Io, svc: *networking
                     continue;
                 };
 
+                enterSyncByRootPhase(self, io, .prepare_block, req.kind, .beacon_blocks_by_root, root);
                 const prepared = self.chainService().prepareRawPreparedBlockInput(block_ssz, .unknown_block_sync) catch |err| {
+                    failSyncByRootPhase(self, io, .prepare_block);
                     log.warn("processSyncByRoot: block preparation failed for root {x:0>2}{x:0>2}{x:0>2}{x:0>2}...: {}", .{
                         root[0], root[1], root[2], root[3], err,
                     });
                     self.unknown_block_sync.onFetchFailed(root, peer_id);
                     continue;
                 };
+                completeSyncByRootPhase(self, io, .prepare_block);
 
+                enterSyncByRootPhase(self, io, .callback, req.kind, .beacon_blocks_by_root, root);
                 self.unknown_block_sync.onParentFetched(root, prepared) catch |err| {
+                    failSyncByRootPhase(self, io, .callback);
                     log.warn("processSyncByRoot: onParentFetched error: {}", .{err});
+                    continue;
                 };
+                completeSyncByRootPhase(self, io, .callback);
             },
             .unknown_block_gossip => {
-                ensureByRootDataAvailability(self, io, svc, peer_id, block_ssz) catch |err| {
+                ensureByRootDataAvailability(self, io, svc, peer_id, root, req.kind, block_ssz) catch |err| {
                     log.debug("processSyncByRoot: unknown-block-gossip DA prefetch failed for root {x:0>2}{x:0>2}{x:0>2}{x:0>2}...: {}", .{
                         root[0], root[1], root[2], root[3], err,
                     });
@@ -937,22 +1033,28 @@ pub fn processSyncByRootRequests(self: *BeaconNode, io: std.Io, svc: *networking
                     continue;
                 };
 
+                enterSyncByRootPhase(self, io, .prepare_block, req.kind, .beacon_blocks_by_root, root);
                 const prepared = self.chainService().prepareRawPreparedBlockInput(block_ssz, .unknown_block_sync) catch |err| {
+                    failSyncByRootPhase(self, io, .prepare_block);
                     log.warn("processSyncByRoot: unknown-block-gossip block preparation failed for root {x:0>2}{x:0>2}{x:0>2}{x:0>2}...: {}", .{
                         root[0], root[1], root[2], root[3], err,
                     });
                     self.onPendingUnknownBlockFetchFailed(root, peer_id);
                     continue;
                 };
+                completeSyncByRootPhase(self, io, .prepare_block);
 
+                enterSyncByRootPhase(self, io, .callback, req.kind, .beacon_blocks_by_root, root);
                 self.onPendingUnknownBlockFetchAccepted(root);
                 const import_result = self.importPreparedBlock(prepared) catch |err| {
+                    failSyncByRootPhase(self, io, .callback);
                     log.warn("processSyncByRoot: unknown-block-gossip import failed for root {x:0>2}{x:0>2}{x:0>2}{x:0>2}...: {}", .{
                         root[0], root[1], root[2], root[3], err,
                     });
                     self.onPendingUnknownBlockFetchFailed(root, null);
                     continue;
                 };
+                completeSyncByRootPhase(self, io, .callback);
 
                 switch (import_result) {
                     .pending => {},
@@ -1000,7 +1102,7 @@ pub fn processPendingLinkedChainImports(self: *BeaconNode, io: std.Io, svc: *net
                 break;
             };
 
-            ensureByRootDataAvailability(self, io, svc, fetched.peer_id, fetched.block_ssz) catch |err| {
+            ensureByRootDataAvailability(self, io, svc, fetched.peer_id, null, null, fetched.block_ssz) catch |err| {
                 self.allocator.free(fetched.block_ssz);
                 log.warn("linked unknown-chain import: DA prefetch failed at slot {d}: {}", .{ header.slot, err });
                 failed = true;
@@ -1924,6 +2026,51 @@ fn completeP2pRuntimeStage(self: *BeaconNode, io: std.Io, stage: P2pRuntimeStage
         metrics.observeP2pRuntimeStageComplete(
             @intFromEnum(stage),
             self.p2p_runtime_heartbeat.last_stage_duration_ns,
+        );
+    }
+}
+
+fn enterSyncByRootPhase(
+    self: *BeaconNode,
+    io: std.Io,
+    phase: SyncByRootPhase,
+    request_kind: @import("sync_bridge.zig").PendingByRootRequestKind,
+    method: networking.Method,
+    root: [32]u8,
+) void {
+    const now_ns = timestampNowNs(io);
+    const now_ms = currentUnixTimeMs(io);
+    self.sync_by_root_heartbeat.enter(phase, request_kind, method, root, now_ns, now_ms);
+    if (self.metrics) |metrics| {
+        metrics.observeSyncByRootPhaseEnter(
+            @intFromEnum(phase),
+            self.sync_by_root_heartbeat.current_request_kind,
+            self.sync_by_root_heartbeat.current_method,
+            self.sync_by_root_heartbeat.current_root_prefix,
+            now_ns,
+            now_ms,
+        );
+    }
+}
+
+fn completeSyncByRootPhase(self: *BeaconNode, io: std.Io, phase: SyncByRootPhase) void {
+    const now_ns = timestampNowNs(io);
+    self.sync_by_root_heartbeat.complete(phase, now_ns);
+    if (self.metrics) |metrics| {
+        metrics.observeSyncByRootPhaseComplete(
+            @intFromEnum(phase),
+            self.sync_by_root_heartbeat.last_phase_duration_ns,
+        );
+    }
+}
+
+fn failSyncByRootPhase(self: *BeaconNode, io: std.Io, phase: SyncByRootPhase) void {
+    const now_ns = timestampNowNs(io);
+    self.sync_by_root_heartbeat.fail(phase, now_ns);
+    if (self.metrics) |metrics| {
+        metrics.observeSyncByRootPhaseError(
+            @intFromEnum(phase),
+            self.sync_by_root_heartbeat.last_phase_duration_ns,
         );
     }
 }
@@ -4104,23 +4251,32 @@ fn ensureByRootDataAvailability(
     io: std.Io,
     svc: *networking.P2pService,
     peer_id: []const u8,
+    root: ?[32]u8,
+    request_kind: ?@import("sync_bridge.zig").PendingByRootRequestKind,
     block_bytes: []const u8,
 ) !void {
-    var meta = try buildSyncBlockMeta(self, block_bytes, null);
+    if (request_kind) |kind| {
+        enterSyncByRootPhase(self, io, .ensure_da_plan, kind, .beacon_blocks_by_root, root.?);
+    }
+    var meta = buildSyncBlockMeta(self, block_bytes, null) catch |err| {
+        if (request_kind != null) failSyncByRootPhase(self, io, .ensure_da_plan);
+        return err;
+    };
+    if (request_kind != null) completeSyncByRootPhase(self, io, .ensure_da_plan);
     defer deinitSyncBlockMeta(self, &meta);
 
     switch (meta.block_data_plan) {
         .none => return,
         .blobs => |missing| {
             if (missing.len == 0) return;
-            fetchBlobSidecarsByRootForMeta(self, io, svc, peer_id, meta, missing) catch |err| {
+            fetchBlobSidecarsByRootForMeta(self, io, svc, peer_id, meta, missing, request_kind) catch |err| {
                 reportReqRespFetchFailure(self, io, peer_id, .blob_sidecars_by_root, err);
                 return err;
             };
         },
         .columns => |missing| {
             if (missing.len == 0) return;
-            fetchDataColumnsByRootForMeta(self, io, svc, peer_id, meta) catch |err| {
+            fetchDataColumnsByRootForMeta(self, io, svc, peer_id, meta, request_kind) catch |err| {
                 reportReqRespFetchFailure(self, io, peer_id, .data_column_sidecars_by_root, err);
                 return err;
             };
@@ -4296,7 +4452,7 @@ fn fetchBlobSidecarsByRangeForMetas(
             defer self.allocator.free(missing);
             if (missing.len == 0) continue;
 
-            fetchBlobSidecarsByRootForMeta(self, io, svc, peer_id, meta, missing) catch |err| {
+            fetchBlobSidecarsByRootForMeta(self, io, svc, peer_id, meta, missing, null) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -4319,6 +4475,7 @@ fn fetchBlobSidecarsByRootForMeta(
     peer_id: []const u8,
     meta: SyncBlockMeta,
     missing: []const u64,
+    request_kind: ?@import("sync_bridge.zig").PendingByRootRequestKind,
 ) !void {
     if (missing.len == 0) return;
 
@@ -4339,7 +4496,12 @@ fn fetchBlobSidecarsByRootForMeta(
         });
     }
 
-    var outbound = try openReqRespRequest(self, io, svc, peer_id, .blob_sidecars_by_root, protocol_id);
+    if (request_kind) |kind| enterSyncByRootPhase(self, io, .fetch_blobs_by_root_open, kind, .blob_sidecars_by_root, meta.block_root);
+    var outbound = openReqRespRequest(self, io, svc, peer_id, .blob_sidecars_by_root, protocol_id) catch |err| {
+        if (request_kind != null) failSyncByRootPhase(self, io, .fetch_blobs_by_root_open);
+        return err;
+    };
+    if (request_kind != null) completeSyncByRootPhase(self, io, .fetch_blobs_by_root_open);
     defer outbound.deinit(io);
     var request_outcome: networking.ReqRespRequestOutcome = .transport_error;
     defer outbound.finish(io, request_outcome);
@@ -4358,7 +4520,14 @@ fn fetchBlobSidecarsByRootForMeta(
     };
     defer reader.deinit();
 
-    while (try reader.next(io, &outbound.stream)) |decoded| {
+    while (true) {
+        if (request_kind) |kind| enterSyncByRootPhase(self, io, .fetch_blobs_by_root_read, kind, .blob_sidecars_by_root, meta.block_root);
+        const maybe_decoded = reader.next(io, &outbound.stream) catch |err| {
+            if (request_kind != null) failSyncByRootPhase(self, io, .fetch_blobs_by_root_read);
+            return err;
+        };
+        if (request_kind != null) completeSyncByRootPhase(self, io, .fetch_blobs_by_root_read);
+        const decoded = maybe_decoded orelse break;
         outbound.noteResponseChunk(decoded.ssz_bytes.len);
         if (decoded.result != .success) {
             self.allocator.free(decoded.ssz_bytes);
@@ -4602,6 +4771,7 @@ fn fetchDataColumnsByRootForMeta(
     svc: *networking.P2pService,
     preferred_peer_id: []const u8,
     meta: SyncBlockMeta,
+    request_kind: ?@import("sync_bridge.zig").PendingByRootRequestKind,
 ) !void {
     var attempted_peers = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -4627,7 +4797,7 @@ fn fetchDataColumnsByRootForMeta(
         errdefer self.allocator.free(selected_peer);
         try attempted_peers.append(self.allocator, selected_peer);
 
-        fetchDataColumnsByRootOnce(self, io, svc, selected_peer, meta, missing) catch |err| {
+        fetchDataColumnsByRootOnce(self, io, svc, selected_peer, meta, missing, request_kind) catch |err| {
             log.debug("Data column by-root fetch failed from peer {s}: {}", .{ selected_peer, err });
             last_err = err;
             continue;
@@ -4877,6 +5047,7 @@ fn fetchDataColumnsByRootOnce(
     peer_id: []const u8,
     meta: SyncBlockMeta,
     missing: []const u64,
+    request_kind: ?@import("sync_bridge.zig").PendingByRootRequestKind,
 ) !void {
     const covered_missing = try dataColumnsCoveredByPeer(self, peer_id, missing);
     defer self.allocator.free(covered_missing);
@@ -4885,7 +5056,12 @@ fn fetchDataColumnsByRootOnce(
     const protocol_id = "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy";
     const req_resp_encoding = networking.req_resp_encoding;
 
-    var outbound = try openReqRespRequest(self, io, svc, peer_id, .data_column_sidecars_by_root, protocol_id);
+    if (request_kind) |kind| enterSyncByRootPhase(self, io, .fetch_columns_by_root_open, kind, .data_column_sidecars_by_root, meta.block_root);
+    var outbound = openReqRespRequest(self, io, svc, peer_id, .data_column_sidecars_by_root, protocol_id) catch |err| {
+        if (request_kind != null) failSyncByRootPhase(self, io, .fetch_columns_by_root_open);
+        return err;
+    };
+    if (request_kind != null) completeSyncByRootPhase(self, io, .fetch_columns_by_root_open);
     defer outbound.deinit(io);
     var request_outcome: networking.ReqRespRequestOutcome = .transport_error;
     defer outbound.finish(io, request_outcome);
@@ -4921,7 +5097,14 @@ fn fetchDataColumnsByRootOnce(
 
     const blob_commitments = try meta.any_signed.beaconBlock().beaconBlockBody().blobKzgCommitments();
 
-    while (try reader.next(io, &outbound.stream)) |decoded| {
+    while (true) {
+        if (request_kind) |kind| enterSyncByRootPhase(self, io, .fetch_columns_by_root_read, kind, .data_column_sidecars_by_root, meta.block_root);
+        const maybe_decoded = reader.next(io, &outbound.stream) catch |err| {
+            if (request_kind != null) failSyncByRootPhase(self, io, .fetch_columns_by_root_read);
+            return err;
+        };
+        if (request_kind != null) completeSyncByRootPhase(self, io, .fetch_columns_by_root_read);
+        const decoded = maybe_decoded orelse break;
         outbound.noteResponseChunk(decoded.ssz_bytes.len);
         if (decoded.result != .success) {
             self.allocator.free(decoded.ssz_bytes);
@@ -5141,7 +5324,7 @@ fn fetchBlockByRootFromPeers(
     root: [32]u8,
 ) !LinkedChainFetchResult {
     for (peer_ids) |peer_id| {
-        const block_ssz = fetchBlockByRoot(self, io, svc, peer_id, root) catch |err| {
+        const block_ssz = fetchBlockByRoot(self, io, svc, peer_id, root, null) catch |err| {
             reportReqRespFetchFailure(self, io, peer_id, .beacon_blocks_by_root, err);
             continue;
         };
@@ -5183,18 +5366,31 @@ fn fetchBlockByRoot(
     svc: *networking.P2pService,
     peer_id: []const u8,
     root: [32]u8,
+    request_kind: ?@import("sync_bridge.zig").PendingByRootRequestKind,
 ) ![]const u8 {
     const protocol_id = "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy";
     const req_resp_encoding = networking.req_resp_encoding;
 
-    var outbound = try openReqRespRequest(self, io, svc, peer_id, .beacon_blocks_by_root, protocol_id);
+    if (request_kind) |kind| enterSyncByRootPhase(self, io, .fetch_block_open, kind, .beacon_blocks_by_root, root);
+    var outbound = openReqRespRequest(self, io, svc, peer_id, .beacon_blocks_by_root, protocol_id) catch |err| {
+        if (request_kind != null) failSyncByRootPhase(self, io, .fetch_block_open);
+        return err;
+    };
+    if (request_kind != null) completeSyncByRootPhase(self, io, .fetch_block_open);
     defer outbound.deinit(io);
     var request_outcome: networking.ReqRespRequestOutcome = .transport_error;
     defer outbound.finish(io, request_outcome);
 
-    try req_resp_encoding.writeRequestToStream(self.allocator, io, &outbound.stream, &root);
+    if (request_kind) |kind| enterSyncByRootPhase(self, io, .fetch_block_write, kind, .beacon_blocks_by_root, root);
+    req_resp_encoding.writeRequestToStream(self.allocator, io, &outbound.stream, &root) catch |err| {
+        if (request_kind != null) failSyncByRootPhase(self, io, .fetch_block_write);
+        return err;
+    };
     outbound.noteRequestPayload(root.len);
+    if (request_kind != null) completeSyncByRootPhase(self, io, .fetch_block_write);
+    if (request_kind) |kind| enterSyncByRootPhase(self, io, .fetch_block_close_write, kind, .beacon_blocks_by_root, root);
     outbound.stream.closeWrite(io);
+    if (request_kind != null) completeSyncByRootPhase(self, io, .fetch_block_close_write);
     request_outcome = .malformed_response;
 
     var reader = req_resp_encoding.ResponseChunkStreamReader{
@@ -5203,8 +5399,16 @@ fn fetchBlockByRoot(
     };
     defer reader.deinit();
 
-    const decoded = (try reader.next(io, &outbound.stream)) orelse return error.NoBlockReturned;
+    if (request_kind) |kind| enterSyncByRootPhase(self, io, .fetch_block_read, kind, .beacon_blocks_by_root, root);
+    const decoded = (reader.next(io, &outbound.stream) catch |err| {
+        if (request_kind != null) failSyncByRootPhase(self, io, .fetch_block_read);
+        return err;
+    }) orelse {
+        if (request_kind != null) failSyncByRootPhase(self, io, .fetch_block_read);
+        return error.NoBlockReturned;
+    };
     outbound.noteResponseChunk(decoded.ssz_bytes.len);
+    if (request_kind != null) completeSyncByRootPhase(self, io, .fetch_block_read);
     if (decoded.result != .success) {
         self.allocator.free(decoded.ssz_bytes);
         request_outcome = responseCodeOutcome(decoded.result);
@@ -6102,4 +6306,44 @@ test "runtime loop stage ids remain stable for metrics dashboards" {
     try std.testing.expectEqual(@as(u16, 10), @intFromEnum(P2pRuntimeStage.sync_batches));
     try std.testing.expectEqual(@as(u16, 12), @intFromEnum(P2pRuntimeStage.linked_chain_imports));
     try std.testing.expectEqual(@as(u16, 16), @intFromEnum(P2pRuntimeStage.advance_chain_clock));
+}
+
+test "sync by root phase ids remain stable for metrics dashboards" {
+    try std.testing.expectEqual(@as(u16, 0), @intFromEnum(SyncByRootPhase.idle));
+    try std.testing.expectEqual(@as(u16, 1), @intFromEnum(SyncByRootPhase.pop_request));
+    try std.testing.expectEqual(@as(u16, 10), @intFromEnum(SyncByRootPhase.fetch_block_open));
+    try std.testing.expectEqual(@as(u16, 14), @intFromEnum(SyncByRootPhase.fetch_block_read));
+    try std.testing.expectEqual(@as(u16, 20), @intFromEnum(SyncByRootPhase.ensure_da_plan));
+    try std.testing.expectEqual(@as(u16, 31), @intFromEnum(SyncByRootPhase.fetch_blobs_by_root_read));
+    try std.testing.expectEqual(@as(u16, 41), @intFromEnum(SyncByRootPhase.fetch_columns_by_root_read));
+    try std.testing.expectEqual(@as(u16, 60), @intFromEnum(SyncByRootPhase.prepare_block));
+    try std.testing.expectEqual(@as(u16, 70), @intFromEnum(SyncByRootPhase.callback));
+    try std.testing.expectEqual(@as(u16, 90), @intFromEnum(SyncByRootPhase.failed));
+}
+
+test "sync by root heartbeat records phase entry completion and errors" {
+    var heartbeat = SyncByRootHeartbeat{};
+    const root = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd } ++ [_]u8{0} ** 28;
+
+    heartbeat.enter(.fetch_block_open, .unknown_block_parent, .beacon_blocks_by_root, root, 100, 1000);
+    try std.testing.expectEqual(SyncByRootPhase.fetch_block_open, heartbeat.current_phase);
+    try std.testing.expectEqual(@as(u16, 1), heartbeat.current_request_kind);
+    try std.testing.expectEqual(@as(u16, 2), heartbeat.current_method);
+    try std.testing.expectEqual(@as(u32, 0xaabbccdd), heartbeat.current_root_prefix);
+    try std.testing.expectEqual(@as(u64, 100), heartbeat.current_phase_started_ns);
+    try std.testing.expectEqual(@as(u64, 1000), heartbeat.current_phase_started_unix_ms);
+    try std.testing.expectEqual(@as(u64, 1), heartbeat.phase_entries_total);
+
+    heartbeat.complete(.fetch_block_open, 250);
+    try std.testing.expectEqual(SyncByRootPhase.idle, heartbeat.current_phase);
+    try std.testing.expectEqual(SyncByRootPhase.fetch_block_open, heartbeat.last_completed_phase);
+    try std.testing.expectEqual(@as(u64, 150), heartbeat.last_phase_duration_ns);
+    try std.testing.expectEqual(@as(u64, 1), heartbeat.phase_completions_total);
+
+    heartbeat.enter(.fetch_block_read, .unknown_block_parent, .beacon_blocks_by_root, root, 300, 1300);
+    heartbeat.fail(.fetch_block_read, 375);
+    try std.testing.expectEqual(SyncByRootPhase.failed, heartbeat.current_phase);
+    try std.testing.expectEqual(SyncByRootPhase.fetch_block_read, heartbeat.last_error_phase);
+    try std.testing.expectEqual(@as(u64, 75), heartbeat.last_phase_duration_ns);
+    try std.testing.expectEqual(@as(u64, 1), heartbeat.phase_errors_total);
 }

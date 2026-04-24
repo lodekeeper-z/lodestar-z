@@ -637,6 +637,18 @@ pub const BeaconMetrics = struct {
     p2p_runtime_last_stage_duration_ns: GaugeU64,
     p2p_runtime_stage_entries_total: Counter(u64),
     p2p_runtime_stage_completions_total: Counter(u64),
+    sync_by_root_current_phase: GaugeU64,
+    sync_by_root_current_request_kind: GaugeU64,
+    sync_by_root_current_method: GaugeU64,
+    sync_by_root_current_root_prefix: GaugeU64,
+    sync_by_root_current_phase_started_awake_ns: GaugeU64,
+    sync_by_root_current_phase_started_unix_ms: GaugeU64,
+    sync_by_root_last_completed_phase: GaugeU64,
+    sync_by_root_last_error_phase: GaugeU64,
+    sync_by_root_last_phase_duration_ns: GaugeU64,
+    sync_by_root_phase_entries_total: Counter(u64),
+    sync_by_root_phase_completions_total: Counter(u64),
+    sync_by_root_phase_errors_total: Counter(u64),
 
     // Block production.
     block_production_requests_total: CounterVec(u64, BlockProductionModeLabels),
@@ -2330,6 +2342,66 @@ pub const BeaconMetrics = struct {
                 .{ .help = "Total main P2P runtime loop stage completions." },
                 ro,
             ),
+            .sync_by_root_current_phase = GaugeU64.init(
+                "beacon_sync_by_root_current_phase",
+                .{ .help = "Current sync-by-root phase id; zero means idle between phases." },
+                ro,
+            ),
+            .sync_by_root_current_request_kind = GaugeU64.init(
+                "beacon_sync_by_root_current_request_kind",
+                .{ .help = "Current sync-by-root request kind id: 1 parent, 2 gossip, 3 chain header." },
+                ro,
+            ),
+            .sync_by_root_current_method = GaugeU64.init(
+                "beacon_sync_by_root_current_method",
+                .{ .help = "Current sync-by-root req/resp method id: 2 blocks_by_root, 3 blobs_by_root, 4 columns_by_root." },
+                ro,
+            ),
+            .sync_by_root_current_root_prefix = GaugeU64.init(
+                "beacon_sync_by_root_current_root_prefix",
+                .{ .help = "Big-endian u32 prefix of the block root currently handled by sync-by-root instrumentation." },
+                ro,
+            ),
+            .sync_by_root_current_phase_started_awake_ns = GaugeU64.init(
+                "beacon_sync_by_root_current_phase_started_awake_ns",
+                .{ .help = "Awake monotonic timestamp when the current sync-by-root phase started." },
+                ro,
+            ),
+            .sync_by_root_current_phase_started_unix_ms = GaugeU64.init(
+                "beacon_sync_by_root_current_phase_started_unix_ms",
+                .{ .help = "Unix timestamp in milliseconds when the current sync-by-root phase started." },
+                ro,
+            ),
+            .sync_by_root_last_completed_phase = GaugeU64.init(
+                "beacon_sync_by_root_last_completed_phase",
+                .{ .help = "Most recently completed sync-by-root phase id." },
+                ro,
+            ),
+            .sync_by_root_last_error_phase = GaugeU64.init(
+                "beacon_sync_by_root_last_error_phase",
+                .{ .help = "Most recent sync-by-root phase id that returned an error." },
+                ro,
+            ),
+            .sync_by_root_last_phase_duration_ns = GaugeU64.init(
+                "beacon_sync_by_root_last_phase_duration_ns",
+                .{ .help = "Duration of the most recently completed or failed sync-by-root phase in nanoseconds." },
+                ro,
+            ),
+            .sync_by_root_phase_entries_total = Counter(u64).init(
+                "beacon_sync_by_root_phase_entries_total",
+                .{ .help = "Total sync-by-root phase entries." },
+                ro,
+            ),
+            .sync_by_root_phase_completions_total = Counter(u64).init(
+                "beacon_sync_by_root_phase_completions_total",
+                .{ .help = "Total sync-by-root phase completions." },
+                ro,
+            ),
+            .sync_by_root_phase_errors_total = Counter(u64).init(
+                "beacon_sync_by_root_phase_errors_total",
+                .{ .help = "Total sync-by-root phase errors." },
+                ro,
+            ),
 
             .block_production_requests_total = try CounterVec(u64, BlockProductionModeLabels).init(
                 allocator,
@@ -3132,6 +3204,46 @@ pub const BeaconMetrics = struct {
         self.p2p_runtime_last_completed_stage.set(stage_id);
         self.p2p_runtime_last_stage_duration_ns.set(duration_ns);
         self.p2p_runtime_stage_completions_total.incr();
+    }
+
+    pub fn observeSyncByRootPhaseEnter(
+        self: *BeaconMetrics,
+        phase_id: u64,
+        request_kind_id: u64,
+        method_id: u64,
+        root_prefix: u64,
+        started_awake_ns: u64,
+        started_unix_ms: u64,
+    ) void {
+        self.sync_by_root_current_phase.set(phase_id);
+        self.sync_by_root_current_request_kind.set(request_kind_id);
+        self.sync_by_root_current_method.set(method_id);
+        self.sync_by_root_current_root_prefix.set(root_prefix);
+        self.sync_by_root_current_phase_started_awake_ns.set(started_awake_ns);
+        self.sync_by_root_current_phase_started_unix_ms.set(started_unix_ms);
+        self.sync_by_root_phase_entries_total.incr();
+    }
+
+    pub fn observeSyncByRootPhaseComplete(
+        self: *BeaconMetrics,
+        phase_id: u64,
+        duration_ns: u64,
+    ) void {
+        self.sync_by_root_current_phase.set(0);
+        self.sync_by_root_last_completed_phase.set(phase_id);
+        self.sync_by_root_last_phase_duration_ns.set(duration_ns);
+        self.sync_by_root_phase_completions_total.incr();
+    }
+
+    pub fn observeSyncByRootPhaseError(
+        self: *BeaconMetrics,
+        phase_id: u64,
+        duration_ns: u64,
+    ) void {
+        self.sync_by_root_current_phase.set(@intFromEnum(@import("p2p_runtime.zig").SyncByRootPhase.failed));
+        self.sync_by_root_last_error_phase.set(phase_id);
+        self.sync_by_root_last_phase_duration_ns.set(duration_ns);
+        self.sync_by_root_phase_errors_total.incr();
     }
 
     pub fn setGossipProcessorQueueDepth(

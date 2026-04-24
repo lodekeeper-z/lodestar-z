@@ -698,6 +698,7 @@ pub const BeaconNode = struct {
     last_sync_service_metrics_snapshot: ?SyncServiceMetricsSnapshot = null,
     last_db_metrics_snapshot: ?DatabaseMetricsSnapshot = null,
     p2p_runtime_heartbeat: p2p_runtime_mod.P2pRuntimeHeartbeat = .{},
+    sync_by_root_heartbeat: p2p_runtime_mod.SyncByRootHeartbeat = .{},
     last_state_metrics_root: ?[32]u8 = null,
     last_previous_epoch_orphaned_epoch: ?u64 = null,
 
