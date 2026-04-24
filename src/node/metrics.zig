@@ -637,6 +637,18 @@ pub const BeaconMetrics = struct {
     p2p_runtime_last_stage_duration_ns: GaugeU64,
     p2p_runtime_stage_entries_total: Counter(u64),
     p2p_runtime_stage_completions_total: Counter(u64),
+    sync_batches_current_phase: GaugeU64,
+    sync_batches_current_method: GaugeU64,
+    sync_batches_current_batch_id: GaugeU64,
+    sync_batches_current_start_slot: GaugeU64,
+    sync_batches_current_phase_started_awake_ns: GaugeU64,
+    sync_batches_current_phase_started_unix_ms: GaugeU64,
+    sync_batches_last_completed_phase: GaugeU64,
+    sync_batches_last_error_phase: GaugeU64,
+    sync_batches_last_phase_duration_ns: GaugeU64,
+    sync_batches_phase_entries_total: Counter(u64),
+    sync_batches_phase_completions_total: Counter(u64),
+    sync_batches_phase_errors_total: Counter(u64),
     sync_by_root_current_phase: GaugeU64,
     sync_by_root_current_request_kind: GaugeU64,
     sync_by_root_current_method: GaugeU64,
@@ -2342,6 +2354,66 @@ pub const BeaconMetrics = struct {
                 .{ .help = "Total main P2P runtime loop stage completions." },
                 ro,
             ),
+            .sync_batches_current_phase = GaugeU64.init(
+                "beacon_sync_batches_current_phase",
+                .{ .help = "Current sync-batches phase id; zero means idle between phases." },
+                ro,
+            ),
+            .sync_batches_current_method = GaugeU64.init(
+                "beacon_sync_batches_current_method",
+                .{ .help = "Current sync-batches req/resp method id: 1 blocks_by_range, 5 blobs_by_range, 14 columns_by_range." },
+                ro,
+            ),
+            .sync_batches_current_batch_id = GaugeU64.init(
+                "beacon_sync_batches_current_batch_id",
+                .{ .help = "Current range-sync batch id handled by sync-batches instrumentation." },
+                ro,
+            ),
+            .sync_batches_current_start_slot = GaugeU64.init(
+                "beacon_sync_batches_current_start_slot",
+                .{ .help = "Start slot of the current range-sync batch handled by sync-batches instrumentation." },
+                ro,
+            ),
+            .sync_batches_current_phase_started_awake_ns = GaugeU64.init(
+                "beacon_sync_batches_current_phase_started_awake_ns",
+                .{ .help = "Awake monotonic timestamp when the current sync-batches phase started." },
+                ro,
+            ),
+            .sync_batches_current_phase_started_unix_ms = GaugeU64.init(
+                "beacon_sync_batches_current_phase_started_unix_ms",
+                .{ .help = "Unix timestamp in milliseconds when the current sync-batches phase started." },
+                ro,
+            ),
+            .sync_batches_last_completed_phase = GaugeU64.init(
+                "beacon_sync_batches_last_completed_phase",
+                .{ .help = "Most recently completed sync-batches phase id." },
+                ro,
+            ),
+            .sync_batches_last_error_phase = GaugeU64.init(
+                "beacon_sync_batches_last_error_phase",
+                .{ .help = "Most recent sync-batches phase id that returned an error." },
+                ro,
+            ),
+            .sync_batches_last_phase_duration_ns = GaugeU64.init(
+                "beacon_sync_batches_last_phase_duration_ns",
+                .{ .help = "Duration of the most recently completed or failed sync-batches phase in nanoseconds." },
+                ro,
+            ),
+            .sync_batches_phase_entries_total = Counter(u64).init(
+                "beacon_sync_batches_phase_entries_total",
+                .{ .help = "Total sync-batches phase entries." },
+                ro,
+            ),
+            .sync_batches_phase_completions_total = Counter(u64).init(
+                "beacon_sync_batches_phase_completions_total",
+                .{ .help = "Total sync-batches phase completions." },
+                ro,
+            ),
+            .sync_batches_phase_errors_total = Counter(u64).init(
+                "beacon_sync_batches_phase_errors_total",
+                .{ .help = "Total sync-batches phase errors." },
+                ro,
+            ),
             .sync_by_root_current_phase = GaugeU64.init(
                 "beacon_sync_by_root_current_phase",
                 .{ .help = "Current sync-by-root phase id; zero means idle between phases." },
@@ -3204,6 +3276,46 @@ pub const BeaconMetrics = struct {
         self.p2p_runtime_last_completed_stage.set(stage_id);
         self.p2p_runtime_last_stage_duration_ns.set(duration_ns);
         self.p2p_runtime_stage_completions_total.incr();
+    }
+
+    pub fn observeSyncBatchesPhaseEnter(
+        self: *BeaconMetrics,
+        phase_id: u64,
+        method_id: u64,
+        batch_id: u64,
+        start_slot: u64,
+        started_awake_ns: u64,
+        started_unix_ms: u64,
+    ) void {
+        self.sync_batches_current_phase.set(phase_id);
+        self.sync_batches_current_method.set(method_id);
+        self.sync_batches_current_batch_id.set(batch_id);
+        self.sync_batches_current_start_slot.set(start_slot);
+        self.sync_batches_current_phase_started_awake_ns.set(started_awake_ns);
+        self.sync_batches_current_phase_started_unix_ms.set(started_unix_ms);
+        self.sync_batches_phase_entries_total.incr();
+    }
+
+    pub fn observeSyncBatchesPhaseComplete(
+        self: *BeaconMetrics,
+        phase_id: u64,
+        duration_ns: u64,
+    ) void {
+        self.sync_batches_current_phase.set(0);
+        self.sync_batches_last_completed_phase.set(phase_id);
+        self.sync_batches_last_phase_duration_ns.set(duration_ns);
+        self.sync_batches_phase_completions_total.incr();
+    }
+
+    pub fn observeSyncBatchesPhaseError(
+        self: *BeaconMetrics,
+        phase_id: u64,
+        duration_ns: u64,
+    ) void {
+        self.sync_batches_current_phase.set(@intFromEnum(@import("p2p_runtime.zig").SyncBatchesPhase.failed));
+        self.sync_batches_last_error_phase.set(phase_id);
+        self.sync_batches_last_phase_duration_ns.set(duration_ns);
+        self.sync_batches_phase_errors_total.incr();
     }
 
     pub fn observeSyncByRootPhaseEnter(

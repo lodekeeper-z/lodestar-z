@@ -120,6 +120,80 @@ pub const P2pRuntimeHeartbeat = struct {
     }
 };
 
+pub const SyncBatchesPhase = enum(u16) {
+    idle = 0,
+    pop_request = 1,
+    fetch_blocks_open = 10,
+    fetch_blocks_write = 11,
+    fetch_blocks_close_write = 12,
+    fetch_blocks_read = 14,
+    ensure_da_plan = 20,
+    fetch_blobs_by_range_open = 30,
+    fetch_blobs_by_range_read = 31,
+    fetch_columns_by_range_open = 40,
+    fetch_columns_by_range_read = 41,
+    callback = 60,
+    failed = 90,
+};
+
+pub const SyncBatchesHeartbeat = struct {
+    current_phase: SyncBatchesPhase = .idle,
+    current_method: u16 = 0,
+    current_batch_id: u64 = 0,
+    current_start_slot: u64 = 0,
+    current_phase_started_ns: u64 = 0,
+    current_phase_started_unix_ms: u64 = 0,
+    last_completed_phase: SyncBatchesPhase = .idle,
+    last_error_phase: SyncBatchesPhase = .idle,
+    last_phase_duration_ns: u64 = 0,
+    phase_entries_total: u64 = 0,
+    phase_completions_total: u64 = 0,
+    phase_errors_total: u64 = 0,
+
+    pub fn enter(
+        self: *SyncBatchesHeartbeat,
+        phase: SyncBatchesPhase,
+        method: networking.Method,
+        batch_id: u64,
+        start_slot: u64,
+        now_ns: u64,
+        now_unix_ms: u64,
+    ) void {
+        self.current_phase = phase;
+        self.current_method = syncBatchesMethodId(method);
+        self.current_batch_id = batch_id;
+        self.current_start_slot = start_slot;
+        self.current_phase_started_ns = now_ns;
+        self.current_phase_started_unix_ms = now_unix_ms;
+        self.phase_entries_total +|= 1;
+    }
+
+    pub fn complete(self: *SyncBatchesHeartbeat, phase: SyncBatchesPhase, now_ns: u64) void {
+        self.last_completed_phase = phase;
+        self.last_phase_duration_ns = now_ns -| self.current_phase_started_ns;
+        self.phase_completions_total +|= 1;
+        self.current_phase = .idle;
+        self.current_phase_started_ns = now_ns;
+    }
+
+    pub fn fail(self: *SyncBatchesHeartbeat, phase: SyncBatchesPhase, now_ns: u64) void {
+        self.last_error_phase = phase;
+        self.last_phase_duration_ns = now_ns -| self.current_phase_started_ns;
+        self.phase_errors_total +|= 1;
+        self.current_phase = .failed;
+        self.current_phase_started_ns = now_ns;
+    }
+};
+
+fn syncBatchesMethodId(method: networking.Method) u16 {
+    return switch (method) {
+        .beacon_blocks_by_range => 1,
+        .blob_sidecars_by_range => 5,
+        .data_column_sidecars_by_range => 14,
+        else => @intCast(@intFromEnum(method)),
+    };
+}
+
 pub const SyncByRootPhase = enum(u16) {
     idle = 0,
     pop_request = 1,
@@ -872,6 +946,8 @@ pub fn processSyncBatches(self: *BeaconNode, io: std.Io, svc: *networking.P2pSer
 
     while (cb_ctx.popPendingRequest()) |req| {
         const peer_id = req.peerId();
+        enterSyncBatchesPhase(self, io, .pop_request, .beacon_blocks_by_range, req.batch_id, req.start_slot);
+        completeSyncBatchesPhase(self, io, .pop_request);
         log.debug("Processing sync chain {d} batch {d}/gen {d}: slots {d}..{d} from peer {s}", .{
             req.chain_id,
             req.batch_id,
@@ -922,7 +998,7 @@ pub fn processSyncBatches(self: *BeaconNode, io: std.Io, svc: *networking.P2pSer
                 break :blk retained_blocks.?;
             }
 
-            const owned_blocks = fetchRawBlocksByRange(self, io, svc, peer_id, req.start_slot, req.count) catch |err| {
+            const owned_blocks = fetchRawBlocksByRange(self, io, svc, peer_id, req.start_slot, req.count, req.batch_id) catch |err| {
                 noteSyncPeerGoneIfTransportClosed(self, io, svc, peer_id, err);
                 reportReqRespFetchFailure(self, io, peer_id, .beacon_blocks_by_range, err);
                 log.debug("Batch {d} fetch failed: {}", .{ req.batch_id, err });
@@ -943,7 +1019,7 @@ pub fn processSyncBatches(self: *BeaconNode, io: std.Io, svc: *networking.P2pSer
             continue;
         }
 
-        ensureRangeSyncDataAvailability(self, io, svc, peer_id, blocks) catch |err| {
+        ensureRangeSyncDataAvailability(self, io, svc, peer_id, blocks, req.batch_id, req.start_slot) catch |err| {
             log.debug("Batch {d}: DA prefetch deferred/failed: {}", .{ req.batch_id, err });
             if (self.sync_service_inst) |sync_svc| {
                 switch (err) {
@@ -955,7 +1031,9 @@ pub fn processSyncBatches(self: *BeaconNode, io: std.Io, svc: *networking.P2pSer
         };
 
         if (self.sync_service_inst) |sync_svc| {
+            enterSyncBatchesPhase(self, io, .callback, .beacon_blocks_by_range, req.batch_id, req.start_slot);
             sync_svc.onBatchResponse(req.chain_id, req.batch_id, req.generation, blocks);
+            completeSyncBatchesPhase(self, io, .callback);
         }
 
         log.debug("Batch {d}: delivered {d} blocks to sync pipeline", .{
@@ -2026,6 +2104,51 @@ fn completeP2pRuntimeStage(self: *BeaconNode, io: std.Io, stage: P2pRuntimeStage
         metrics.observeP2pRuntimeStageComplete(
             @intFromEnum(stage),
             self.p2p_runtime_heartbeat.last_stage_duration_ns,
+        );
+    }
+}
+
+fn enterSyncBatchesPhase(
+    self: *BeaconNode,
+    io: std.Io,
+    phase: SyncBatchesPhase,
+    method: networking.Method,
+    batch_id: u64,
+    start_slot: u64,
+) void {
+    const now_ns = timestampNowNs(io);
+    const now_ms = currentUnixTimeMs(io);
+    self.sync_batches_heartbeat.enter(phase, method, batch_id, start_slot, now_ns, now_ms);
+    if (self.metrics) |metrics| {
+        metrics.observeSyncBatchesPhaseEnter(
+            @intFromEnum(phase),
+            self.sync_batches_heartbeat.current_method,
+            self.sync_batches_heartbeat.current_batch_id,
+            self.sync_batches_heartbeat.current_start_slot,
+            now_ns,
+            now_ms,
+        );
+    }
+}
+
+fn completeSyncBatchesPhase(self: *BeaconNode, io: std.Io, phase: SyncBatchesPhase) void {
+    const now_ns = timestampNowNs(io);
+    self.sync_batches_heartbeat.complete(phase, now_ns);
+    if (self.metrics) |metrics| {
+        metrics.observeSyncBatchesPhaseComplete(
+            @intFromEnum(phase),
+            self.sync_batches_heartbeat.last_phase_duration_ns,
+        );
+    }
+}
+
+fn failSyncBatchesPhase(self: *BeaconNode, io: std.Io, phase: SyncBatchesPhase) void {
+    const now_ns = timestampNowNs(io);
+    self.sync_batches_heartbeat.fail(phase, now_ns);
+    if (self.metrics) |metrics| {
+        metrics.observeSyncBatchesPhaseError(
+            @intFromEnum(phase),
+            self.sync_batches_heartbeat.last_phase_duration_ns,
         );
     }
 }
@@ -4232,15 +4355,22 @@ fn ensureRangeSyncDataAvailability(
     svc: *networking.P2pService,
     peer_id: []const u8,
     blocks: []const BatchBlock,
+    batch_id: u64,
+    batch_start_slot: u64,
 ) !void {
-    const metas = try buildSyncBlockMetas(self, blocks);
+    enterSyncBatchesPhase(self, io, .ensure_da_plan, .beacon_blocks_by_range, batch_id, batch_start_slot);
+    const metas = buildSyncBlockMetas(self, blocks) catch |err| {
+        failSyncBatchesPhase(self, io, .ensure_da_plan);
+        return err;
+    };
+    completeSyncBatchesPhase(self, io, .ensure_da_plan);
     defer deinitSyncBlockMetas(self, metas);
 
-    fetchBlobSidecarsByRangeForMetas(self, io, svc, peer_id, metas) catch |err| {
+    fetchBlobSidecarsByRangeForMetas(self, io, svc, peer_id, metas, batch_id, batch_start_slot) catch |err| {
         reportReqRespFetchFailure(self, io, peer_id, .blob_sidecars_by_range, err);
         return err;
     };
-    fetchDataColumnsByRangeForMetas(self, io, svc, peer_id, metas) catch |err| {
+    fetchDataColumnsByRangeForMetas(self, io, svc, peer_id, metas, batch_id, batch_start_slot) catch |err| {
         reportReqRespFetchFailure(self, io, peer_id, .data_column_sidecars_by_range, err);
         return err;
     };
@@ -4326,6 +4456,8 @@ fn fetchBlobSidecarsByRangeForMetas(
     svc: *networking.P2pService,
     peer_id: []const u8,
     metas: []const SyncBlockMeta,
+    batch_id: u64,
+    batch_start_slot: u64,
 ) !void {
     var start_slot: u64 = std.math.maxInt(u64);
     var end_slot: u64 = 0;
@@ -4356,7 +4488,12 @@ fn fetchBlobSidecarsByRangeForMetas(
     const protocol_id = "/eth2/beacon_chain/req/blob_sidecars_by_range/1/ssz_snappy";
     const req_resp_encoding = networking.req_resp_encoding;
 
-    var outbound = try openReqRespRequest(self, io, svc, peer_id, .blob_sidecars_by_range, protocol_id);
+    enterSyncBatchesPhase(self, io, .fetch_blobs_by_range_open, .blob_sidecars_by_range, batch_id, batch_start_slot);
+    var outbound = openReqRespRequest(self, io, svc, peer_id, .blob_sidecars_by_range, protocol_id) catch |err| {
+        failSyncBatchesPhase(self, io, .fetch_blobs_by_range_open);
+        return err;
+    };
+    completeSyncBatchesPhase(self, io, .fetch_blobs_by_range_open);
     defer outbound.deinit(io);
     var request_outcome: networking.ReqRespRequestOutcome = .transport_error;
     defer outbound.finish(io, request_outcome);
@@ -4378,7 +4515,14 @@ fn fetchBlobSidecarsByRangeForMetas(
     };
     defer reader.deinit();
 
-    while (try reader.next(io, &outbound.stream)) |decoded| {
+    while (true) {
+        enterSyncBatchesPhase(self, io, .fetch_blobs_by_range_read, .blob_sidecars_by_range, batch_id, batch_start_slot);
+        const maybe_decoded = reader.next(io, &outbound.stream) catch |err| {
+            failSyncBatchesPhase(self, io, .fetch_blobs_by_range_read);
+            return err;
+        };
+        completeSyncBatchesPhase(self, io, .fetch_blobs_by_range_read);
+        const decoded = maybe_decoded orelse break;
         outbound.noteResponseChunk(decoded.ssz_bytes.len);
         if (decoded.result != .success) {
             self.allocator.free(decoded.ssz_bytes);
@@ -4614,6 +4758,8 @@ fn fetchDataColumnsByRangeForMetas(
     svc: *networking.P2pService,
     preferred_peer_id: []const u8,
     metas: []const SyncBlockMeta,
+    batch_id: u64,
+    batch_start_slot: u64,
 ) !void {
     var attempted_peers = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -4642,7 +4788,7 @@ fn fetchDataColumnsByRangeForMetas(
         errdefer self.allocator.free(selected_peer);
         try attempted_peers.append(self.allocator, selected_peer);
 
-        fetchDataColumnsByRangeOnce(self, io, svc, selected_peer, metas, &request) catch |err| {
+        fetchDataColumnsByRangeOnce(self, io, svc, selected_peer, metas, &request, batch_id, batch_start_slot) catch |err| {
             log.debug("Data column by-range fetch failed from peer {s}: {}", .{ selected_peer, err });
             last_err = err;
             continue;
@@ -4668,11 +4814,18 @@ fn fetchDataColumnsByRangeOnce(
     peer_id: []const u8,
     metas: []const SyncBlockMeta,
     request: *const networking.messages.DataColumnSidecarsByRangeRequest.Type,
+    batch_id: u64,
+    batch_start_slot: u64,
 ) !void {
     const protocol_id = "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy";
     const req_resp_encoding = networking.req_resp_encoding;
 
-    var outbound = try openReqRespRequest(self, io, svc, peer_id, .data_column_sidecars_by_range, protocol_id);
+    enterSyncBatchesPhase(self, io, .fetch_columns_by_range_open, .data_column_sidecars_by_range, batch_id, batch_start_slot);
+    var outbound = openReqRespRequest(self, io, svc, peer_id, .data_column_sidecars_by_range, protocol_id) catch |err| {
+        failSyncBatchesPhase(self, io, .fetch_columns_by_range_open);
+        return err;
+    };
+    completeSyncBatchesPhase(self, io, .fetch_columns_by_range_open);
     defer outbound.deinit(io);
     var request_outcome: networking.ReqRespRequestOutcome = .transport_error;
     defer outbound.finish(io, request_outcome);
@@ -4706,7 +4859,14 @@ fn fetchDataColumnsByRangeOnce(
     };
     defer reader.deinit();
 
-    while (try reader.next(io, &outbound.stream)) |decoded| {
+    while (true) {
+        enterSyncBatchesPhase(self, io, .fetch_columns_by_range_read, .data_column_sidecars_by_range, batch_id, batch_start_slot);
+        const maybe_decoded = reader.next(io, &outbound.stream) catch |err| {
+            failSyncBatchesPhase(self, io, .fetch_columns_by_range_read);
+            return err;
+        };
+        completeSyncBatchesPhase(self, io, .fetch_columns_by_range_read);
+        const decoded = maybe_decoded orelse break;
         outbound.noteResponseChunk(decoded.ssz_bytes.len);
         if (decoded.result != .success) {
             self.allocator.free(decoded.ssz_bytes);
@@ -5426,11 +5586,17 @@ fn fetchRawBlocksByRange(
     peer_id: []const u8,
     start_slot: u64,
     count: u64,
+    batch_id: u64,
 ) ![]BatchBlock {
     const protocol_id = "/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy";
     const req_resp_encoding = networking.req_resp_encoding;
 
-    var outbound = try openReqRespRequest(self, io, svc, peer_id, .beacon_blocks_by_range, protocol_id);
+    enterSyncBatchesPhase(self, io, .fetch_blocks_open, .beacon_blocks_by_range, batch_id, start_slot);
+    var outbound = openReqRespRequest(self, io, svc, peer_id, .beacon_blocks_by_range, protocol_id) catch |err| {
+        failSyncBatchesPhase(self, io, .fetch_blocks_open);
+        return err;
+    };
+    completeSyncBatchesPhase(self, io, .fetch_blocks_open);
     defer outbound.deinit(io);
     var request_outcome: networking.ReqRespRequestOutcome = .transport_error;
     defer outbound.finish(io, request_outcome);
@@ -5442,9 +5608,16 @@ fn fetchRawBlocksByRange(
     };
     var req_ssz: [networking.messages.BeaconBlocksByRangeRequest.fixed_size]u8 = undefined;
     _ = networking.messages.BeaconBlocksByRangeRequest.serializeIntoBytes(&request, &req_ssz);
-    try req_resp_encoding.writeRequestToStream(self.allocator, io, &outbound.stream, &req_ssz);
+    enterSyncBatchesPhase(self, io, .fetch_blocks_write, .beacon_blocks_by_range, batch_id, start_slot);
+    req_resp_encoding.writeRequestToStream(self.allocator, io, &outbound.stream, &req_ssz) catch |err| {
+        failSyncBatchesPhase(self, io, .fetch_blocks_write);
+        return err;
+    };
+    completeSyncBatchesPhase(self, io, .fetch_blocks_write);
     outbound.noteRequestPayload(req_ssz.len);
+    enterSyncBatchesPhase(self, io, .fetch_blocks_close_write, .beacon_blocks_by_range, batch_id, start_slot);
     outbound.stream.closeWrite(io);
+    completeSyncBatchesPhase(self, io, .fetch_blocks_close_write);
     request_outcome = .malformed_response;
 
     var result: std.ArrayListUnmanaged(BatchBlock) = .empty;
@@ -5462,7 +5635,9 @@ fn fetchRawBlocksByRange(
     var previous_chunk: ?ValidatedBlockRangeChunk = null;
 
     while (blocks_received < count) {
+        enterSyncBatchesPhase(self, io, .fetch_blocks_read, .beacon_blocks_by_range, batch_id, start_slot);
         const decoded = reader.next(io, &outbound.stream) catch |err| {
+            failSyncBatchesPhase(self, io, .fetch_blocks_read);
             if (err == error.UnexpectedEof and result.items.len > 0) {
                 log.debug("blocks-by-range from {s}: salvaging {d} block(s) after unexpected EOF", .{
                     peer_id,
@@ -5471,7 +5646,11 @@ fn fetchRawBlocksByRange(
                 break;
             }
             return err;
-        } orelse break;
+        } orelse {
+            completeSyncBatchesPhase(self, io, .fetch_blocks_read);
+            break;
+        };
+        completeSyncBatchesPhase(self, io, .fetch_blocks_read);
         outbound.noteResponseChunk(decoded.ssz_bytes.len);
         if (decoded.result != .success) {
             self.allocator.free(decoded.ssz_bytes);
@@ -6306,6 +6485,48 @@ test "runtime loop stage ids remain stable for metrics dashboards" {
     try std.testing.expectEqual(@as(u16, 10), @intFromEnum(P2pRuntimeStage.sync_batches));
     try std.testing.expectEqual(@as(u16, 12), @intFromEnum(P2pRuntimeStage.linked_chain_imports));
     try std.testing.expectEqual(@as(u16, 16), @intFromEnum(P2pRuntimeStage.advance_chain_clock));
+}
+
+test "sync batches phase ids remain stable for metrics dashboards" {
+    try std.testing.expectEqual(@as(u16, 0), @intFromEnum(SyncBatchesPhase.idle));
+    try std.testing.expectEqual(@as(u16, 1), @intFromEnum(SyncBatchesPhase.pop_request));
+    try std.testing.expectEqual(@as(u16, 10), @intFromEnum(SyncBatchesPhase.fetch_blocks_open));
+    try std.testing.expectEqual(@as(u16, 11), @intFromEnum(SyncBatchesPhase.fetch_blocks_write));
+    try std.testing.expectEqual(@as(u16, 12), @intFromEnum(SyncBatchesPhase.fetch_blocks_close_write));
+    try std.testing.expectEqual(@as(u16, 14), @intFromEnum(SyncBatchesPhase.fetch_blocks_read));
+    try std.testing.expectEqual(@as(u16, 20), @intFromEnum(SyncBatchesPhase.ensure_da_plan));
+    try std.testing.expectEqual(@as(u16, 30), @intFromEnum(SyncBatchesPhase.fetch_blobs_by_range_open));
+    try std.testing.expectEqual(@as(u16, 31), @intFromEnum(SyncBatchesPhase.fetch_blobs_by_range_read));
+    try std.testing.expectEqual(@as(u16, 40), @intFromEnum(SyncBatchesPhase.fetch_columns_by_range_open));
+    try std.testing.expectEqual(@as(u16, 41), @intFromEnum(SyncBatchesPhase.fetch_columns_by_range_read));
+    try std.testing.expectEqual(@as(u16, 60), @intFromEnum(SyncBatchesPhase.callback));
+    try std.testing.expectEqual(@as(u16, 90), @intFromEnum(SyncBatchesPhase.failed));
+}
+
+test "sync batches heartbeat records phase entry completion and errors" {
+    var heartbeat = SyncBatchesHeartbeat{};
+
+    heartbeat.enter(.fetch_blocks_open, .beacon_blocks_by_range, 42, 9001, 100, 1000);
+    try std.testing.expectEqual(SyncBatchesPhase.fetch_blocks_open, heartbeat.current_phase);
+    try std.testing.expectEqual(@as(u16, 1), heartbeat.current_method);
+    try std.testing.expectEqual(@as(u64, 42), heartbeat.current_batch_id);
+    try std.testing.expectEqual(@as(u64, 9001), heartbeat.current_start_slot);
+    try std.testing.expectEqual(@as(u64, 100), heartbeat.current_phase_started_ns);
+    try std.testing.expectEqual(@as(u64, 1000), heartbeat.current_phase_started_unix_ms);
+    try std.testing.expectEqual(@as(u64, 1), heartbeat.phase_entries_total);
+
+    heartbeat.complete(.fetch_blocks_open, 250);
+    try std.testing.expectEqual(SyncBatchesPhase.idle, heartbeat.current_phase);
+    try std.testing.expectEqual(SyncBatchesPhase.fetch_blocks_open, heartbeat.last_completed_phase);
+    try std.testing.expectEqual(@as(u64, 150), heartbeat.last_phase_duration_ns);
+    try std.testing.expectEqual(@as(u64, 1), heartbeat.phase_completions_total);
+
+    heartbeat.enter(.fetch_blocks_read, .beacon_blocks_by_range, 42, 9001, 300, 1300);
+    heartbeat.fail(.fetch_blocks_read, 375);
+    try std.testing.expectEqual(SyncBatchesPhase.failed, heartbeat.current_phase);
+    try std.testing.expectEqual(SyncBatchesPhase.fetch_blocks_read, heartbeat.last_error_phase);
+    try std.testing.expectEqual(@as(u64, 75), heartbeat.last_phase_duration_ns);
+    try std.testing.expectEqual(@as(u64, 1), heartbeat.phase_errors_total);
 }
 
 test "sync by root phase ids remain stable for metrics dashboards" {
