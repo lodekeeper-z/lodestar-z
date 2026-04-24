@@ -356,10 +356,34 @@ const OutboundDialEvent = union(enum) {
     timeout: TimeoutWaitResult,
 };
 
+const ReqRespOpenAttemptResult = union(enum) {
+    success: networking.QuicStream,
+    failure: anyerror,
+    canceled,
+};
+
+const ReqRespOpenEvent = union(enum) {
+    open: ReqRespOpenAttemptResult,
+    timeout: TimeoutWaitResult,
+};
+
 fn freeOutboundDialEvent(allocator: std.mem.Allocator, event: OutboundDialEvent) void {
     switch (event) {
         .dial => |result| switch (result) {
             .success => |peer_id| allocator.free(peer_id),
+            .failure, .canceled => {},
+        },
+        .timeout => {},
+    }
+}
+
+fn freeReqRespOpenEvent(io: std.Io, event: ReqRespOpenEvent) void {
+    switch (event) {
+        .open => |result| switch (result) {
+            .success => |stream| {
+                var owned_stream = stream;
+                closeOwnedQuicStream(io, &owned_stream);
+            },
             .failure, .canceled => {},
         },
         .timeout => {},
@@ -742,6 +766,17 @@ fn sleepingOutboundDialAttemptTask(io: std.Io, delay_ms: u64) OutboundDialAttemp
     return .{ .failure = error.TestUnexpectedResult };
 }
 
+fn sleepingReqRespOpenAttemptTask(io: std.Io, delay_ms: u64) ReqRespOpenAttemptResult {
+    const sleep_timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(@intCast(delay_ms)),
+        .clock = .awake,
+    } };
+    sleep_timeout.sleep(io) catch |err| switch (err) {
+        error.Canceled => return .canceled,
+    };
+    return .{ .failure = error.TestUnexpectedResult };
+}
+
 test "outbound dial helper returns successful dial before timeout" {
     const peer_id = try awaitOutboundDialAttemptWithTimeout(
         std.testing.allocator,
@@ -763,6 +798,18 @@ test "outbound dial helper times out hung dial attempts" {
             std.testing.io,
             5,
             sleepingOutboundDialAttemptTask,
+            .{ std.testing.io, 50 },
+        ),
+    );
+}
+
+test "req/resp open helper times out hung protocol dials" {
+    try std.testing.expectError(
+        error.Timeout,
+        awaitReqRespOpenWithTimeout(
+            std.testing.io,
+            5,
+            sleepingReqRespOpenAttemptTask,
             .{ std.testing.io, 50 },
         ),
     );
@@ -1384,6 +1431,60 @@ fn responseCodeOutcome(code: networking.ResponseCode) networking.ReqRespRequestO
     return networking.ReqRespRequestOutcome.fromResponseCode(code);
 }
 
+fn reqRespOpenAttemptTask(
+    svc: *networking.P2pService,
+    io: std.Io,
+    peer_id: []const u8,
+    protocol_id: []const u8,
+) ReqRespOpenAttemptResult {
+    const stream = svc.dialProtocol(io, peer_id, protocol_id) catch |err| return .{ .failure = err };
+    return .{ .success = stream };
+}
+
+fn awaitReqRespOpenWithTimeout(
+    io: std.Io,
+    timeout_ms: u64,
+    comptime AttemptTask: anytype,
+    attempt_args: anytype,
+) !networking.QuicStream {
+    var events_buf: [2]ReqRespOpenEvent = undefined;
+    var select = std.Io.Select(ReqRespOpenEvent).init(io, &events_buf);
+    errdefer while (select.cancel()) |event| {
+        freeReqRespOpenEvent(io, event);
+    };
+
+    try select.concurrent(.open, AttemptTask, attempt_args);
+    select.async(.timeout, waitTimeout, .{ io, .{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+        .clock = .awake,
+    } } });
+
+    while (true) {
+        const event = try select.await();
+        switch (event) {
+            .open => |result| {
+                while (select.cancel()) |pending| {
+                    freeReqRespOpenEvent(io, pending);
+                }
+                return switch (result) {
+                    .success => |stream| stream,
+                    .failure => |err| err,
+                    .canceled => error.Canceled,
+                };
+            },
+            .timeout => |result| switch (result) {
+                .fired => {
+                    while (select.cancel()) |pending| {
+                        freeReqRespOpenEvent(io, pending);
+                    }
+                    return error.Timeout;
+                },
+                .canceled => {},
+            },
+        }
+    }
+}
+
 fn openReqRespRequest(
     self: *BeaconNode,
     io: std.Io,
@@ -1415,7 +1516,12 @@ fn openReqRespRequest(
         protocol_id,
     });
 
-    const stream = svc.dialProtocol(io, peer_id, protocol_id) catch |err| {
+    const stream = awaitReqRespOpenWithTimeout(
+        io,
+        outbound_dial_timeout_ms,
+        reqRespOpenAttemptTask,
+        .{ svc, io, peer_id, protocol_id },
+    ) catch |err| {
         if (self.metrics) |metrics| {
             metrics.observeReqRespOutbound(req_resp_method, .transport_error, reqRespElapsedSeconds(io, started_ns), 0, 0, 0);
         }
