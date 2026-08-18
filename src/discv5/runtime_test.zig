@@ -446,17 +446,37 @@ test "Runtime command admission is bounded nonblocking and drains accepted owner
 
     var run_error: ?anyerror = null;
     var runtime_group: std.Io.Group = .init;
+    var runtime_group_started = false;
+    var runtime_group_awaited = false;
+    var producer_group: std.Io.Group = .init;
+    var producer_group_started = false;
+    var producer_group_awaited = false;
     try runtime_group.concurrent(io, runRuntime, .{ runtime, &run_error });
+    runtime_group_started = true;
+    defer {
+        gate.proceed.store(true, .release);
+        if (runtime_group_started and !runtime_group_awaited) runtime.stop();
+        if (producer_group_started and !producer_group_awaited) {
+            producer_group.await(io) catch {};
+            producer_group_started = false;
+            producer_group_awaited = true;
+        }
+        if (runtime_group_started and !runtime_group_awaited) {
+            runtime_group.await(io) catch {};
+            runtime_group_started = false;
+            runtime_group_awaited = true;
+        }
+    }
     for (0..10_000) |_| {
         if (gate.entered.load(.acquire)) break;
         try std.Thread.yield();
     } else return error.RuntimeDidNotEnter;
 
     var producers: [producer_count]OwnedCommandProducer = undefined;
-    var producer_group: std.Io.Group = .init;
     for (&producers) |*producer| {
         producer.* = .{ .io = io, .allocator = alloc, .runtime = runtime };
         try producer_group.concurrent(io, enqueueOwnedCommand, .{producer});
+        producer_group_started = true;
     }
     for (0..10_000) |_| {
         var attempted: usize = 0;
@@ -475,7 +495,11 @@ test "Runtime command admission is bounded nonblocking and drains accepted owner
     runtime.stop();
     gate.proceed.store(true, .release);
     try producer_group.await(io);
+    producer_group_started = false;
+    producer_group_awaited = true;
     try runtime_group.await(io);
+    runtime_group_started = false;
+    runtime_group_awaited = true;
 
     for (&producers) |*producer| {
         if (producer.accepted) {
@@ -777,6 +801,49 @@ test "running Runtime rejects oversized TALK before queued ownership admission" 
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
     try std.testing.expectEqual(@as(usize, 0), counts.permits);
+
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
+}
+
+test "running Runtime rejects exactly 128 FINDNODE distances before request admission" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x75, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x76} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 19075 } };
+    const distances = [_]u16{1} ** 128;
+
+    var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+    var snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), snapshot.sentMessageCount(.findnode));
+
+    try std.testing.expectError(error.TooManyDistances, runtime.sendFindNode(remote_id, &remote_pubkey, address, &distances));
+
+    counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+    snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), snapshot.sentMessageCount(.findnode));
 
     running.stop();
     try running.await();
