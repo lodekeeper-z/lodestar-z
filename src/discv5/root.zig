@@ -49,7 +49,10 @@ test {
     _ = @import("state/response_book.zig");
     _ = @import("state/peer_book_test.zig");
     _ = @import("contact_book.zig");
-    _ = @import("actor_test.zig");
+    _ = @import("actor_tests/eviction_request_lifecycle.zig");
+    _ = @import("actor_tests/session_handshake_recovery.zig");
+    _ = @import("actor_tests/event_lookup_allocator_failures.zig");
+    _ = @import("actor_tests/interoperability_handshake_policy.zig");
     _ = @import("address_vote_test.zig");
     _ = @import("runtime_test.zig");
     _ = @import("service/addr_votes.zig");

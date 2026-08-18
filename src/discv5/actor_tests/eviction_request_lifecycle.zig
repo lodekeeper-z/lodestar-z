@@ -1,0 +1,701 @@
+const std = @import("std");
+const actor_mod = @import("../actor.zig");
+const completion = @import("../flow/completion.zig");
+const admission = @import("../admission.zig");
+const config = @import("../config.zig");
+const enr = @import("../enr.zig");
+const events = @import("../events.zig");
+const outbound = @import("../flow/outbound.zig");
+const packet = @import("../protocol/packet.zig");
+const message = @import("../protocol/message.zig");
+const metrics = @import("../metrics.zig");
+const secp = @import("../secp256k1.zig");
+const request_book = @import("../state/request_book.zig");
+const session_book = @import("../state/session_book.zig");
+const types = @import("../types.zig");
+const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
+const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
+const deliverEncrypted = @import("../test_support/encrypted_delivery.zig").deliverEncrypted;
+
+test "request completion has one canonical finish path" {
+    try std.testing.expect(@hasDecl(completion, "finish"));
+    try std.testing.expect(!@hasDecl(completion, "apply"));
+    try std.testing.expect(!@hasDecl(completion, "cancel"));
+}
+
+test "Actor isolates health identity and arms exact eviction probes" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x41} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x42} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
+    remote_builder.ip = .{ 127, 0, 0, 2 };
+    remote_builder.udp = 9000;
+    const remote_enr = try remote_builder.encode();
+    defer alloc.free(remote_enr);
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
+    const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9000 } };
+    const endpoint = types.Endpoint{ .node_id = remote_id, .addr = address };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 4 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    try std.testing.expect(actor.peers.learnEnr(remote_enr, 0) != null);
+    _ = actor.peers.markResponsive(remote_id, address, 0, null);
+
+    const health = types.RequestKey.init(endpoint, try message.ReqId.fromSlice(&.{1}));
+    const unrelated = types.RequestKey.init(endpoint, try message.ReqId.fromSlice(&.{2}));
+    const newer = types.RequestKey.init(endpoint, try message.ReqId.fromSlice(&.{3}));
+    try std.testing.expect(actor.peers.armHealthRequest(health, .connected_only));
+    actor.onRequestCompletion(harness.env(), unrelated, .api, true, &.{});
+    try expectActorHealthRequest(actor, remote_id, health);
+    actor.onRequestCompletion(harness.env(), health, .api, false, &.{});
+    try expectActorHealthRequest(actor, remote_id, health);
+    actor.onRequestCompletion(harness.env(), health, .{ .maintenance = .enr_refresh }, false, &.{});
+    try expectActorHealthRequest(actor, remote_id, health);
+
+    try std.testing.expect(!actor.peers.armHealthRequest(newer, .connected_only));
+    actor.onRequestCompletion(harness.env(), unrelated, .{ .maintenance = .health }, false, &.{});
+    try expectActorHealthRequest(actor, remote_id, health);
+    actor.onRequestCompletion(harness.env(), health, .{ .maintenance = .health }, true, &.{});
+    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+
+    try std.testing.expect(actor.peers.armHealthRequest(newer, .connected_only));
+    actor.onRequestCompletion(harness.env(), newer, .{ .maintenance = .eviction }, false, &.{});
+    // Exact-candidate eviction timeout on a still-connected entry keeps the
+    // incumbent (liveness proven by other authenticated traffic) and only
+    // releases the probe reservation.
+    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, actor.peers.routing.getEntry(&remote_id).?.status);
+    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+    _ = actor.peers.markResponsive(remote_id, address, 0, null);
+    const candidate = actor.peers.routing.getEntry(&remote_id).?.*;
+    actor.probeEviction(harness.env(), candidate);
+    const eviction_key = actor.peers.routing.getEntry(&remote_id).?.health_request orelse return error.MissingEvictionHealthRequest;
+    try std.testing.expect(types.EndpointContext.eql(.{}, eviction_key.endpoint, endpoint));
+    const request = actor.requests.get(eviction_key) orelse return error.MissingEvictionRequest;
+    switch (request.origin) {
+        .maintenance => |reason| try std.testing.expectEqual(types.MaintenanceReason.eviction, reason),
+        else => return error.WrongEvictionRequestOrigin,
+    }
+    try std.testing.expectEqual(remote_pubkey, actor.peers.known(&remote_id).?.pubkey);
+}
+
+test "stale eviction candidate fails reservation before any send or permit" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x34} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x35} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 8 }, .port = 9006 } };
+    const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 9 }, .port = 9007 } };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, address_b, null, outbound.nowNs(io)));
+    const stale = @import("../kbucket.zig").Entry{
+        .node_id = remote_id,
+        .pubkey = remote_pubkey,
+        .addr = address_a,
+        .last_seen = 0,
+        .status = .connected,
+    };
+
+    actor.probeEviction(harness.env(), stale);
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+}
+
+const EvictionHarness = struct {
+    ingress: admission.IngressAdmission,
+    outbox: events.EventOutbox,
+    actor: actor_mod.Actor,
+    recording: RecordingSender,
+    candidate: @import("../kbucket.zig").Entry,
+    candidate_key: secp.KeyPair,
+    candidate_id: types.NodeId,
+    candidate_endpoint: types.Endpoint,
+    pending_id: types.NodeId,
+    bucket_distance: u8,
+
+    const kbucket_mod = @import("../kbucket.zig");
+
+    fn init(alloc: std.mem.Allocator, io: std.Io) !EvictionHarness {
+        const local_key = try secp.keyPairFromSecret(&([_]u8{0x25} ** 32));
+        const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+        const candidate_key = try secp.keyPairFromSecret(&([_]u8{0x26} ** 32));
+        const candidate_pubkey = secp.compressedPubkey(&candidate_key);
+        const candidate_id = try enr.nodeIdFromCompressedPubkey(&candidate_pubkey);
+        const distance = kbucket_mod.logDistance(&local_id, &candidate_id) orelse return error.SameNodeId;
+        // Low-byte variations below preserve the bucket only when the highest
+        // differing bit is far above them.
+        try std.testing.expect(distance > 64);
+        const candidate_addr = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 51 }, .port = 9051 } };
+        const cfg = config.Config{
+            .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+            .local_key_pair = local_key,
+            .local_node_id = local_id,
+            .request_timeout_ms = 1,
+            .request_retries = 0,
+            .ping_interval_ms = 0,
+            .rate_limiter = null,
+            .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 4 },
+        };
+        var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
+        errdefer ingress.deinit();
+        var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
+        errdefer outbox.deinit();
+        var actor = try actor_mod.Actor.init(alloc, cfg);
+        errdefer actor.deinit(&ingress);
+
+        // Fill the candidate's bucket: the real candidate first (learned via
+        // a valid ENR like production peers), then K - 1 fabricated
+        // disconnected peers in the same bucket.
+        var candidate_builder = enr.Builder.init(alloc, candidate_key, 1);
+        candidate_builder.ip = candidate_addr.ip4.bytes;
+        candidate_builder.udp = candidate_addr.ip4.port;
+        const candidate_enr = try candidate_builder.encode();
+        defer alloc.free(candidate_enr);
+        try std.testing.expect(actor.peers.learnEnr(candidate_enr, 0) != null);
+        try std.testing.expectEqual(kbucket_mod.EntryStatus.disconnected, actor.peers.routing.getEntry(&candidate_id).?.status);
+        var sibling = candidate_id;
+        for (1..kbucket_mod.K) |i| {
+            sibling[31] = candidate_id[31] ^ @as(u8, @intCast(i));
+            try std.testing.expect(actor.peers.routing.insert(.{
+                .node_id = sibling,
+                .pubkey = candidate_pubkey,
+                .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 52 }, .port = @intCast(9052 + i) } },
+                .last_seen = 0,
+                .status = .disconnected,
+            }));
+        }
+
+        // A connected newcomer overflows the bucket; the genuine eviction
+        // candidate handed back is the disconnected oldest entry.
+        var pending_id = candidate_id;
+        pending_id[30] = candidate_id[30] ^ 0x55;
+        const outcome = actor.peers.routing.insertDetailed(.{
+            .node_id = pending_id,
+            .pubkey = candidate_pubkey,
+            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 53 }, .port = 9053 } },
+            .last_seen = 1,
+            .status = .connected,
+        });
+        try std.testing.expect(!outcome.inserted);
+        const candidate = outcome.pending_eviction orelse return error.MissingEvictionCandidate;
+        try std.testing.expectEqualSlices(u8, &candidate_id, &candidate.node_id);
+        try std.testing.expectEqual(kbucket_mod.EntryStatus.disconnected, candidate.status);
+
+        return .{
+            .ingress = ingress,
+            .outbox = outbox,
+            .actor = actor,
+            .recording = RecordingSender.init(alloc),
+            .candidate = candidate,
+            .candidate_key = candidate_key,
+            .candidate_id = candidate_id,
+            .candidate_endpoint = .{ .node_id = candidate_id, .addr = candidate_addr },
+            .pending_id = pending_id,
+            .bucket_distance = distance,
+        };
+    }
+
+    fn deinit(self: *EvictionHarness) void {
+        self.recording.deinit();
+        self.actor.deinit(&self.ingress);
+        self.outbox.deinit();
+        self.ingress.deinit();
+    }
+
+    fn bucket(self: *EvictionHarness) *kbucket_mod.KBucket {
+        return &self.actor.peers.routing.buckets[self.bucket_distance];
+    }
+
+    fn armedKey(self: *EvictionHarness) !types.RequestKey {
+        return self.actor.peers.routing.getEntry(&self.candidate_id).?.health_request orelse error.MissingEvictionReservation;
+    }
+
+    fn expectProbeRequest(self: *EvictionHarness) !types.RequestKey {
+        const key = try self.armedKey();
+        try std.testing.expect(types.EndpointContext.eql(.{}, key.endpoint, self.candidate_endpoint));
+        const request = self.actor.requests.get(key) orelse return error.MissingEvictionRequest;
+        switch (request.origin) {
+            .maintenance => |reason| try std.testing.expectEqual(types.MaintenanceReason.eviction, reason),
+            else => return error.WrongEvictionOrigin,
+        }
+        try std.testing.expectEqual(@as(usize, 1), self.actor.requests.activeCount());
+        try std.testing.expectEqual(@as(usize, 1), self.ingress.permitCount());
+        try std.testing.expectEqual(@as(usize, 1), self.recording.datagrams.items.len);
+        return key;
+    }
+};
+
+test "real full-bucket eviction probe stays active with a live permit after send" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var harness = try EvictionHarness.init(alloc, io);
+    defer harness.deinit();
+
+    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    _ = try harness.expectProbeRequest();
+    try std.testing.expect(harness.bucket().pending != null);
+    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.disconnected, harness.actor.peers.routing.getEntry(&harness.candidate_id).?.status);
+}
+
+test "real eviction probe PONG keeps the candidate and clears the pending replacement" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var harness = try EvictionHarness.init(alloc, io);
+    defer harness.deinit();
+    const stable = session_book.StableSession{ .initiator_key = [_]u8{0x27} ** 16, .recipient_key = [_]u8{0x28} ** 16 };
+    harness.actor.sessions.put(harness.candidate_endpoint, stable, outbound.nowNs(io));
+
+    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    const key = try harness.expectProbeRequest();
+    const pong = message.Pong{ .req_id = key.req_id, .enr_seq = 0, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 };
+    var pong_buffer: [128]u8 = undefined;
+    try deliverEncrypted(&harness.actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, harness.candidate_endpoint, &stable.recipient_key, try pong.encodeInto(&pong_buffer), 31);
+
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    const survivor = harness.actor.peers.routing.getEntry(&harness.candidate_id) orelse return error.CandidateEvicted;
+    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, survivor.status);
+    try std.testing.expect(survivor.health_request == null);
+    try std.testing.expect(harness.bucket().pending == null);
+    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.pending_id) == null);
+    var connected_event = harness.outbox.pop() orelse return error.MissingConnectedEvent;
+    defer connected_event.deinit(alloc);
+    try std.testing.expect(connected_event == .peer_connected);
+    try std.testing.expectEqualSlices(u8, &harness.candidate_id, &connected_event.peer_connected.peer_id);
+}
+
+test "real eviction probe WHOAREYOU recovery preserves reservation and completes" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var harness = try EvictionHarness.init(alloc, io);
+    defer harness.deinit();
+
+    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    const key = try harness.expectProbeRequest();
+    var probe = harness.recording.datagrams.items[0].bytes;
+    const request_nonce = (try packet.decode(probe.bytes[0..probe.len], &harness.candidate_id)).static_header.nonce;
+    var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
+        .masking_iv = &([_]u8{0x29} ** 16),
+        .recipient_node_id = &harness.actor.local_node_id,
+        .request_nonce = &request_nonce,
+        .id_nonce = &([_]u8{0x2a} ** 16),
+        .enr_seq = 0,
+    }, null);
+    harness.actor.handlePacket(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, challenge, harness.candidate_endpoint.addr);
+
+    // The recovery handshake is on the wire while reservation, request,
+    // permit, and pending keys all survive.
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    const pending = harness.actor.requests.pendingKeys(harness.candidate_endpoint) orelse return error.MissingPendingKeys;
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.key, key));
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, try harness.armedKey(), key));
+
+    const pong = message.Pong{ .req_id = key.req_id, .enr_seq = 0, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 };
+    var pong_buffer: [128]u8 = undefined;
+    try deliverEncrypted(&harness.actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, harness.candidate_endpoint, &pending.keys.recipient_key, try pong.encodeInto(&pong_buffer), 32);
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, harness.actor.peers.routing.getEntry(&harness.candidate_id).?.status);
+    try std.testing.expect(harness.bucket().pending == null);
+}
+
+test "real eviction probe timeout removes the exact candidate and promotes pending" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var harness = try EvictionHarness.init(alloc, io);
+    defer harness.deinit();
+
+    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    _ = try harness.expectProbeRequest();
+
+    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    harness.actor.maintenance(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox });
+
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id) == null);
+    const promoted = harness.actor.peers.routing.getEntry(&harness.pending_id) orelse return error.PendingNotPromoted;
+    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, promoted.status);
+    try std.testing.expect(harness.bucket().pending == null);
+    var saw_promoted_connected = false;
+    while (harness.outbox.pop()) |event_value| {
+        var event = event_value;
+        defer event.deinit(alloc);
+        if (event == .peer_connected and std.mem.eql(u8, &event.peer_connected.peer_id, &harness.pending_id)) saw_promoted_connected = true;
+    }
+    try std.testing.expect(saw_promoted_connected);
+}
+
+test "real eviction probe send failure rolls back reservation and bucket state" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var harness = try EvictionHarness.init(alloc, io);
+    defer harness.deinit();
+
+    harness.recording.fail_next = true;
+    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id).?.health_request == null);
+    try std.testing.expect(harness.bucket().pending != null);
+    try std.testing.expectEqualSlices(u8, &harness.pending_id, &harness.bucket().pending.?.node_id);
+    harness.actor.requests.assertInvariants();
+}
+
+test "health and eviction probes never queue behind endpoint establishment" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x36} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x37} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
+    remote_builder.ip = .{ 127, 0, 0, 10 };
+    remote_builder.udp = 9010;
+    const remote_enr = try remote_builder.encode();
+    defer alloc.free(remote_enr);
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 10 }, .port = 9010 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .request_timeout_ms = 1,
+        .request_retries = 0,
+        .ping_interval_ms = 0,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    try std.testing.expect(actor.peers.learnEnr(remote_enr, 0) != null);
+    _ = actor.peers.markResponsive(remote_id, endpoint.addr, 0, null);
+
+    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    try std.testing.expectError(error.EndpointBusy, actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .{ .maintenance = .health }));
+    actor.probeEviction(harness.env(), actor.peers.routing.getEntry(&remote_id).?.*);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+
+    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    actor.maintenance(harness.env());
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, actor.peers.routing.getEntry(&remote_id).?.status);
+}
+
+fn expectActorHealthRequest(actor: *const actor_mod.Actor, node_id: types.NodeId, expected: types.RequestKey) !void {
+    const actual = actor.peers.routing.getEntryWithPending(&node_id).?.health_request orelse return error.MissingHealthRequest;
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, actual, expected));
+    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, actor.peers.routing.getEntry(&node_id).?.status);
+}
+
+test "named cancellation conserves permits and queued FIFO across drain failure" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x43} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x44} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 4 }, .port = 9004 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+
+    const first = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    const second = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 2, .api);
+    const third = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 3, .api);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), actor.requests.queuedCount());
+
+    try std.testing.expect(actor.cancelRequest(harness.env(), .init(endpoint, second)));
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
+
+    harness.recording.fail_next = true;
+    try std.testing.expect(actor.cancelRequest(harness.env(), .init(endpoint, first)));
+    try std.testing.expect(!actor.cancelRequest(harness.env(), .init(endpoint, first)));
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0x51} ** 16,
+        .recipient_key = [_]u8{0x52} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+    outbound.drainEndpoint(actor, harness.env(), endpoint);
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expectEqualSlices(u8, third.slice(), (try decodeSentPing(&harness.recording.datagrams.items[1].bytes, &remote_id, &stable.initiator_key)).req_id.slice());
+}
+
+test "maintenance automatically redrains a queued lane after one transient send failure" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x99} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9a} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 44 }, .port = 9244 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .request_timeout_ms = 60_000,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 2,
+            .max_queued_requests = 2,
+            .max_queued_requests_per_endpoint = 2,
+            .event_capacity = 2,
+            .command_capacity = 2,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+
+    const first = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    const second = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
+
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xc1} ** 16,
+        .recipient_key = [_]u8{0xc2} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+    harness.recording.fail_next = true;
+    try std.testing.expect(actor.cancelRequest(
+        harness.env(),
+        .init(endpoint, first),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+
+    actor.maintenance(harness.env());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    const retried = try decodeSentPing(&harness.recording.datagrams.items[1].bytes, &remote_id, &stable.initiator_key);
+    try std.testing.expectEqualSlices(u8, second.slice(), retried.req_id.slice());
+}
+
+fn decodeSentPing(datagram: *const types.PacketBytes, recipient_id: *const types.NodeId, write_key: *const [16]u8) !message.Ping {
+    var raw = datagram.*;
+    const parsed = try packet.decode(raw.bytes[0..raw.len], recipient_id);
+    var plaintext_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    var ad_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const plaintext = try packet.decryptMessageInto(
+        &plaintext_buffer,
+        &ad_buffer,
+        write_key,
+        &parsed.static_header.nonce,
+        parsed.message_ciphertext,
+        &parsed.masking_iv,
+        parsed.header_raw,
+    );
+    return message.Ping.decode(plaintext);
+}
+
+test "AdmissionPermit survives retry and releases on final timeout" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x45} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x46} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 6 }, .port = 9006 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .request_timeout_ms = 1,
+        .request_retries = 1,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 }, outbound.nowNs(io));
+    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(u64, 1), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
+
+    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    actor.maintenance(harness.env());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(u64, 2), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
+
+    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    actor.maintenance(harness.env());
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    var timeout_event = harness.outbox.pop() orelse return error.MissingTimeoutEvent;
+    defer timeout_event.deinit(alloc);
+    try std.testing.expect(timeout_event == .request_timeout);
+}
+
+test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x18} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x19} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 25 }, .port = 9025 } },
+    };
+    const discovered_key_a = try secp.keyPairFromSecret(&([_]u8{0x1a} ** 32));
+    var builder_a = enr.Builder.init(alloc, discovered_key_a, 1);
+    builder_a.ip = .{ 127, 0, 0, 26 };
+    builder_a.udp = 9026;
+    const raw_a = try builder_a.encode();
+    defer alloc.free(raw_a);
+    const id_a = (try (try enr.decode(raw_a)).nodeId()).?;
+    const discovered_key_b = try secp.keyPairFromSecret(&([_]u8{0x1b} ** 32));
+    var builder_b = enr.Builder.init(alloc, discovered_key_b, 1);
+    builder_b.ip = .{ 127, 0, 0, 27 };
+    builder_b.udp = 9027;
+    const raw_b = try builder_b.encode();
+    defer alloc.free(raw_b);
+    const id_b = (try (try enr.decode(raw_b)).nodeId()).?;
+    const distance_a: u16 = if (@import("../kbucket.zig").logDistance(&id_a, &remote_id)) |value| @as(u16, value) + 1 else 0;
+    const distance_b: u16 = if (@import("../kbucket.zig").logDistance(&id_b, &remote_id)) |value| @as(u16, value) + 1 else 0;
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .request_timeout_ms = 1,
+        .request_retries = 1,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 1,
+            .max_queued_requests = 1,
+            .challenge_capacity = 1,
+            .response_recovery_capacity = 1,
+            .event_capacity = 4,
+            .command_capacity = 1,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0x1c} ** 16,
+        .recipient_key = [_]u8{0x1d} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+    const req_id = try actor.sendFindNode(
+        harness.env(),
+        endpoint,
+        &remote_pubkey,
+        &.{ distance_a, distance_b },
+        .api,
+    );
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+
+    var first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const first = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{raw_a} };
+    const first_plaintext = try first.encodeInto(&first_buffer);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, first_plaintext, 0x21);
+    const partial = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
+    try std.testing.expectEqual(@as(u64, 2), partial.total_responses.?);
+    try std.testing.expectEqual(@as(u64, 1), partial.responses_received);
+    try std.testing.expectEqual(@as(usize, 1), partial.enrs.items.len);
+
+    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    actor.maintenance(harness.env());
+    const fresh = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
+    try std.testing.expect(fresh.total_responses == null);
+    try std.testing.expectEqual(@as(u64, 0), fresh.responses_received);
+    try std.testing.expectEqual(@as(usize, 0), fresh.enrs.items.len);
+    try std.testing.expectEqual(@as(usize, request_book.MAX_NODES_RESPONSE), fresh.enrs.capacity);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, first_plaintext, 0x22);
+    const repeated = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
+    try std.testing.expectEqual(@as(u64, 1), repeated.responses_received);
+    try std.testing.expectEqual(@as(usize, 1), repeated.enrs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+
+    var final_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const final = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{raw_b} };
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 0x23);
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    var saw_nodes = false;
+    var processed: usize = 0;
+    while (processed < cfg.limits.event_capacity) : (processed += 1) {
+        var event = harness.outbox.pop() orelse break;
+        if (event == .nodes) {
+            try std.testing.expectEqual(@as(usize, 2), event.nodes.enrs.items.len);
+            saw_nodes = true;
+        }
+        event.deinit(alloc);
+    }
+    try std.testing.expect(saw_nodes);
+}
