@@ -40,6 +40,23 @@ pub fn handlePacket(actor: *Actor, env: Env, raw: []u8, from: types.Address) voi
     }
 }
 
+fn decryptParsedMessage(
+    parsed: *const packet.ParsedPacket,
+    read_key: *const [16]u8,
+    plaintext_out: *[packet.MAX_PACKET_SIZE]u8,
+    ad_out: *[packet.MAX_PACKET_SIZE]u8,
+) ?[]u8 {
+    return packet.decryptMessageInto(
+        plaintext_out,
+        ad_out,
+        read_key,
+        &parsed.static_header.nonce,
+        parsed.message_ciphertext,
+        &parsed.masking_iv,
+        parsed.header_raw,
+    ) catch null;
+}
+
 fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: types.Address) void {
     if (parsed.authdata_raw.len != 32) return;
     const endpoint = types.Endpoint{ .node_id = parsed.authdata_raw[0..32].*, .addr = from };
@@ -53,15 +70,7 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
     var plaintext_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     var ad_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     if (stable) |stable_value| {
-        if (packet.decryptMessageInto(
-            &plaintext_buffer,
-            &ad_buffer,
-            &stable_value.recipient_key,
-            &parsed.static_header.nonce,
-            parsed.message_ciphertext,
-            &parsed.masking_iv,
-            parsed.header_raw,
-        ) catch null) |plaintext| {
+        if (decryptParsedMessage(parsed, &stable_value.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
             var accepted = stable_value;
             if (!accepted.seen_nonces.insert(&parsed.static_header.nonce)) {
                 if (sendWhoareyou(actor, env, endpoint, &parsed.static_header.nonce))
@@ -75,15 +84,7 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
     }
 
     if (actor.requests.pendingKeys(endpoint)) |pending| {
-        if (packet.decryptMessageInto(
-            &plaintext_buffer,
-            &ad_buffer,
-            &pending.keys.recipient_key,
-            &parsed.static_header.nonce,
-            parsed.message_ciphertext,
-            &parsed.masking_iv,
-            parsed.header_raw,
-        ) catch null) |plaintext| {
+        if (decryptParsedMessage(parsed, &pending.keys.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
             var accepted = session_book.StableSession{
                 .initiator_key = pending.keys.initiator_key,
                 .recipient_key = pending.keys.recipient_key,
@@ -98,15 +99,7 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
     }
 
     if (actor.responses.candidate(endpoint, now_ns)) |candidate| {
-        if (packet.decryptMessageInto(
-            &plaintext_buffer,
-            &ad_buffer,
-            &candidate.recipient_key,
-            &parsed.static_header.nonce,
-            parsed.message_ciphertext,
-            &parsed.masking_iv,
-            parsed.header_raw,
-        ) catch null) |plaintext| {
+        if (decryptParsedMessage(parsed, &candidate.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
             var accepted = session_book.StableSession{
                 .initiator_key = candidate.initiator_key,
                 .recipient_key = candidate.recipient_key,

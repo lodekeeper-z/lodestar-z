@@ -989,6 +989,64 @@ fn encodeEncryptedPacket(actor: *const actor_mod.Actor, source_id: types.NodeId,
     return types.PacketBytes.init(encoded);
 }
 
+test "stable session wins a same-read-key candidate collision" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x55} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x56} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 19 }, .port = 9019 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .rate_limiter = null,
+        .limits = .{ .response_recovery_capacity = 2, .event_capacity = 2, .command_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const now_ns = outbound.nowNs(io);
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, now_ns));
+
+    const shared_read_key = [_]u8{0x82} ** 16;
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0x81} ** 16,
+        .recipient_key = shared_read_key,
+    };
+    const candidate = @import("../state/response_book.zig").CandidateKeys{
+        .initiator_key = [_]u8{0x83} ** 16,
+        .recipient_key = shared_read_key,
+    };
+    actor.sessions.put(endpoint, stable, now_ns);
+    _ = actor.responses.candidates.putMove(endpoint, candidate, actor.responses.timeout_ms, now_ns);
+
+    const talk_response = message.TalkResp{
+        .req_id = try message.ReqId.fromSlice(&.{0x84}),
+        .response = "stable collision proof",
+    };
+    var plaintext_buffer: [128]u8 = undefined;
+    var encrypted = try encodeEncryptedPacket(
+        actor,
+        remote_id,
+        &shared_read_key,
+        try talk_response.encodeInto(&plaintext_buffer),
+        0x85,
+    );
+    actor.handlePacket(harness.env(), encrypted.bytes[0..encrypted.len], endpoint.addr);
+
+    const retained_candidate = actor.responses.candidate(endpoint, outbound.nowNs(io)) orelse return error.CandidateWasPromoted;
+    try std.testing.expectEqual(candidate.initiator_key, retained_candidate.initiator_key);
+    const retained_stable = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingStableSession;
+    try std.testing.expectEqual(stable.initiator_key, retained_stable.initiator_key);
+    try std.testing.expect(retained_stable.seen_nonces.contains(&([_]u8{0x85} ** packet.NONCE_SIZE)));
+}
+
 test "old key remains accepted without promotion until candidate response" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
