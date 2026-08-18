@@ -72,16 +72,15 @@ fn dispatch(
     actor.responses.removeExpired(endpoint.addr, &encoded.nonce, now_ns, env.ingress);
     if (actor.responses.hasLive(endpoint.addr, &encoded.nonce, now_ns)) return error.DuplicateChallenge;
 
-    const retry_packet = try types.PacketBytes.init(encoded.bytes);
     const recovery = request_book.RecoveryState{
         .nonce = encoded.nonce,
         .dest_pubkey = dest_pubkey.*,
         .plaintext = try .init(plaintext),
     };
     const phase: request_book.Phase = if (stable == null)
-        .{ .awaiting_whoareyou = .{ .retry_packet = retry_packet, .recovery = recovery } }
+        .{ .awaiting_whoareyou = .{ .retry_packet = try .init(encoded.bytes), .recovery = recovery } }
     else
-        .{ .awaiting_response = .{ .retry_packet = retry_packet, .recovery = recovery } };
+        .{ .awaiting_response = .{ .recovery = recovery, .wait = .session_request } };
     const response = try actor.requests.makeResponse(kind, distances);
     var prepared = try actor.requests.prepareActive(
         env.ingress,

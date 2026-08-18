@@ -76,7 +76,7 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
         },
         .awaiting_response => |response| {
             var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-            const pending_write_key = if (response.pending_keys) |keys| keys.initiator_key else null;
+            const pending_write_key = if (response.wait.pendingKeys()) |keys| keys.initiator_key else null;
             const stable = if (pending_write_key == null) actor.sessions.get(key.endpoint, now_ns) else null;
             const awaiting_whoareyou = pending_write_key == null and stable == null;
             const encoded = if (pending_write_key) |write_key|
@@ -102,10 +102,16 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
                 actor.requests.commitRetry(key, deadline_ns);
                 return;
             }
-            const retained = types.PacketBytes.init(encoded.bytes) catch {
-                actor.requests.commitRetry(key, deadline_ns);
-                return;
-            };
+            const transition: request_book.FreshRetryTransition = if (awaiting_whoareyou)
+                .{ .probe = .{
+                    .retry_packet = types.PacketBytes.init(encoded.bytes) catch {
+                        actor.requests.commitRetry(key, deadline_ns);
+                        return;
+                    },
+                    .nonce = encoded.nonce,
+                } }
+            else
+                .{ .response = encoded.nonce };
             var next_admission = env.ingress.acquire(
                 key.endpoint.addr,
                 @import("../admission.zig").requestPacketBudget(retry.kind),
@@ -120,9 +126,7 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
             };
             actor.requests.commitFreshRetry(
                 key,
-                retained,
-                encoded.nonce,
-                awaiting_whoareyou,
+                transition,
                 deadline_ns,
                 next_admission.move(),
                 env.ingress,

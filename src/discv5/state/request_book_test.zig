@@ -18,14 +18,6 @@ fn endpoint(last: u8) types.Endpoint {
     };
 }
 
-test "recovery state keeps retry packet ownership only at the request phase" {
-    try std.testing.expect(!@hasField(book_mod.RecoveryState, "retry_packet"));
-    try std.testing.expect(@hasField(book_mod.AwaitingWhoareyou, "retry_packet"));
-    try std.testing.expect(@hasField(book_mod.AwaitingWhoareyou, "recovery"));
-    try std.testing.expect(@hasField(book_mod.AwaitingResponse, "retry_packet"));
-    try std.testing.expect(@hasField(book_mod.AwaitingResponse, "recovery"));
-}
-
 fn probe(nonce_byte: u8) !book_mod.AwaitingWhoareyou {
     return .{
         .retry_packet = try .init(&.{ 3, 4 }),
@@ -35,6 +27,63 @@ fn probe(nonce_byte: u8) !book_mod.AwaitingWhoareyou {
             .plaintext = try .init(&.{ 1, 2 }),
         },
     };
+}
+
+test "response waits preserve challenge and pending-key behavior across retries and promotion" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const keys = book_mod.PendingSessionKeys{
+        .initiator_key = [_]u8{10} ** 16,
+        .recipient_key = [_]u8{11} ** 16,
+    };
+
+    const promoted_retry = types.RequestKey.init(endpoint(1), try message.ReqId.fromSlice(&.{1}));
+    const promoted_prepared = try book.prepareActive(
+        &ingress,
+        promoted_retry,
+        .api,
+        .pong,
+        .{ .awaiting_whoareyou = try probe(20) },
+        1,
+        true,
+    );
+    book.commitPrepared(promoted_prepared);
+    book.commitChallenge(try book.challenge(&([_]u8{20} ** 12), promoted_retry.endpoint.addr), keys, 2);
+    try std.testing.expect(book.pendingKeys(promoted_retry.endpoint) != null);
+    try std.testing.expectError(error.InvalidChallenge, book.challenge(&([_]u8{20} ** 12), promoted_retry.endpoint.addr));
+
+    var retry_permit = try ingress.acquire(promoted_retry.endpoint.addr, admission.requestPacketBudget(.ping));
+    book.commitFreshRetry(promoted_retry, .{ .response = [_]u8{21} ** 12 }, 3, retry_permit.move(), &ingress);
+    const retry_pending = book.pendingKeys(promoted_retry.endpoint) orelse return error.MissingPendingKeys;
+    try std.testing.expectEqual(keys, retry_pending.keys);
+    _ = try book.challenge(&([_]u8{21} ** 12), promoted_retry.endpoint.addr);
+    book.promotePending(retry_pending);
+    try std.testing.expect(book.pendingKeys(promoted_retry.endpoint) == null);
+    _ = try book.challenge(&([_]u8{21} ** 12), promoted_retry.endpoint.addr);
+
+    const confirmed_retry = types.RequestKey.init(endpoint(2), try message.ReqId.fromSlice(&.{2}));
+    const confirmed_prepared = try book.prepareActive(
+        &ingress,
+        confirmed_retry,
+        .api,
+        .pong,
+        .{ .awaiting_whoareyou = try probe(30) },
+        1,
+        true,
+    );
+    book.commitPrepared(confirmed_prepared);
+    book.commitChallenge(try book.challenge(&([_]u8{30} ** 12), confirmed_retry.endpoint.addr), keys, 2);
+    const confirmed_pending = book.pendingKeys(confirmed_retry.endpoint) orelse return error.MissingPendingKeys;
+    book.promotePending(confirmed_pending);
+    try std.testing.expect(book.pendingKeys(confirmed_retry.endpoint) == null);
+    try std.testing.expectError(error.InvalidChallenge, book.challenge(&([_]u8{30} ** 12), confirmed_retry.endpoint.addr));
+
+    var confirmed_permit = try ingress.acquire(confirmed_retry.endpoint.addr, admission.requestPacketBudget(.ping));
+    book.commitFreshRetry(confirmed_retry, .{ .response = [_]u8{31} ** 12 }, 3, confirmed_permit.move(), &ingress);
+    try std.testing.expect(book.pendingKeys(confirmed_retry.endpoint) == null);
+    _ = try book.challenge(&([_]u8{31} ** 12), confirmed_retry.endpoint.addr);
 }
 
 test "RequestBook conserves challenge lane active and admission indexes" {
@@ -56,7 +105,7 @@ test "RequestBook conserves challenge lane active and admission indexes" {
     book.assertInvariants();
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
     const challenge = try book.challenge(&([_]u8{7} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, try .init(&.{ 9, 9 }), .{
+    book.commitChallenge(challenge, .{
         .initiator_key = [_]u8{10} ** 16,
         .recipient_key = [_]u8{11} ** 16,
     }, 2);
@@ -91,7 +140,7 @@ test "WHOAREYOU phase changes preserve the cumulative retry bound" {
     try std.testing.expectEqual(@as(u32, 1), book.get(key).?.attempts);
 
     const challenge = try book.challenge(&([_]u8{12} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, try .init(&.{ 9, 9 }), .{
+    book.commitChallenge(challenge, .{
         .initiator_key = [_]u8{10} ** 16,
         .recipient_key = [_]u8{11} ** 16,
     }, 3);
@@ -204,7 +253,7 @@ fn allocationLifecycle(alloc: std.mem.Allocator) !void {
     }, 0, true);
     book.commitPrepared(prepared);
     const challenge = try book.challenge(&([_]u8{9} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, try .init(&.{ 4, 5 }), .{
+    book.commitChallenge(challenge, .{
         .initiator_key = [_]u8{6} ** 16,
         .recipient_key = [_]u8{7} ** 16,
     }, 1);
@@ -286,7 +335,7 @@ test "challenge preparation and commit remain allocation-free" {
     }, 10, true);
     book.commitPrepared(prepared);
     const challenge = try book.challenge(&([_]u8{11} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, try .init(&.{1}), .{
+    book.commitChallenge(challenge, .{
         .initiator_key = [_]u8{1} ** 16,
         .recipient_key = [_]u8{2} ** 16,
     }, 20);
@@ -315,12 +364,12 @@ test "timed-out active scan visits maximum-capacity table once across bounded ba
         };
         const req_id = try message.ReqId.fromSlice(&.{});
         const phase = book_mod.Phase{ .awaiting_response = .{
-            .retry_packet = try .init(&.{1}),
             .recovery = .{
                 .nonce = [_]u8{0} ** 12,
                 .dest_pubkey = [_]u8{2} ** 33,
                 .plaintext = try .init(&.{2}),
             },
+            .wait = .session_request,
         } };
         const prepared = try book.prepareActive(&ingress, .init(peer, req_id), .api, .pong, phase, now_ns - 1, false);
         book.commitPrepared(prepared);

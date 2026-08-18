@@ -200,10 +200,9 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         .write_key = &keys.initiator_key,
         .plaintext = recovery.plaintext.slice(),
     }) catch return;
-    const retry_packet = types.PacketBytes.init(datagram) catch return;
     env.sender.send(from, datagram) catch return;
     switch (source) {
-        .request => |preparation| actor.requests.commitChallenge(preparation, retry_packet, .{
+        .request => |preparation| actor.requests.commitChallenge(preparation, .{
             .initiator_key = keys.initiator_key,
             .recipient_key = keys.recipient_key,
         }, outbound.deadlineNs(outbound.nowNs(env.io), actor.request_timeout_ms)),

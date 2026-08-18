@@ -26,15 +26,57 @@ pub const AwaitingWhoareyou = struct {
 };
 
 pub const AwaitingResponse = struct {
-    retry_packet: types.PacketBytes,
     recovery: RecoveryState,
-    challengeable: bool = true,
-    pending_keys: ?PendingSessionKeys = null,
+    wait: ResponseWait,
+};
+
+pub const ResponseWait = union(enum) {
+    session_request,
+    handshake_sent: PendingSessionKeys,
+    handshake_confirmed,
+    retry_with_pending_keys: PendingSessionKeys,
+
+    pub fn canChallenge(self: ResponseWait) bool {
+        return switch (self) {
+            .session_request, .retry_with_pending_keys => true,
+            .handshake_sent, .handshake_confirmed => false,
+        };
+    }
+
+    pub fn pendingKeys(self: ResponseWait) ?PendingSessionKeys {
+        return switch (self) {
+            .handshake_sent, .retry_with_pending_keys => |keys| keys,
+            .session_request, .handshake_confirmed => null,
+        };
+    }
+
+    pub fn afterPromotion(self: ResponseWait) ResponseWait {
+        return switch (self) {
+            .handshake_sent => .handshake_confirmed,
+            .retry_with_pending_keys => .session_request,
+            .session_request, .handshake_confirmed => unreachable,
+        };
+    }
+
+    pub fn afterFreshRetry(self: ResponseWait) ResponseWait {
+        return switch (self) {
+            .handshake_sent, .retry_with_pending_keys => |keys| .{ .retry_with_pending_keys = keys },
+            .session_request, .handshake_confirmed => .session_request,
+        };
+    }
 };
 
 pub const Phase = union(enum) {
     awaiting_whoareyou: AwaitingWhoareyou,
     awaiting_response: AwaitingResponse,
+};
+
+pub const FreshRetryTransition = union(enum) {
+    probe: struct {
+        retry_packet: types.PacketBytes,
+        nonce: [12]u8,
+    },
+    response: [12]u8,
 };
 
 pub const NodesAccumulator = struct {
@@ -321,7 +363,7 @@ pub const RequestBook = struct {
         const active = self.active.get(key) orelse return error.InvalidChallenge;
         const recovery = switch (active.phase) {
             .awaiting_whoareyou => |value| value.recovery,
-            .awaiting_response => |value| if (value.challengeable) value.recovery else return error.InvalidChallenge,
+            .awaiting_response => |value| if (value.wait.canChallenge()) value.recovery else return error.InvalidChallenge,
         };
         if (!std.mem.eql(u8, &recovery.nonce, nonce)) return error.InvalidChallenge;
         if (self.lanes.get(key.endpoint)) |lane| {
@@ -338,16 +380,13 @@ pub const RequestBook = struct {
     pub fn commitChallenge(
         self: *RequestBook,
         preparation: ChallengePreparation,
-        retry_packet: types.PacketBytes,
         keys: PendingSessionKeys,
         deadline_ns: i64,
     ) void {
         const active = self.active.getPtr(preparation.key) orelse unreachable;
         active.phase = .{ .awaiting_response = .{
-            .retry_packet = retry_packet,
             .recovery = preparation.recovery,
-            .challengeable = false,
-            .pending_keys = keys,
+            .wait = .{ .handshake_sent = keys },
         } };
         active.deadline_ns = deadline_ns;
         std.debug.assert(self.challenge_by_nonce.remove(.init(preparation.key.endpoint.addr, &preparation.recovery.nonce)));
@@ -362,14 +401,14 @@ pub const RequestBook = struct {
             .awaiting_whoareyou => return null,
             .awaiting_response => |value| value,
         };
-        return .{ .key = key, .keys = response.pending_keys orelse return null };
+        return .{ .key = key, .keys = response.wait.pendingKeys() orelse return null };
     }
 
     pub fn promotePending(self: *RequestBook, view: PendingKeysView) void {
         const active = self.active.getPtr(view.key) orelse return;
         switch (active.phase) {
             .awaiting_whoareyou => return,
-            .awaiting_response => |*response| response.pending_keys = null,
+            .awaiting_response => |*response| response.wait = response.wait.afterPromotion(),
         }
         if (self.lanes.getPtr(view.key.endpoint)) |lane| {
             if (lane.establishing) |key| {
@@ -435,9 +474,7 @@ pub const RequestBook = struct {
     pub fn commitFreshRetry(
         self: *RequestBook,
         key: types.RequestKey,
-        retry_packet: types.PacketBytes,
-        nonce: [12]u8,
-        awaiting_whoareyou: bool,
+        transition: FreshRetryTransition,
         deadline_ns: i64,
         next_admission: AdmissionPermit,
         admission: *admission_mod.IngressAdmission,
@@ -447,19 +484,25 @@ pub const RequestBook = struct {
             .awaiting_whoareyou => unreachable,
             .awaiting_response => |response| response.recovery,
         };
-        const pending_keys = active.phase.awaiting_response.pending_keys;
+        const response_wait = active.phase.awaiting_response.wait;
         if (challengeForPhase(key.endpoint.addr, active.phase)) |old| std.debug.assert(self.challenge_by_nonce.remove(old));
+        const nonce = switch (transition) {
+            .probe => |probe_retry| probe_retry.nonce,
+            .response => |response_nonce| response_nonce,
+        };
         recovery.nonce = nonce;
-        active.phase = if (awaiting_whoareyou)
-            .{ .awaiting_whoareyou = .{ .retry_packet = retry_packet, .recovery = recovery } }
-        else
-            .{ .awaiting_response = .{
-                .retry_packet = retry_packet,
+        active.phase = switch (transition) {
+            .probe => |probe_retry| .{ .awaiting_whoareyou = .{
+                .retry_packet = probe_retry.retry_packet,
                 .recovery = recovery,
-                .pending_keys = pending_keys,
-            } };
+            } },
+            .response => .{ .awaiting_response = .{
+                .recovery = recovery,
+                .wait = response_wait.afterFreshRetry(),
+            } },
+        };
         self.challenge_by_nonce.putAssumeCapacityNoClobber(.init(key.endpoint.addr, &nonce), key);
-        if (awaiting_whoareyou) self.setEstablishing(key);
+        if (transition == .probe) self.setEstablishing(key);
         switch (active.response) {
             .nodes => |*nodes| nodes.resetGeneration(self.alloc),
             .pong, .talkresp => {},
@@ -594,6 +637,6 @@ pub const RequestBook = struct {
 fn challengeForPhase(address: types.Address, phase: Phase) ?types.ChallengeKey {
     return switch (phase) {
         .awaiting_whoareyou => |state| .init(address, &state.recovery.nonce),
-        .awaiting_response => |response| if (response.challengeable) .init(address, &response.recovery.nonce) else null,
+        .awaiting_response => |response| if (response.wait.canChallenge()) .init(address, &response.recovery.nonce) else null,
     };
 }
