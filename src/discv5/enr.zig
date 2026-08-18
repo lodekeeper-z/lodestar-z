@@ -75,6 +75,8 @@ pub const Enr = struct {
     custody_group_count: ?u64,
 
     /// Compute NodeId from ENR public key
+    /// Return `null` when the record has no secp256k1 key, or
+    /// `error.InvalidPublicKey` when the encoded key is malformed.
     pub fn nodeId(self: *const Enr) NodeIdError!?NodeId {
         const pk = self.pubkey orelse return null;
         return try nodeIdFromCompressedPubkey(&pk);
@@ -100,7 +102,8 @@ pub const Enr = struct {
     }
 };
 
-/// Compute NodeId = keccak256(uncompressed pubkey[1..]) from compressed pubkey
+/// Compute NodeId = keccak256(uncompressed pubkey[1..]) from a validated
+/// compressed public key. Returns `error.InvalidPublicKey` for malformed input.
 pub fn nodeIdFromCompressedPubkey(compressed: *const [33]u8) NodeIdError!NodeId {
     // Per discv5/v4 identity scheme:
     //   node-id = keccak256(uncompressed_pubkey[1..65])
