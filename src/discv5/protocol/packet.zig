@@ -21,6 +21,16 @@ pub const ID_NONCE_SIZE = 16;
 pub const WHOAREYOU_AUTHDATA_SIZE = ID_NONCE_SIZE + 8;
 pub const WHOAREYOU_CHALLENGE_DATA_SIZE = MASKING_IV_SIZE + STATIC_HEADER_SIZE + WHOAREYOU_AUTHDATA_SIZE;
 
+/// Whether an ordinary packet with fixed NodeId authdata fits the wire limit.
+/// Layout: masking IV || static header || NodeId authdata || plaintext || GCM tag.
+pub fn ordinaryMessageFits(plaintext_len: usize) bool {
+    var total = std.math.add(usize, MASKING_IV_SIZE, STATIC_HEADER_SIZE) catch return false;
+    total = std.math.add(usize, total, NODE_ID_SIZE) catch return false;
+    total = std.math.add(usize, total, plaintext_len) catch return false;
+    total = std.math.add(usize, total, GCM_TAG_SIZE) catch return false;
+    return total <= MAX_PACKET_SIZE;
+}
+
 pub const Error = error{
     InvalidPacket,
     InvalidProtocolId,
@@ -289,6 +299,13 @@ fn writeHeader(
     @memcpy(out[9..21], nonce);
     std.mem.writeInt(u16, out[21..23], authdata_size, .big);
     @memcpy(out[STATIC_HEADER_SIZE..], authdata);
+}
+
+test "discv5 packet: ordinary message plaintext fit boundary" {
+    const max_plaintext = MAX_PACKET_SIZE - MASKING_IV_SIZE - STATIC_HEADER_SIZE - NODE_ID_SIZE - GCM_TAG_SIZE;
+    try std.testing.expect(ordinaryMessageFits(max_plaintext));
+    try std.testing.expect(!ordinaryMessageFits(max_plaintext + 1));
+    try std.testing.expect(!ordinaryMessageFits(std.math.maxInt(usize)));
 }
 
 test "discv5 packet: AES-CTR masking round-trip" {

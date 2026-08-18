@@ -10,8 +10,9 @@ pub const metrics = @import("metrics.zig");
 pub const secp256k1 = @import("secp256k1.zig");
 pub const hex = @import("hex");
 
-pub const Runtime = @import("runtime.zig").Runtime;
-pub const RuntimeError = @import("runtime.zig").Error;
+const runtime = @import("runtime.zig");
+pub const Runtime = runtime.Runtime;
+pub const RuntimeError = runtime.Error;
 pub const Config = @import("config.zig").Config;
 pub const Options = @import("config.zig").Options;
 pub const Limits = @import("config.zig").Limits;

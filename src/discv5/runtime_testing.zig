@@ -1,9 +1,10 @@
 const std = @import("std");
 const message = @import("protocol/message.zig");
+const runtime_error = @import("runtime_error.zig");
 const transport = @import("transport.zig");
 const types = @import("types.zig");
 
-pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime RuntimeError: type, comptime receive_backoff: anytype) type {
+pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime receive_backoff: anytype) type {
     return if (@import("builtin").is_test) struct {
         pub const CommandGate = struct {
             entered: std.atomic.Value(bool) = .init(false),
@@ -25,22 +26,22 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime Runtim
                 self.queue.putOneUncancelable(io, 0) catch unreachable;
             }
         };
-        pub const BoolResult = RuntimeError!bool;
-        pub const BoolReply = std.Io.Queue(BoolResult);
-        pub const ReqResult = RuntimeError!message.ReqId;
-        pub const ReqReply = std.Io.Queue(ReqResult);
+        pub const EnrAdmissionResult = runtime_error.EnrAdmissionError!bool;
+        pub const EnrAdmissionReply = std.Io.Queue(EnrAdmissionResult);
+        pub const PingResult = runtime_error.RequestError!message.ReqId;
+        pub const PingReply = std.Io.Queue(PingResult);
 
         pub fn actorLoop(runtime: *Runtime) std.Io.Cancelable!void {
             return impl(runtime).actorLoopForTesting();
         }
 
-        pub fn enqueueAddEnr(runtime: *Runtime, bytes: []u8, reply: *BoolReply) !void {
+        pub fn enqueueAddEnr(runtime: *Runtime, bytes: []u8, reply: *EnrAdmissionReply) !void {
             const storage = impl(runtime);
             errdefer storage.allocator.free(bytes);
             try storage.enqueueCommand(.{ .add_enr = .{ .enr = bytes, .reply = reply } });
         }
 
-        pub fn enqueueSendPing(runtime: *Runtime, endpoint: types.Endpoint, pubkey: [33]u8, reply: *ReqReply) !void {
+        pub fn enqueueSendPing(runtime: *Runtime, endpoint: types.Endpoint, pubkey: [33]u8, reply: *PingReply) !void {
             try impl(runtime).enqueueCommand(.{ .send_ping = .{
                 .endpoint = endpoint,
                 .pubkey = pubkey,
@@ -70,8 +71,17 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime Runtim
         }
 
         pub fn activeAndPermitCount(runtime: *Runtime) struct { active: usize, permits: usize } {
+            const counts = activeQueuedAndPermitCount(runtime);
+            return .{ .active = counts.active, .permits = counts.permits };
+        }
+
+        pub fn activeQueuedAndPermitCount(runtime: *Runtime) struct { active: usize, queued: usize, permits: usize } {
             const storage = impl(runtime);
-            return .{ .active = storage.actor.requests.activeCount(), .permits = storage.admission.permitCount() };
+            return .{
+                .active = storage.actor.requests.activeCount(),
+                .queued = storage.actor.requests.queuedCount(),
+                .permits = storage.admission.permitCount(),
+            };
         }
 
         pub fn receiveBackoff(consecutive_errors: u8) u64 {

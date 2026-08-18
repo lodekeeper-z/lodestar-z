@@ -13,7 +13,19 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const MAX_RECEIVE_ERROR_BACKOFF_MS: u64 = 100;
-pub const Error = @import("runtime_error.zig").Error;
+const runtime_error = @import("runtime_error.zig");
+pub const InitError = runtime_error.InitError;
+pub const RunError = runtime_error.RunError;
+pub const EventError = runtime_error.EventError;
+pub const CommandError = runtime_error.CommandError;
+pub const EnrAdmissionError = runtime_error.EnrAdmissionError;
+pub const SetLocalEnrError = runtime_error.SetLocalEnrError;
+pub const RequestError = runtime_error.RequestError;
+pub const FindNodeError = runtime_error.FindNodeError;
+pub const TalkRequestError = runtime_error.TalkRequestError;
+pub const TalkResponseError = runtime_error.TalkResponseError;
+pub const LookupError = runtime_error.LookupError;
+pub const Error = runtime_error.Error;
 
 /// Internal implementation behind the opaque `Runtime` handle. Exposed for
 /// structural runtime tests.
@@ -34,17 +46,25 @@ pub const RuntimeImpl = struct {
     test_command_gate: if (@import("builtin").is_test) ?*Testing.CommandGate else void = if (@import("builtin").is_test) null else {},
     test_cancellation_gate: if (@import("builtin").is_test) ?*Testing.CancellationGate else void = if (@import("builtin").is_test) null else {},
 
-    const ReqResult = Error!message.ReqId;
-    const IdResult = Error!u32;
-    const VoidResult = Error!void;
-    const BoolResult = Error!bool;
-    const MetricsResult = Error!metrics.MetricsSnapshot;
-    const EnrResult = Error!?enr.RawEnr;
-    const U64Result = Error!u64;
-    const ReqReply = Io.Queue(ReqResult);
-    const IdReply = Io.Queue(IdResult);
-    const VoidReply = Io.Queue(VoidResult);
-    const BoolReply = Io.Queue(BoolResult);
+    const EnrAdmissionResult = EnrAdmissionError!bool;
+    const SetLocalEnrResult = SetLocalEnrError!void;
+    const PingResult = RequestError!message.ReqId;
+    const FindNodeResult = FindNodeError!message.ReqId;
+    const TalkRequestResult = TalkRequestError!message.ReqId;
+    const TalkResponseResult = TalkResponseError!void;
+    const LookupResult = LookupError!u32;
+    const CommandBoolResult = CommandError!bool;
+    const MetricsResult = CommandError!metrics.MetricsSnapshot;
+    const EnrResult = CommandError!?enr.RawEnr;
+    const U64Result = CommandError!u64;
+    const EnrAdmissionReply = Io.Queue(EnrAdmissionResult);
+    const SetLocalEnrReply = Io.Queue(SetLocalEnrResult);
+    const PingReply = Io.Queue(PingResult);
+    const FindNodeReply = Io.Queue(FindNodeResult);
+    const TalkRequestReply = Io.Queue(TalkRequestResult);
+    const TalkResponseReply = Io.Queue(TalkResponseResult);
+    const LookupReply = Io.Queue(LookupResult);
+    const CommandBoolReply = Io.Queue(CommandBoolResult);
     const MetricsReply = Io.Queue(MetricsResult);
     const EnrReply = Io.Queue(EnrResult);
     const U64Reply = Io.Queue(U64Result);
@@ -59,14 +79,14 @@ pub const RuntimeImpl = struct {
         pubkey: ?[33]u8,
         address: types.Address,
         enr: ?[]u8,
-        reply: *BoolReply,
+        reply: *EnrAdmissionReply,
     };
 
     const SendPing = struct {
         endpoint: types.Endpoint,
         pubkey: [33]u8,
         enr_seq: u64,
-        reply: *ReqReply,
+        reply: *PingReply,
     };
 
     const SendFindNode = struct {
@@ -74,15 +94,15 @@ pub const RuntimeImpl = struct {
         pubkey: [33]u8,
         distances: [127]u16,
         distances_len: u8,
-        reply: *ReqReply,
+        reply: *FindNodeReply,
     };
 
     pub const Command = union(enum) {
         inbound: Inbound,
         maintenance,
         add_node: AddNode,
-        add_enr: struct { enr: []u8, reply: *BoolReply },
-        set_local_enr: struct { enr: []u8, reply: *VoidReply },
+        add_enr: struct { enr: []u8, reply: *EnrAdmissionReply },
+        set_local_enr: struct { enr: []u8, reply: *SetLocalEnrReply },
         send_ping: SendPing,
         send_findnode: SendFindNode,
         send_talk_request: struct {
@@ -90,24 +110,58 @@ pub const RuntimeImpl = struct {
             pubkey: [33]u8,
             protocol_name: []u8,
             request: []u8,
-            reply: *ReqReply,
+            reply: *TalkRequestReply,
         },
         send_talk_response: struct {
             endpoint: types.Endpoint,
             req_id: message.ReqId,
             response: []u8,
-            reply: *VoidReply,
+            reply: *TalkResponseReply,
         },
-        cancel_request: struct { key: types.RequestKey, reply: *BoolReply },
-        start_lookup: struct { target: types.NodeId, reply: *IdReply },
-        start_random_lookup: *IdReply,
+        cancel_request: struct { key: types.RequestKey, reply: *CommandBoolReply },
+        start_lookup: struct { target: types.NodeId, reply: *LookupReply },
+        start_random_lookup: *LookupReply,
         metrics_snapshot: *MetricsReply,
         local_enr: *EnrReply,
         peer_enr: struct { node_id: types.NodeId, reply: *EnrReply },
         local_enr_seq: *U64Reply,
     };
 
-    fn init(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) !RuntimeImpl {
+    fn init(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) InitError!RuntimeImpl {
+        return initRaw(io, allocator, config, options) catch |err| switch (err) {
+            error.BindFailed => error.BindFailed,
+            error.Canceled => error.Canceled,
+            error.InvalidBindAddressFamily => error.InvalidBindAddressFamily,
+            error.InvalidCapacity => error.InvalidCapacity,
+            error.InvalidEnr => error.InvalidEnr,
+            error.InvalidLocalIdentity => error.InvalidLocalIdentity,
+            error.InvalidLookupNumResults => error.InvalidLookupNumResults,
+            error.InvalidLookupParallelism => error.InvalidLookupParallelism,
+            error.InvalidLookupRequestLimit => error.InvalidLookupRequestLimit,
+            error.InvalidMaintenanceInterval => error.InvalidMaintenanceInterval,
+            error.InvalidRateLimiterCapacity => error.InvalidRateLimiterCapacity,
+            error.InvalidRateLimiterQuota => error.InvalidRateLimiterQuota,
+            error.InvalidRequestRetries => error.InvalidRequestRetries,
+            error.InvalidSessionCapacity => error.InvalidSessionCapacity,
+            error.InvalidVoteThreshold => error.InvalidVoteThreshold,
+            error.NoBindAddresses => error.NoBindAddresses,
+            error.OutOfMemory => error.OutOfMemory,
+            error.AdmissionCapacityOverflow,
+            error.BufferTooSmall,
+            error.CapacityTooLarge,
+            error.InvalidAdmissionCapacity,
+            error.InvalidContactCapacity,
+            error.InvalidEventCapacity,
+            error.InvalidPublicKey,
+            error.InvalidRequestCapacity,
+            error.InvalidSignature,
+            error.UnsupportedScheme,
+            error.ZeroCapacity,
+            => unreachable,
+        };
+    }
+
+    fn initRaw(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) !RuntimeImpl {
         try config.validate();
         try options.validate();
         var transport = try transport_mod.Transport.init(io, config.bind_addresses);
@@ -278,28 +332,28 @@ pub const RuntimeImpl = struct {
             },
             .set_local_enr => |value| {
                 defer self.allocator.free(value.enr);
-                try replyResult(self.io, value.reply, self.actor.setLocalEnr(env, value.enr));
+                try replyResult(self.io, value.reply, setLocalEnrResult(&self.actor, env, value.enr));
             },
-            .send_ping => |value| try replyResult(self.io, value.reply, self.actor.sendPing(env, value.endpoint, &value.pubkey, value.enr_seq, .api)),
-            .send_findnode => |value| try replyResult(self.io, value.reply, self.actor.sendFindNode(env, value.endpoint, &value.pubkey, value.distances[0..value.distances_len], .api)),
+            .send_ping => |value| try replyResult(self.io, value.reply, sendPingResult(&self.actor, env, value.endpoint, &value.pubkey, value.enr_seq)),
+            .send_findnode => |value| try replyResult(self.io, value.reply, sendFindNodeResult(&self.actor, env, value.endpoint, &value.pubkey, value.distances[0..value.distances_len])),
             .send_talk_request => |value| {
                 defer self.allocator.free(value.protocol_name);
                 defer self.allocator.free(value.request);
-                try replyResult(self.io, value.reply, self.actor.sendTalkRequest(env, value.endpoint, &value.pubkey, value.protocol_name, value.request));
+                try replyResult(self.io, value.reply, sendTalkRequestResult(&self.actor, env, value.endpoint, &value.pubkey, value.protocol_name, value.request));
             },
             .send_talk_response => |value| {
                 defer self.allocator.free(value.response);
-                try replyResult(self.io, value.reply, self.actor.sendTalkResponse(env, value.endpoint, value.req_id, value.response));
+                try replyResult(self.io, value.reply, sendTalkResponseResult(&self.actor, env, value.endpoint, value.req_id, value.response));
             },
             .cancel_request => |value| value.reply.putOneUncancelable(
                 self.io,
                 self.actor.cancelRequest(env, value.key),
             ) catch {},
-            .start_lookup => |value| try replyResult(self.io, value.reply, self.actor.startLookup(env, value.target)),
+            .start_lookup => |value| try replyResult(self.io, value.reply, startLookupResult(&self.actor, env, value.target)),
             .start_random_lookup => |reply| {
                 var target: types.NodeId = undefined;
                 self.io.random(&target);
-                try replyResult(self.io, reply, self.actor.startLookup(env, target));
+                try replyResult(self.io, reply, startLookupResult(&self.actor, env, target));
             },
             .metrics_snapshot => |reply| {
                 var snapshot = self.actor.metricsSnapshot(nowNs(self.io));
@@ -369,6 +423,171 @@ pub const RuntimeImpl = struct {
     }
 };
 
+fn setLocalEnrResult(actor: *actor_mod.Actor, env: actor_mod.Env, raw: []const u8) SetLocalEnrError!void {
+    return actor.setLocalEnr(env, raw) catch |err| switch (err) {
+        error.InvalidEnr => error.InvalidEnr,
+        error.InvalidPublicKey => error.InvalidPublicKey,
+        error.InvalidSignature => error.InvalidSignature,
+        error.OutOfMemory => error.OutOfMemory,
+        error.StaleEnrSeq => error.StaleEnrSeq,
+        error.UnsupportedScheme => error.UnsupportedScheme,
+        error.WrongNodeId => error.WrongNodeId,
+        // `enr.decode` declares the encoder-only BufferTooSmall member, but
+        // decoding a prechecked, at-most-MAX_ENR_SIZE record never writes to a
+        // caller-sized buffer.
+        error.BufferTooSmall => unreachable,
+    };
+}
+
+fn sendPingResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64) RequestError!message.ReqId {
+    return actor.sendPing(env, endpoint, pubkey, enr_seq, .api) catch |err| switch (err) {
+        error.Canceled => error.Canceled,
+        error.DuplicateChallenge => error.DuplicateChallenge,
+        error.DuplicateRequest => error.DuplicateRequest,
+        error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
+        error.OutOfMemory => error.OutOfMemory,
+        error.PermitGenerationExhausted => error.PermitGenerationExhausted,
+        error.TooManyActiveRequests => error.TooManyActiveRequests,
+        error.TooManyQueuedRequests => error.TooManyQueuedRequests,
+        error.TooManyQueuedRequestsForEndpoint => error.TooManyQueuedRequestsForEndpoint,
+        error.TransportSendFailed => error.TransportSendFailed,
+        error.AdmissionBudgetOverflow,
+        error.BufferTooSmall,
+        error.DecryptionFailed,
+        error.EndpointBusy,
+        error.EndpointEstablishing,
+        error.InvalidEncoding,
+        error.InvalidFlag,
+        error.InvalidMessage,
+        error.InvalidPacket,
+        error.InvalidPacketBudget,
+        error.InvalidProtocolId,
+        error.MessageOversize,
+        error.Overflow,
+        error.PacketTooLarge,
+        error.TooManyAdmissionPermits,
+        error.TooManyDistances,
+        error.UnexpectedType,
+        error.UnsupportedVersion,
+        => unreachable,
+    };
+}
+
+fn sendFindNodeResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16) FindNodeError!message.ReqId {
+    return actor.sendFindNode(env, endpoint, pubkey, distances, .api) catch |err| switch (err) {
+        error.Canceled => error.Canceled,
+        error.DuplicateChallenge => error.DuplicateChallenge,
+        error.DuplicateRequest => error.DuplicateRequest,
+        error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
+        error.OutOfMemory => error.OutOfMemory,
+        error.PermitGenerationExhausted => error.PermitGenerationExhausted,
+        error.TooManyActiveRequests => error.TooManyActiveRequests,
+        error.TooManyDistances => error.TooManyDistances,
+        error.TooManyQueuedRequests => error.TooManyQueuedRequests,
+        error.TooManyQueuedRequestsForEndpoint => error.TooManyQueuedRequestsForEndpoint,
+        error.TransportSendFailed => error.TransportSendFailed,
+        error.AdmissionBudgetOverflow,
+        error.BufferTooSmall,
+        error.DecryptionFailed,
+        error.EndpointBusy,
+        error.EndpointEstablishing,
+        error.InvalidEncoding,
+        error.InvalidFlag,
+        error.InvalidMessage,
+        error.InvalidPacket,
+        error.InvalidPacketBudget,
+        error.InvalidProtocolId,
+        error.MessageOversize,
+        error.Overflow,
+        error.PacketTooLarge,
+        error.TooManyAdmissionPermits,
+        error.UnexpectedType,
+        error.UnsupportedVersion,
+        => unreachable,
+    };
+}
+
+fn sendTalkRequestResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8) TalkRequestError!message.ReqId {
+    return actor.sendTalkRequest(env, endpoint, pubkey, protocol_name, request) catch |err| switch (err) {
+        // Keep encoder exhaustion normalized in case message layout drifts
+        // beyond its packet-sized scratch buffer before the packet preflight.
+        error.BufferTooSmall => error.MessageTooLarge,
+        error.Canceled => error.Canceled,
+        error.DuplicateChallenge => error.DuplicateChallenge,
+        error.DuplicateRequest => error.DuplicateRequest,
+        error.MessageTooLarge => error.MessageTooLarge,
+        error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
+        error.OutOfMemory => error.OutOfMemory,
+        error.PermitGenerationExhausted => error.PermitGenerationExhausted,
+        error.TooManyActiveRequests => error.TooManyActiveRequests,
+        error.TooManyQueuedRequests => error.TooManyQueuedRequests,
+        error.TooManyQueuedRequestsForEndpoint => error.TooManyQueuedRequestsForEndpoint,
+        error.TransportSendFailed => error.TransportSendFailed,
+        error.AdmissionBudgetOverflow,
+        error.DecryptionFailed,
+        error.EndpointBusy,
+        error.EndpointEstablishing,
+        error.InvalidEncoding,
+        error.InvalidFlag,
+        error.InvalidMessage,
+        error.InvalidPacket,
+        error.InvalidPacketBudget,
+        error.InvalidProtocolId,
+        error.MessageOversize,
+        error.Overflow,
+        error.PacketTooLarge,
+        error.TooManyAdmissionPermits,
+        error.TooManyDistances,
+        error.UnexpectedType,
+        error.UnsupportedVersion,
+        => unreachable,
+    };
+}
+
+fn sendTalkResponseResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, req_id: message.ReqId, response: []const u8) TalkResponseError!void {
+    return actor.sendTalkResponse(env, endpoint, req_id, response) catch |err| switch (err) {
+        // Keep encoder exhaustion normalized in case message layout drifts
+        // beyond its packet-sized scratch buffer before the packet preflight.
+        error.BufferTooSmall => error.MessageTooLarge,
+        error.Canceled => error.Canceled,
+        error.EndpointMismatch => error.EndpointMismatch,
+        error.MessageTooLarge => error.MessageTooLarge,
+        error.NoSession => error.NoSession,
+        error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
+        error.NonceGenerationExhausted => error.NonceGenerationExhausted,
+        error.OutOfMemory => error.OutOfMemory,
+        error.PermitGenerationExhausted => error.PermitGenerationExhausted,
+        error.TransportSendFailed => error.TransportSendFailed,
+        error.UnknownPeer => error.UnknownPeer,
+        error.AdmissionBudgetOverflow,
+        error.DecryptionFailed,
+        error.InvalidEncoding,
+        error.InvalidFlag,
+        error.InvalidMessage,
+        error.InvalidPacket,
+        error.InvalidPacketBudget,
+        error.InvalidProtocolId,
+        error.MessageOversize,
+        error.Overflow,
+        error.PacketTooLarge,
+        error.TooManyAdmissionPermits,
+        error.UnexpectedType,
+        error.UnsupportedVersion,
+        => unreachable,
+    };
+}
+
+fn startLookupResult(actor: *actor_mod.Actor, env: actor_mod.Env, target: types.NodeId) LookupError!u32 {
+    return actor.startLookup(env, target) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooManyLookups => error.TooManyLookups,
+        error.InvalidNumResults,
+        error.InvalidParallelism,
+        error.TooManySeeds,
+        => unreachable,
+    };
+}
+
 fn replyResult(io: std.Io, reply: anytype, result: anytype) std.Io.Cancelable!void {
     reply.putOneUncancelable(io, result) catch {};
     if (result) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
@@ -379,7 +598,20 @@ fn nowNs(io: std.Io) i64 {
 }
 
 pub const Runtime = opaque {
-    pub fn init(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) Error!*Runtime {
+    pub const InitError = runtime_error.InitError;
+    pub const RunError = runtime_error.RunError;
+    pub const EventError = runtime_error.EventError;
+    pub const CommandError = runtime_error.CommandError;
+    pub const EnrAdmissionError = runtime_error.EnrAdmissionError;
+    pub const SetLocalEnrError = runtime_error.SetLocalEnrError;
+    pub const RequestError = runtime_error.RequestError;
+    pub const FindNodeError = runtime_error.FindNodeError;
+    pub const TalkRequestError = runtime_error.TalkRequestError;
+    pub const TalkResponseError = runtime_error.TalkResponseError;
+    pub const LookupError = runtime_error.LookupError;
+    pub const Error = runtime_error.Error;
+
+    pub fn init(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) runtime_error.InitError!*Runtime {
         const storage = try allocator.create(RuntimeImpl);
         errdefer allocator.destroy(storage);
         storage.* = try RuntimeImpl.init(io, allocator, config, options);
@@ -393,7 +625,7 @@ pub const Runtime = opaque {
         allocator.destroy(storage);
     }
 
-    pub fn run(self: *Runtime) Error!void {
+    pub fn run(self: *Runtime) runtime_error.RunError!void {
         return impl(self).run();
     }
 
@@ -413,7 +645,7 @@ pub const Runtime = opaque {
         return implConst(self).boundAddress(family);
     }
 
-    pub fn nextEvent(self: *Runtime) Error!events.Event {
+    pub fn nextEvent(self: *Runtime) runtime_error.EventError!events.Event {
         return impl(self).nextEvent();
     }
 
@@ -421,14 +653,14 @@ pub const Runtime = opaque {
         return impl(self).popEvent();
     }
 
-    pub fn addNode(self: *Runtime, node_id: types.NodeId, pubkey: ?*const [33]u8, address: types.Address, enr_bytes: ?[]const u8) Error!bool {
+    pub fn addNode(self: *Runtime, node_id: types.NodeId, pubkey: ?*const [33]u8, address: types.Address, enr_bytes: ?[]const u8) runtime_error.EnrAdmissionError!bool {
         const storage = impl(self);
         try storage.ensureRunning();
         if (enr_bytes) |bytes| if (bytes.len > @import("enr.zig").MAX_ENR_SIZE) return error.InvalidEnr;
         var owned: ?[]u8 = if (enr_bytes) |bytes| try storage.allocator.dupe(u8, bytes) else null;
         errdefer if (owned) |bytes| storage.allocator.free(bytes);
-        var buffer: [1]RuntimeImpl.BoolResult = undefined;
-        var reply = RuntimeImpl.BoolReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.EnrAdmissionResult = undefined;
+        var reply = RuntimeImpl.EnrAdmissionReply.init(&buffer);
         try storage.enqueueCommand(.{ .add_node = .{
             .node_id = node_id,
             .pubkey = if (pubkey) |key| key.* else null,
@@ -440,37 +672,37 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn addEnr(self: *Runtime, enr_bytes: []const u8) Error!bool {
+    pub fn addEnr(self: *Runtime, enr_bytes: []const u8) runtime_error.EnrAdmissionError!bool {
         const storage = impl(self);
         try storage.ensureRunning();
         if (enr_bytes.len > @import("enr.zig").MAX_ENR_SIZE) return error.InvalidEnr;
         var owned: ?[]u8 = try storage.allocator.dupe(u8, enr_bytes);
         errdefer if (owned) |bytes| storage.allocator.free(bytes);
-        var buffer: [1]RuntimeImpl.BoolResult = undefined;
-        var reply = RuntimeImpl.BoolReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.EnrAdmissionResult = undefined;
+        var reply = RuntimeImpl.EnrAdmissionReply.init(&buffer);
         try storage.enqueueCommand(.{ .add_enr = .{ .enr = owned.?, .reply = &reply } });
         owned = null;
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn setLocalEnr(self: *Runtime, enr_bytes: []const u8) Error!void {
+    pub fn setLocalEnr(self: *Runtime, enr_bytes: []const u8) runtime_error.SetLocalEnrError!void {
         const storage = impl(self);
         try storage.ensureRunning();
         if (enr_bytes.len > @import("enr.zig").MAX_ENR_SIZE) return error.InvalidEnr;
         var owned: ?[]u8 = try storage.allocator.dupe(u8, enr_bytes);
         errdefer if (owned) |bytes| storage.allocator.free(bytes);
-        var buffer: [1]RuntimeImpl.VoidResult = undefined;
-        var reply = RuntimeImpl.VoidReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.SetLocalEnrResult = undefined;
+        var reply = RuntimeImpl.SetLocalEnrReply.init(&buffer);
         try storage.enqueueCommand(.{ .set_local_enr = .{ .enr = owned.?, .reply = &reply } });
         owned = null;
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn sendPing(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, enr_seq: u64) Error!message.ReqId {
+    pub fn sendPing(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, enr_seq: u64) runtime_error.RequestError!message.ReqId {
         const storage = impl(self);
         try storage.ensureRunning();
-        var buffer: [1]RuntimeImpl.ReqResult = undefined;
-        var reply = RuntimeImpl.ReqReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.PingResult = undefined;
+        var reply = RuntimeImpl.PingReply.init(&buffer);
         try storage.enqueueCommand(.{ .send_ping = .{
             .endpoint = .{ .node_id = node_id, .addr = address },
             .pubkey = pubkey.*,
@@ -480,14 +712,14 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn sendFindNode(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, distances: []const u16) Error!message.ReqId {
+    pub fn sendFindNode(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, distances: []const u16) runtime_error.FindNodeError!message.ReqId {
         const storage = impl(self);
         try storage.ensureRunning();
         if (distances.len > 127) return error.TooManyDistances;
         var copied: [127]u16 = undefined;
         @memcpy(copied[0..distances.len], distances);
-        var buffer: [1]RuntimeImpl.ReqResult = undefined;
-        var reply = RuntimeImpl.ReqReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.FindNodeResult = undefined;
+        var reply = RuntimeImpl.FindNodeReply.init(&buffer);
         try storage.enqueueCommand(.{ .send_findnode = .{
             .endpoint = .{ .node_id = node_id, .addr = address },
             .pubkey = pubkey.*,
@@ -498,7 +730,7 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn sendTalkRequest(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, protocol_name: []const u8, request: []const u8) Error!message.ReqId {
+    pub fn sendTalkRequest(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, protocol_name: []const u8, request: []const u8) runtime_error.TalkRequestError!message.ReqId {
         const storage = impl(self);
         try storage.ensureRunning();
         const payload_len = std.math.add(usize, protocol_name.len, request.len) catch return error.MessageTooLarge;
@@ -507,8 +739,8 @@ pub const Runtime = opaque {
         errdefer if (protocol_copy) |bytes| storage.allocator.free(bytes);
         var request_copy: ?[]u8 = try storage.allocator.dupe(u8, request);
         errdefer if (request_copy) |bytes| storage.allocator.free(bytes);
-        var buffer: [1]RuntimeImpl.ReqResult = undefined;
-        var reply = RuntimeImpl.ReqReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.TalkRequestResult = undefined;
+        var reply = RuntimeImpl.TalkRequestReply.init(&buffer);
         try storage.enqueueCommand(.{ .send_talk_request = .{
             .endpoint = .{ .node_id = node_id, .addr = address },
             .pubkey = pubkey.*,
@@ -521,14 +753,14 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn sendTalkResponse(self: *Runtime, node_id: types.NodeId, address: types.Address, req_id: message.ReqId, response: []const u8) Error!void {
+    pub fn sendTalkResponse(self: *Runtime, node_id: types.NodeId, address: types.Address, req_id: message.ReqId, response: []const u8) runtime_error.TalkResponseError!void {
         const storage = impl(self);
         try storage.ensureRunning();
         if (response.len > packet.MAX_PACKET_SIZE) return error.MessageTooLarge;
         var owned: ?[]u8 = try storage.allocator.dupe(u8, response);
         errdefer if (owned) |bytes| storage.allocator.free(bytes);
-        var buffer: [1]RuntimeImpl.VoidResult = undefined;
-        var reply = RuntimeImpl.VoidReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.TalkResponseResult = undefined;
+        var reply = RuntimeImpl.TalkResponseReply.init(&buffer);
         try storage.enqueueCommand(.{ .send_talk_response = .{
             .endpoint = .{ .node_id = node_id, .addr = address },
             .req_id = req_id,
@@ -539,20 +771,20 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn startLookup(self: *Runtime, target: types.NodeId) Error!u32 {
+    pub fn startLookup(self: *Runtime, target: types.NodeId) runtime_error.LookupError!u32 {
         const storage = impl(self);
         try storage.ensureRunning();
-        var buffer: [1]RuntimeImpl.IdResult = undefined;
-        var reply = RuntimeImpl.IdReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.LookupResult = undefined;
+        var reply = RuntimeImpl.LookupReply.init(&buffer);
         try storage.enqueueCommand(.{ .start_lookup = .{ .target = target, .reply = &reply } });
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn cancelRequest(self: *Runtime, node_id: types.NodeId, address: types.Address, req_id: message.ReqId) Error!bool {
+    pub fn cancelRequest(self: *Runtime, node_id: types.NodeId, address: types.Address, req_id: message.ReqId) runtime_error.CommandError!bool {
         const storage = impl(self);
         try storage.ensureRunning();
-        var buffer: [1]RuntimeImpl.BoolResult = undefined;
-        var reply = RuntimeImpl.BoolReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.CommandBoolResult = undefined;
+        var reply = RuntimeImpl.CommandBoolReply.init(&buffer);
         try storage.enqueueCommand(.{ .cancel_request = .{
             .key = .init(.{ .node_id = node_id, .addr = address }, req_id),
             .reply = &reply,
@@ -560,16 +792,16 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn startRandomLookup(self: *Runtime) Error!u32 {
+    pub fn startRandomLookup(self: *Runtime) runtime_error.LookupError!u32 {
         const storage = impl(self);
         try storage.ensureRunning();
-        var buffer: [1]RuntimeImpl.IdResult = undefined;
-        var reply = RuntimeImpl.IdReply.init(&buffer);
+        var buffer: [1]RuntimeImpl.LookupResult = undefined;
+        var reply = RuntimeImpl.LookupReply.init(&buffer);
         try storage.enqueueCommand(.{ .start_random_lookup = &reply });
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn metricsSnapshot(self: *Runtime) Error!metrics.MetricsSnapshot {
+    pub fn metricsSnapshot(self: *Runtime) runtime_error.CommandError!metrics.MetricsSnapshot {
         const storage = impl(self);
         try storage.ensureRunning();
         var buffer: [1]RuntimeImpl.MetricsResult = undefined;
@@ -578,7 +810,7 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn localEnr(self: *Runtime) Error!?enr.RawEnr {
+    pub fn localEnr(self: *Runtime) runtime_error.CommandError!?enr.RawEnr {
         const storage = impl(self);
         try storage.ensureRunning();
         var buffer: [1]RuntimeImpl.EnrResult = undefined;
@@ -587,7 +819,7 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn peerEnr(self: *Runtime, node_id: types.NodeId) Error!?enr.RawEnr {
+    pub fn peerEnr(self: *Runtime, node_id: types.NodeId) runtime_error.CommandError!?enr.RawEnr {
         const storage = impl(self);
         try storage.ensureRunning();
         var buffer: [1]RuntimeImpl.EnrResult = undefined;
@@ -596,7 +828,7 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn localEnrSeq(self: *Runtime) Error!u64 {
+    pub fn localEnrSeq(self: *Runtime) runtime_error.CommandError!u64 {
         const storage = impl(self);
         try storage.ensureRunning();
         var buffer: [1]RuntimeImpl.U64Result = undefined;
@@ -624,4 +856,4 @@ fn receiveErrorBackoffMs(consecutive_errors: u8) u64 {
     return @min(@as(u64, 1) << shift, MAX_RECEIVE_ERROR_BACKOFF_MS);
 }
 
-pub const Testing = @import("runtime_testing.zig").Hooks(Runtime, RuntimeImpl, Error, receiveErrorBackoffMs);
+pub const Testing = @import("runtime_testing.zig").Hooks(Runtime, RuntimeImpl, receiveErrorBackoffMs);

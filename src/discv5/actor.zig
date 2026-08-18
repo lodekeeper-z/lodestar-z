@@ -8,6 +8,7 @@ const completion = @import("flow/completion.zig");
 const kbucket = @import("kbucket.zig");
 const lookup_mod = @import("service/lookup.zig");
 const message = @import("protocol/message.zig");
+const packet = @import("protocol/packet.zig");
 const metrics_mod = @import("metrics.zig");
 const outbound = @import("flow/outbound.zig");
 const maintenance_flow = @import("flow/maintenance.zig");
@@ -177,15 +178,19 @@ pub const Actor = struct {
     ) !message.ReqId {
         const req_id = randomReqId(env.io);
         const talk = message.TalkReq{ .req_id = req_id, .protocol = protocol_name, .request = request };
-        var buffer: [@import("protocol/packet.zig").MAX_PACKET_SIZE]u8 = undefined;
-        try outbound.sendTracked(self, env, endpoint, pubkey, req_id, .talkreq, &.{}, try talk.encodeInto(&buffer), .api);
+        var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+        const plaintext = try talk.encodeInto(&buffer);
+        if (!packet.ordinaryMessageFits(plaintext.len)) return error.MessageTooLarge;
+        try outbound.sendTracked(self, env, endpoint, pubkey, req_id, .talkreq, &.{}, plaintext, .api);
         return req_id;
     }
 
     pub fn sendTalkResponse(self: *Actor, env: Env, endpoint: types.Endpoint, req_id: message.ReqId, response: []const u8) !void {
         const talk = message.TalkResp{ .req_id = req_id, .response = response };
-        var buffer: [@import("protocol/packet.zig").MAX_PACKET_SIZE]u8 = undefined;
-        try outbound.sendResponse(self, env, endpoint, try talk.encodeInto(&buffer));
+        var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+        const plaintext = try talk.encodeInto(&buffer);
+        if (!packet.ordinaryMessageFits(plaintext.len)) return error.MessageTooLarge;
+        try outbound.sendResponse(self, env, endpoint, plaintext);
     }
 
     pub fn addNode(self: *Actor, node_id: types.NodeId, pubkey: ?*const [33]u8, address: types.Address, raw: ?[]const u8, now_ns: i64) bool {

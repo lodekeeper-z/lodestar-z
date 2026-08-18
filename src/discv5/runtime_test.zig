@@ -1,6 +1,8 @@
 const std = @import("std");
 const config = @import("config.zig");
 const enr = @import("enr.zig");
+const metrics = @import("metrics.zig");
+const packet = @import("protocol/packet.zig");
 const runtime_mod = @import("runtime.zig");
 const secp = @import("secp256k1.zig");
 const transport_mod = @import("transport.zig");
@@ -78,7 +80,7 @@ fn runActorLoop(runtime: *runtime_mod.Runtime, result: *?anyerror) void {
     };
 }
 
-fn awaitBoolReply(io: std.Io, reply: *runtime_mod.Testing.BoolReply, observed: *std.atomic.Value(bool)) void {
+fn awaitBoolReply(io: std.Io, reply: *runtime_mod.Testing.EnrAdmissionReply, observed: *std.atomic.Value(bool)) void {
     const result = reply.getOneUncancelable(io) catch return;
     _ = result catch {};
     observed.store(true, .release);
@@ -95,8 +97,8 @@ const OwnedCommandProducer = struct {
 };
 
 fn enqueueOwnedCommand(context: *OwnedCommandProducer) void {
-    var reply_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var reply = runtime_mod.Testing.BoolReply.init(&reply_buffer);
+    var reply_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var reply = runtime_mod.Testing.EnrAdmissionReply.init(&reply_buffer);
     const owned = context.allocator.dupe(u8, &.{0xff}) catch |err| {
         context.result_error = err;
         context.attempted.store(true, .release);
@@ -388,8 +390,8 @@ test "Runtime cancellation drains accepted owned commands and replies" {
     gate.init();
     runtime_mod.Testing.setCancellationGate(runtime, &gate);
     try runtime_mod.Testing.putMaintenance(runtime);
-    var reply_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var reply = runtime_mod.Testing.BoolReply.init(&reply_buffer);
+    var reply_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var reply = runtime_mod.Testing.EnrAdmissionReply.init(&reply_buffer);
     const owned = try alloc.dupe(u8, &.{0xff});
     try runtime_mod.Testing.enqueueAddEnr(runtime, owned, &reply);
 
@@ -531,8 +533,8 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
     var gate = runtime_mod.Testing.CommandGate{};
     defer gate.proceed.store(true, .release);
     runtime_mod.Testing.setCommandGate(runtime, &gate);
-    var blocker_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var blocker_reply = runtime_mod.Testing.BoolReply.init(&blocker_buffer);
+    var blocker_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var blocker_reply = runtime_mod.Testing.EnrAdmissionReply.init(&blocker_buffer);
     try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &blocker_reply);
     for (0..10_000) |_| {
         if (gate.entered.load(.acquire)) break;
@@ -546,8 +548,8 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
         .node_id = second_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 11 }, .port = 19080 } },
     };
-    var ping_buffer: [1]runtime_mod.Testing.ReqResult = undefined;
-    var ping_reply = runtime_mod.Testing.ReqReply.init(&ping_buffer);
+    var ping_buffer: [1]runtime_mod.Testing.PingResult = undefined;
+    var ping_reply = runtime_mod.Testing.PingReply.init(&ping_buffer);
     try runtime_mod.Testing.enqueueSendPing(runtime, second_endpoint, second_pubkey, &ping_reply);
     try runtime_mod.Testing.putMaintenance(runtime);
     try runtime_mod.Testing.putMaintenance(runtime);
@@ -557,8 +559,8 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
     try std.testing.expect(!(try blocker_result));
     const ping_result = try ping_reply.getOneUncancelable(io);
     _ = try ping_result;
-    var barrier_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var barrier_reply = runtime_mod.Testing.BoolReply.init(&barrier_buffer);
+    var barrier_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var barrier_reply = runtime_mod.Testing.EnrAdmissionReply.init(&barrier_buffer);
     try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &barrier_reply);
     const barrier_result = try barrier_reply.getOneUncancelable(io);
     try std.testing.expect(!(try barrier_result));
@@ -580,8 +582,8 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
     try std.testing.expect(runtime.popEvent() == null);
 
     try runtime_mod.Testing.enqueueStaleMaintenance(runtime);
-    var stale_barrier_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var stale_barrier_reply = runtime_mod.Testing.BoolReply.init(&stale_barrier_buffer);
+    var stale_barrier_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var stale_barrier_reply = runtime_mod.Testing.EnrAdmissionReply.init(&stale_barrier_buffer);
     try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &stale_barrier_reply);
     const stale_barrier_result = try stale_barrier_reply.getOneUncancelable(io);
     try std.testing.expect(!(try stale_barrier_result));
@@ -614,8 +616,8 @@ test "failed maintenance enqueue rolls back pending state for retry" {
     }, .{ .maintenance_interval_ms = 60_000 });
     defer runtime.deinit();
 
-    var first_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var first_reply = runtime_mod.Testing.BoolReply.init(&first_buffer);
+    var first_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var first_reply = runtime_mod.Testing.EnrAdmissionReply.init(&first_buffer);
     try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &first_reply);
     var gate = runtime_mod.Testing.CommandGate{};
     defer gate.proceed.store(true, .release);
@@ -634,8 +636,8 @@ test "failed maintenance enqueue rolls back pending state for retry" {
         try std.Thread.yield();
     } else return error.RuntimeDidNotEnter;
 
-    var second_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var second_reply = runtime_mod.Testing.BoolReply.init(&second_buffer);
+    var second_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var second_reply = runtime_mod.Testing.EnrAdmissionReply.init(&second_buffer);
     try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &second_reply);
     try std.testing.expectError(error.CommandQueueFull, runtime_mod.Testing.putMaintenance(runtime));
     try std.testing.expectError(error.CommandQueueFull, runtime_mod.Testing.putMaintenance(runtime));
@@ -648,16 +650,16 @@ test "failed maintenance enqueue rolls back pending state for retry" {
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x7d} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
-    var ping_buffer: [1]runtime_mod.Testing.ReqResult = undefined;
-    var ping_reply = runtime_mod.Testing.ReqReply.init(&ping_buffer);
+    var ping_buffer: [1]runtime_mod.Testing.PingResult = undefined;
+    var ping_reply = runtime_mod.Testing.PingReply.init(&ping_buffer);
     try runtime_mod.Testing.enqueueSendPing(runtime, .{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 12 }, .port = 19081 } },
     }, remote_pubkey, &ping_reply);
     _ = try (try ping_reply.getOneUncancelable(io));
     try runtime_mod.Testing.putMaintenance(runtime);
-    var barrier_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var barrier_reply = runtime_mod.Testing.BoolReply.init(&barrier_buffer);
+    var barrier_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var barrier_reply = runtime_mod.Testing.EnrAdmissionReply.init(&barrier_buffer);
     for (0..10_000) |_| {
         runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &barrier_reply) catch |err| switch (err) {
             error.CommandQueueFull => {
@@ -688,8 +690,8 @@ test "normal stop drains accepted owned commands and replies" {
     const io = threaded.io();
     const runtime = try initTestRuntime(io, alloc, 0x76, .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 }, .{});
     defer runtime.deinit();
-    var reply_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
-    var reply = runtime_mod.Testing.BoolReply.init(&reply_buffer);
+    var reply_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var reply = runtime_mod.Testing.EnrAdmissionReply.init(&reply_buffer);
     try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &reply);
     runtime.stop();
     try runtime_mod.Testing.actorLoop(runtime);
@@ -697,35 +699,92 @@ test "normal stop drains accepted owned commands and replies" {
     try std.testing.expect(!(try result));
 }
 
-test "public Runtime request APIs expose one explicit error set" {
-    const RuntimeError = runtime_mod.Error;
+fn errorSetOf(comptime function: anytype) type {
+    const return_type = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
+    return @typeInfo(return_type).error_union.error_set;
+}
+
+fn expectErrorSet(comptime function: anytype, comptime expected: type) void {
+    const actual = errorSetOf(function);
+    if (actual == anyerror) @compileError("public Runtime API leaks anyerror");
+    if (actual != expected) @compileError("unexpected Runtime API error set");
+}
+
+test "public Runtime APIs expose exact operation error contracts" {
     comptime {
-        const fallible = .{
-            runtime_mod.Runtime.init,
-            runtime_mod.Runtime.run,
-            runtime_mod.Runtime.nextEvent,
-            runtime_mod.Runtime.addNode,
-            runtime_mod.Runtime.addEnr,
-            runtime_mod.Runtime.setLocalEnr,
-            runtime_mod.Runtime.sendPing,
-            runtime_mod.Runtime.sendFindNode,
-            runtime_mod.Runtime.sendTalkRequest,
-            runtime_mod.Runtime.sendTalkResponse,
-            runtime_mod.Runtime.startLookup,
-            runtime_mod.Runtime.cancelRequest,
-            runtime_mod.Runtime.startRandomLookup,
-            runtime_mod.Runtime.metricsSnapshot,
-            runtime_mod.Runtime.localEnr,
-            runtime_mod.Runtime.peerEnr,
-            runtime_mod.Runtime.localEnrSeq,
-        };
-        for (fallible) |function| {
-            const return_type = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
-            const error_set = @typeInfo(return_type).error_union.error_set;
-            if (error_set == anyerror) @compileError("public Runtime API leaks anyerror");
-            if (error_set != RuntimeError) @compileError("public Runtime API does not use Runtime.Error");
-        }
+        expectErrorSet(runtime_mod.Runtime.init, runtime_mod.InitError);
+        expectErrorSet(runtime_mod.Runtime.run, runtime_mod.RunError);
+        expectErrorSet(runtime_mod.Runtime.nextEvent, runtime_mod.EventError);
+        expectErrorSet(runtime_mod.Runtime.addNode, runtime_mod.EnrAdmissionError);
+        expectErrorSet(runtime_mod.Runtime.addEnr, runtime_mod.EnrAdmissionError);
+        expectErrorSet(runtime_mod.Runtime.setLocalEnr, runtime_mod.SetLocalEnrError);
+        expectErrorSet(runtime_mod.Runtime.sendPing, runtime_mod.RequestError);
+        expectErrorSet(runtime_mod.Runtime.sendFindNode, runtime_mod.FindNodeError);
+        expectErrorSet(runtime_mod.Runtime.sendTalkRequest, runtime_mod.TalkRequestError);
+        expectErrorSet(runtime_mod.Runtime.sendTalkResponse, runtime_mod.TalkResponseError);
+        expectErrorSet(runtime_mod.Runtime.startLookup, runtime_mod.LookupError);
+        expectErrorSet(runtime_mod.Runtime.cancelRequest, runtime_mod.CommandError);
+        expectErrorSet(runtime_mod.Runtime.startRandomLookup, runtime_mod.LookupError);
+        expectErrorSet(runtime_mod.Runtime.metricsSnapshot, runtime_mod.CommandError);
+        expectErrorSet(runtime_mod.Runtime.localEnr, runtime_mod.CommandError);
+        expectErrorSet(runtime_mod.Runtime.peerEnr, runtime_mod.CommandError);
+        expectErrorSet(runtime_mod.Runtime.localEnrSeq, runtime_mod.CommandError);
     }
+}
+
+test "running Runtime rejects oversized TALK before queued ownership admission" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x73, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x74} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 19074 } };
+
+    const ping_req_id = try runtime.sendPing(remote_id, &remote_pubkey, address, 0);
+    var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 1), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 1), counts.permits);
+
+    const protocol = [_]u8{0x01};
+    const request = [_]u8{0x02} ** 1_200;
+    try std.testing.expect(protocol.len + request.len <= packet.MAX_PACKET_SIZE);
+    try std.testing.expectError(error.MessageTooLarge, runtime.sendTalkRequest(remote_id, &remote_pubkey, address, &protocol, &request));
+
+    const response = [_]u8{0x03} ** 1_200;
+    try std.testing.expect(response.len <= packet.MAX_PACKET_SIZE);
+    try std.testing.expectError(error.MessageTooLarge, runtime.sendTalkResponse(remote_id, address, .{ .bytes = [_]u8{0x04} ** 8, .len = 8 }, &response));
+
+    counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 1), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 1), counts.permits);
+    const snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.sentMessageCount(metrics.MessageType.ping));
+    try std.testing.expectEqual(@as(u64, 0), snapshot.sentMessageCount(metrics.MessageType.talkreq));
+
+    try std.testing.expect(try runtime.cancelRequest(remote_id, address, ping_req_id));
+    counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
 }
 
 test "persistent receive errors use bounded backoff" {

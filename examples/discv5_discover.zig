@@ -148,7 +148,6 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
         const event_value = discovery_runtime.nextEvent() catch |err| switch (err) {
             error.Closed => break,
             error.Canceled => return err,
-            else => return err,
         };
         var event = event_value;
         defer event.deinit(alloc);
