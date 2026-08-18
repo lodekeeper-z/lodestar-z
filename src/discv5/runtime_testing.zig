@@ -37,6 +37,10 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime Runtim
             try impl(runtime).requestMaintenanceWake();
         }
 
+        pub fn enqueueStaleMaintenance(runtime: *Runtime) !void {
+            try impl(runtime).enqueueCommand(.maintenance);
+        }
+
         pub fn setCommandGate(runtime: *Runtime, gate: ?*CommandGate) void {
             impl(runtime).test_command_gate = gate;
         }

@@ -319,7 +319,7 @@ test "Runtime command admission is bounded nonblocking and drains accepted owner
     try std.testing.expectEqual(@as(usize, 0), counts.permits);
 }
 
-test "rejected maintenance wake is coalesced and stale queued wake is harmless" {
+test "repeated maintenance wake is coalesced and stale queued wake is harmless" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
@@ -363,6 +363,7 @@ test "rejected maintenance wake is coalesced and stale queued wake is harmless" 
     try std.testing.expectEqual(@as(usize, 1), initial_counts.permits);
 
     var gate = runtime_mod.Testing.CommandGate{};
+    defer gate.proceed.store(true, .release);
     runtime_mod.Testing.setCommandGate(runtime, &gate);
     var blocker_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
     var blocker_reply = runtime_mod.Testing.BoolReply.init(&blocker_buffer);
@@ -383,7 +384,7 @@ test "rejected maintenance wake is coalesced and stale queued wake is harmless" 
     var ping_reply = runtime_mod.Testing.ReqReply.init(&ping_buffer);
     try runtime_mod.Testing.enqueueSendPing(runtime, second_endpoint, second_pubkey, &ping_reply);
     try runtime_mod.Testing.putMaintenance(runtime);
-    try std.testing.expectError(error.CommandQueueFull, runtime_mod.Testing.putMaintenance(runtime));
+    try runtime_mod.Testing.putMaintenance(runtime);
 
     gate.proceed.store(true, .release);
     const blocker_result = try blocker_reply.getOneUncancelable(io);
@@ -397,17 +398,121 @@ test "rejected maintenance wake is coalesced and stale queued wake is harmless" 
     try std.testing.expect(!(try barrier_result));
 
     const counts = runtime_mod.Testing.activeAndPermitCount(runtime);
-    try std.testing.expectEqual(@as(usize, 1), counts.active);
-    try std.testing.expectEqual(@as(usize, 1), counts.permits);
-    var timeout_event = runtime.popEvent() orelse return error.MissingTimeoutEvent;
-    defer timeout_event.deinit(alloc);
-    try std.testing.expect(timeout_event == .request_timeout);
-    try std.testing.expectEqualSlices(u8, &first_id, &timeout_event.request_timeout.peer_id);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+    var saw_first = false;
+    var saw_second = false;
+    for (0..2) |_| {
+        var timeout_event = runtime.popEvent() orelse return error.MissingTimeoutEvent;
+        defer timeout_event.deinit(alloc);
+        try std.testing.expect(timeout_event == .request_timeout);
+        if (std.mem.eql(u8, &first_id, &timeout_event.request_timeout.peer_id)) saw_first = true;
+        if (std.mem.eql(u8, &second_id, &timeout_event.request_timeout.peer_id)) saw_second = true;
+    }
+    try std.testing.expect(saw_first);
+    try std.testing.expect(saw_second);
+    try std.testing.expect(runtime.popEvent() == null);
+
+    try runtime_mod.Testing.enqueueStaleMaintenance(runtime);
+    var stale_barrier_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
+    var stale_barrier_reply = runtime_mod.Testing.BoolReply.init(&stale_barrier_buffer);
+    try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &stale_barrier_reply);
+    const stale_barrier_result = try stale_barrier_reply.getOneUncancelable(io);
+    try std.testing.expect(!(try stale_barrier_result));
     try std.testing.expect(runtime.popEvent() == null);
 
     runtime.stop();
     try runtime_group.await(io);
     try std.testing.expect(run_error == null);
+}
+
+test "failed maintenance enqueue rolls back pending state for retry" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x7c} ** 32));
+    const runtime = try runtime_mod.Runtime.init(io, alloc, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key)),
+        .request_timeout_ms = 0,
+        .request_retries = 0,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 2,
+            .max_queued_requests = 2,
+            .event_capacity = 2,
+            .command_capacity = 1,
+        },
+    }, .{ .maintenance_interval_ms = 60_000 });
+    defer runtime.deinit();
+
+    var first_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
+    var first_reply = runtime_mod.Testing.BoolReply.init(&first_buffer);
+    try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &first_reply);
+    var gate = runtime_mod.Testing.CommandGate{};
+    defer gate.proceed.store(true, .release);
+    runtime_mod.Testing.setCommandGate(runtime, &gate);
+    var loop_error: ?anyerror = null;
+    var loop_group: std.Io.Group = .init;
+    var loop_awaited = false;
+    defer if (!loop_awaited) {
+        gate.proceed.store(true, .release);
+        runtime.stop();
+        loop_group.await(io) catch {};
+    };
+    try loop_group.concurrent(io, runActorLoop, .{ runtime, &loop_error });
+    for (0..10_000) |_| {
+        if (gate.entered.load(.acquire)) break;
+        try std.Thread.yield();
+    } else return error.RuntimeDidNotEnter;
+
+    var second_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
+    var second_reply = runtime_mod.Testing.BoolReply.init(&second_buffer);
+    try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &second_reply);
+    try std.testing.expectError(error.CommandQueueFull, runtime_mod.Testing.putMaintenance(runtime));
+    try std.testing.expectError(error.CommandQueueFull, runtime_mod.Testing.putMaintenance(runtime));
+
+    gate.proceed.store(true, .release);
+    const first_result = try first_reply.getOneUncancelable(io);
+    try std.testing.expect(!(try first_result));
+    const second_result = try second_reply.getOneUncancelable(io);
+    try std.testing.expect(!(try second_result));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x7d} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    var ping_buffer: [1]runtime_mod.Testing.ReqResult = undefined;
+    var ping_reply = runtime_mod.Testing.ReqReply.init(&ping_buffer);
+    try runtime_mod.Testing.enqueueSendPing(runtime, .{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 12 }, .port = 19081 } },
+    }, remote_pubkey, &ping_reply);
+    _ = try (try ping_reply.getOneUncancelable(io));
+    try runtime_mod.Testing.putMaintenance(runtime);
+    var barrier_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
+    var barrier_reply = runtime_mod.Testing.BoolReply.init(&barrier_buffer);
+    for (0..10_000) |_| {
+        runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &barrier_reply) catch |err| switch (err) {
+            error.CommandQueueFull => {
+                try std.Thread.yield();
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    } else return error.MaintenanceDidNotRun;
+    const barrier_result = try barrier_reply.getOneUncancelable(io);
+    try std.testing.expect(!(try barrier_result));
+    var timeout_event = runtime.popEvent() orelse return error.MissingTimeoutEvent;
+    defer timeout_event.deinit(alloc);
+    try std.testing.expect(timeout_event == .request_timeout);
+    try std.testing.expectEqualSlices(u8, &remote_id, &timeout_event.request_timeout.peer_id);
+
+    runtime.stop();
+    try loop_group.await(io);
+    loop_awaited = true;
+    try std.testing.expect(loop_error == null);
 }
 
 test "normal stop drains accepted owned commands and replies" {

@@ -14,7 +14,9 @@ pub fn handle(runtime: *RuntimeImpl, command: Command) std.Io.Cancelable!void {
             runtime.actor.handlePacket(env, bytes.bytes[0..bytes.len], value.from);
             runtime.admission.noteProcessed();
         },
-        .maintenance => {},
+        .maintenance => {
+            if (runtime.maintenance_due.swap(false, .acq_rel)) runtime.actor.maintenance(env);
+        },
         .add_node => |value| {
             defer if (value.enr) |bytes| runtime.allocator.free(bytes);
             var pubkey = value.pubkey;

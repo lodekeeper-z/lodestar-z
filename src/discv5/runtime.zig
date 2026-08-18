@@ -377,7 +377,6 @@ pub const RuntimeImpl = struct {
                 error.Canceled => return error.Canceled,
             };
             try self.handleCommand(command);
-            self.runMaintenanceIfDue();
         }
     }
 
@@ -396,13 +395,7 @@ pub const RuntimeImpl = struct {
             self.handleCommand(command) catch |err| switch (err) {
                 error.Canceled => {},
             };
-            self.runMaintenanceIfDue();
         }
-    }
-
-    fn runMaintenanceIfDue(self: *RuntimeImpl) void {
-        if (!self.maintenance_due.swap(false, .acq_rel)) return;
-        self.actor.maintenance(self.env());
     }
 
     /// Bind the actor execution context from heap-pinned runtime state.
@@ -468,8 +461,11 @@ pub const RuntimeImpl = struct {
     }
 
     pub fn requestMaintenanceWake(self: *RuntimeImpl) !void {
-        self.maintenance_due.store(true, .release);
-        try self.enqueueCommand(.maintenance);
+        if (self.maintenance_due.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        self.enqueueCommand(.maintenance) catch |err| {
+            self.maintenance_due.store(false, .release);
+            return err;
+        };
     }
 };
 
