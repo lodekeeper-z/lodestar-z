@@ -34,7 +34,7 @@ test "ENR Builder: key-value pairs sorted alphabetically (EIP-778)" {
     const parsed = try decode(enr_bytes);
 
     const expected_node_id = hex_mod.hexToBytesComptime(32, "a448f24c6d18e575453db13171562b71999873db5b286df957af199ec94617f7");
-    const node_id = parsed.nodeId() orelse return error.NoNodeId;
+    const node_id = (try parsed.nodeId()) orelse return error.NoNodeId;
     try std.testing.expectEqualSlices(u8, &expected_node_id, &node_id);
 }
 

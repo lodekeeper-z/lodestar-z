@@ -198,7 +198,7 @@ fn handleTalkResp(actor: *Actor, env: Env, plaintext: []const u8, endpoint: type
 
 fn matchesDistances(raw: []const u8, responder: *const types.NodeId, accumulator: *const request_book.NodesAccumulator) bool {
     const parsed = enr.decode(raw) catch return false;
-    const node_id = parsed.nodeId() orelse return false;
+    const node_id = (parsed.nodeId() catch return false) orelse return false;
     const distance: u16 = if (kbucket.logDistance(&node_id, responder)) |value| @as(u16, value) + 1 else 0;
     for (accumulator.distances[0..accumulator.distances_len]) |requested| if (requested == distance) return true;
     return false;

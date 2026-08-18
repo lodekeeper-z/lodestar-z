@@ -290,7 +290,7 @@ pub const PeerBook = struct {
 
     fn entryFromEnr(self: *PeerBook, bytes: []const u8, address: types.Address, status: kbucket.EntryStatus, now_ns: i64) ?kbucket.Entry {
         const parsed = enr.decode(bytes) catch return null;
-        const node_id = parsed.nodeId() orelse return null;
+        const node_id = (parsed.nodeId() catch return null) orelse return null;
         if (std.mem.eql(u8, &node_id, &self.local_node_id)) return null;
         return .{
             .node_id = node_id,

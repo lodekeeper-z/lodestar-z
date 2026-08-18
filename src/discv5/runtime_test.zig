@@ -65,7 +65,7 @@ fn initTestRuntime(io: std.Io, alloc: std.mem.Allocator, secret_byte: u8, limits
     return runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair)),
+        .local_node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair)),
         .rate_limiter = null,
         .limits = limits,
     }, options);
@@ -152,10 +152,10 @@ test "Runtime send cancellation closes drains joins and releases command state" 
     defer threaded.deinit();
     const io = threaded.io();
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x6d} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x6e} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const runtime = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
@@ -325,7 +325,7 @@ test "rejected maintenance wake is coalesced and stale queued wake is harmless" 
     defer threaded.deinit();
     const io = threaded.io();
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const runtime = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
@@ -355,7 +355,7 @@ test "rejected maintenance wake is coalesced and stale queued wake is harmless" 
 
     const first_key = try secp.keyPairFromSecret(&([_]u8{0x7a} ** 32));
     const first_pubkey = secp.compressedPubkey(&first_key);
-    const first_id = enr.nodeIdFromCompressedPubkey(&first_pubkey);
+    const first_id = try enr.nodeIdFromCompressedPubkey(&first_pubkey);
     const first_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 10 }, .port = 19079 } };
     _ = try runtime.sendPing(first_id, &first_pubkey, first_address, 0);
     const initial_counts = runtime_mod.Testing.activeAndPermitCount(runtime);
@@ -374,7 +374,7 @@ test "rejected maintenance wake is coalesced and stale queued wake is harmless" 
 
     const second_key = try secp.keyPairFromSecret(&([_]u8{0x7b} ** 32));
     const second_pubkey = secp.compressedPubkey(&second_key);
-    const second_id = enr.nodeIdFromCompressedPubkey(&second_pubkey);
+    const second_id = try enr.nodeIdFromCompressedPubkey(&second_pubkey);
     const second_endpoint = types.Endpoint{
         .node_id = second_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 11 }, .port = 19080 } },
@@ -471,10 +471,10 @@ test "Runtime exposes named request cancellation" {
     defer threaded.deinit();
     const io = threaded.io();
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x74} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x75} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const runtime = try runtime_mod.Runtime.init(io, alloc, config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
@@ -506,7 +506,7 @@ test "Runtime actor queries return authoritative local and peer ENR snapshots" {
     defer threaded.deinit();
     const io = threaded.io();
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x66} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var initial_builder = enr.Builder.init(alloc, local_key, 1);
     initial_builder.ip = .{ 127, 0, 0, 1 };
     initial_builder.udp = 19066;
@@ -548,7 +548,7 @@ test "Runtime actor queries return authoritative local and peer ENR snapshots" {
     remote_builder.udp = 19068;
     const remote_enr = try remote_builder.encode();
     defer alloc.free(remote_enr);
-    const remote_id = (try enr.decode(remote_enr)).nodeId().?;
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
     try std.testing.expect(try runtime.addEnr(remote_enr));
     const peer_snapshot = (try runtime.peerEnr(remote_id)) orelse return error.MissingPeerEnr;
     try std.testing.expectEqualSlices(u8, remote_enr, peer_snapshot.slice());
@@ -566,7 +566,7 @@ test "Runtime follows run stop caller-await deinit lifecycle" {
     defer threaded.deinit();
     const io = threaded.io();
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x71} ** 32));
-    const node_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const runtime = try runtime_mod.Runtime.init(io, alloc, config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
@@ -600,7 +600,7 @@ fn runtimeInitializationLifecycle(alloc: std.mem.Allocator) !void {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x6f} ** 32));
-    const node_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const runtime = try runtime_mod.Runtime.init(threaded.io(), alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
@@ -622,10 +622,10 @@ test "two live Runtime sockets complete strict handshake and PING lifecycle" {
     const io = threaded.io();
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x80} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x81} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const limits = config.Limits{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 16, .command_capacity = 8 };
     const runtime_a = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },

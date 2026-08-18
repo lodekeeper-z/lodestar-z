@@ -195,5 +195,5 @@ test "discv5 messages: NODES decode returns encoded ENR bytes" {
     try std.testing.expectEqualSlices(u8, enr_bytes, decoded.enrs[0]);
 
     const parsed = try enr_mod.decode(decoded.enrs[0]);
-    try std.testing.expect(parsed.nodeId() != null);
+    try std.testing.expect((try parsed.nodeId()) != null);
 }

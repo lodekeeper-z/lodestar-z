@@ -24,7 +24,7 @@ test "Actor address votes count one voter per native IPv6 source prefix" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x91} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const local_address = ip6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 }, 1, 9000);
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip6 = local_address.ip6.bytes;
@@ -64,7 +64,7 @@ test "Actor address vote window expires old observations deterministically" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x95} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip = .{ 127, 0, 0, 1 };
     local_builder.udp = 9000;
@@ -105,7 +105,7 @@ test "Actor rejects invalid observed endpoints but accepts private unicast" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip = .{ 127, 0, 0, 1 };
     local_builder.udp = 9000;
@@ -155,7 +155,7 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x93} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip = .{ 127, 0, 0, 1 };
     local_builder.udp = 9000;
@@ -181,7 +181,7 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
 
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x94} ** 32));
-    const remote_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
     const remote_address = ip4(.{ 192, 0, 2, 10 }, 9200);
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
     remote_builder.ip = remote_address.ip4.bytes;

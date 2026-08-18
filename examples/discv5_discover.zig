@@ -81,7 +81,7 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
 
     const key_pair = discv5.secp256k1.KeyPair.generate(io);
     const pubkey = discv5.secp256k1.compressedPubkey(&key_pair);
-    const local_node_id = discv5.enr.nodeIdFromCompressedPubkey(&pubkey);
+    const local_node_id = try discv5.enr.nodeIdFromCompressedPubkey(&pubkey);
 
     const runtime_config = discv5.Config{
         .bind_addresses = .{
@@ -300,7 +300,7 @@ fn printFoundParsedEnr(
     raw_enr: []const u8,
     parsed: *const discv5.Enr,
 ) !bool {
-    const node_id = parsed.nodeId() orelse return false;
+    const node_id = (try parsed.nodeId()) orelse return false;
     const seen_entry = try seen.getOrPut(node_id);
     if (seen_entry.found_existing) return false;
 

@@ -189,7 +189,7 @@ pub const Actor = struct {
 
     pub fn addEnr(self: *Actor, outbox: *events.EventOutbox, raw: []const u8, now_ns: i64) bool {
         const parsed = enr.decode(raw) catch return false;
-        const node_id = parsed.nodeId() orelse return false;
+        const node_id = (parsed.nodeId() catch return false) orelse return false;
         const pubkey = parsed.pubkey orelse return false;
         const address = self.peers.addressForEnr(&parsed) orelse return false;
         const previous = if (self.peers.findEnr(&node_id)) |bytes| enr.RawEnr.init(bytes) catch null else null;
@@ -217,7 +217,7 @@ pub const Actor = struct {
 
     pub fn setLocalEnr(self: *Actor, env: Env, raw: []const u8) !void {
         const parsed = try enr.decode(raw);
-        const node_id = parsed.nodeId() orelse return error.InvalidEnr;
+        const node_id = (parsed.nodeId() catch return error.InvalidEnr) orelse return error.InvalidEnr;
         if (!std.mem.eql(u8, &node_id, &self.local_node_id)) return error.WrongNodeId;
         if (self.local.raw) |*current| if (std.mem.eql(u8, current.slice(), raw)) return;
         if (parsed.seq <= self.local.seq) return error.StaleEnrSeq;
@@ -237,7 +237,7 @@ pub const Actor = struct {
 
     pub fn discoveredNodeId(self: *const Actor, raw: []const u8) ?types.NodeId {
         const parsed = enr.decode(raw) catch return null;
-        const node_id = parsed.nodeId() orelse return null;
+        const node_id = (parsed.nodeId() catch return null) orelse return null;
         if (std.mem.eql(u8, &node_id, &self.local_node_id)) return null;
         if (self.peers.addressForEnr(&parsed) == null) return null;
         return node_id;

@@ -182,7 +182,7 @@ pub const SessionBook = struct {
 test "session book stores stable keys independently from challenges" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
@@ -206,7 +206,7 @@ test "session book stores stable keys independently from challenges" {
 test "session book enforces TTL LRU and non-evicting nonce epochs" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
@@ -246,7 +246,7 @@ test "session book enforces TTL LRU and non-evicting nonce epochs" {
 test "session challenge cache moves permit ownership through TTL and LRU cleanup" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 3);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
@@ -276,7 +276,7 @@ test "session challenge cache moves permit ownership through TTL and LRU cleanup
 test "WHOAREYOU rate is per source IP and capacity bounded" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{

@@ -14,7 +14,7 @@ test "PeerBook health request is an exact foreign key" {
     builder.udp = 9000;
     const raw = try builder.encode();
     defer alloc.free(raw);
-    const remote_id = (try enr.decode(raw)).nodeId().?;
+    const remote_id = (try (try enr.decode(raw)).nodeId()).?;
     const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9000 } };
     const endpoint = types.Endpoint{ .node_id = remote_id, .addr = address };
     var peers = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, false);
@@ -50,7 +50,7 @@ test "authenticated endpoint migration disarms stale health timeout" {
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 7 }, .port = 9005 } };
     const raw = try encodeEnr(alloc, remote_key, 1, address_a);
     defer alloc.free(raw);
-    const remote_id = (try enr.decode(raw)).nodeId().?;
+    const remote_id = (try (try enr.decode(raw)).nodeId()).?;
     var peers = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, false);
     defer peers.deinit();
     try std.testing.expect(peers.learnEnr(raw, 0) != null);
@@ -77,7 +77,7 @@ test "ENR replacement preserves health only for the final effective endpoint" {
     defer alloc.free(learned_b);
     const authenticated_b = try encodeEnr(alloc, remote_key, 3, address_b);
     defer alloc.free(authenticated_b);
-    const remote_id = (try enr.decode(raw_a)).nodeId().?;
+    const remote_id = (try (try enr.decode(raw_a)).nodeId()).?;
     var peers = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, false);
     defer peers.deinit();
     try std.testing.expect(peers.learnEnr(raw_a, 0) != null);
@@ -104,7 +104,7 @@ test "new raw ENR needs proof or explicit trust for its exact endpoint" {
     const alloc = std.testing.allocator;
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x41} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 30 }, .port = 9030 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 31 }, .port = 9031 } };
     const raw_a = try encodeEnr(alloc, remote_key, 1, address_a);
@@ -159,7 +159,7 @@ test "explicit raw ENR trust rejects an address that differs from its advertised
     const alloc = std.testing.allocator;
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x42} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const advertised = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 40 }, .port = 9040 } };
     const configured = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 41 }, .port = 9041 } };
     const raw = try encodeEnr(alloc, remote_key, 1, advertised);
@@ -175,7 +175,7 @@ test "PeerBook keeps explicit trust endpoint-specific across newer ENR replaceme
     const alloc = std.testing.allocator;
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x32} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 3 }, .port = 9001 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 4 }, .port = 9002 } };
     const address_c = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 5 }, .port = 9003 } };
@@ -240,7 +240,7 @@ test "contact eviction preserves only matching explicit trust and malformed ENR 
     const alloc = std.testing.allocator;
     const trusted_key = try secp.keyPairFromSecret(&([_]u8{0x38} ** 32));
     const trusted_pubkey = secp.compressedPubkey(&trusted_key);
-    const trusted_id = enr.nodeIdFromCompressedPubkey(&trusted_pubkey);
+    const trusted_id = try enr.nodeIdFromCompressedPubkey(&trusted_pubkey);
     const trusted_address = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 8 }, .port = 9012 } };
     const trusted_enr = try encodeEnr(alloc, trusted_key, 1, trusted_address);
     defer alloc.free(trusted_enr);
@@ -257,7 +257,7 @@ test "contact eviction preserves only matching explicit trust and malformed ENR 
 
     const untrusted_key = try secp.keyPairFromSecret(&([_]u8{0x39} ** 32));
     const untrusted_pubkey = secp.compressedPubkey(&untrusted_key);
-    const untrusted_id = enr.nodeIdFromCompressedPubkey(&untrusted_pubkey);
+    const untrusted_id = try enr.nodeIdFromCompressedPubkey(&untrusted_pubkey);
     const untrusted_address = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 9 }, .port = 9013 } };
     peers.rememberContact(untrusted_id, &untrusted_pubkey, untrusted_address, false);
     _ = peers.acceptHandshake(untrusted_id, &untrusted_pubkey, untrusted_address, null, 3);
@@ -269,7 +269,7 @@ test "full bucket preserves a matching locally trusted contact after learning it
     const local_id = [_]u8{0} ** 32;
     const trusted_key = try secp.keyPairFromSecret(&([_]u8{0x3a} ** 32));
     const trusted_pubkey = secp.compressedPubkey(&trusted_key);
-    const trusted_id = enr.nodeIdFromCompressedPubkey(&trusted_pubkey);
+    const trusted_id = try enr.nodeIdFromCompressedPubkey(&trusted_pubkey);
     const trusted_address = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 10 }, .port = 9014 } };
     const trusted_enr = try encodeEnr(alloc, trusted_key, 1, trusted_address);
     defer alloc.free(trusted_enr);
@@ -293,7 +293,7 @@ test "addTrusted reports failure when neither routing nor contact storage retain
     const local_id = [_]u8{0} ** 32;
     const trusted_key = try secp.keyPairFromSecret(&([_]u8{0x3b} ** 32));
     const trusted_pubkey = secp.compressedPubkey(&trusted_key);
-    const trusted_id = enr.nodeIdFromCompressedPubkey(&trusted_pubkey);
+    const trusted_id = try enr.nodeIdFromCompressedPubkey(&trusted_pubkey);
     const trusted_address = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 11 }, .port = 9015 } };
     const trusted_enr = try encodeEnr(alloc, trusted_key, 1, trusted_address);
     defer alloc.free(trusted_enr);
@@ -316,7 +316,7 @@ test "locally trusted contact remains durable while a pending ENR can still be r
     const local_id = [_]u8{0} ** 32;
     const trusted_key = try secp.keyPairFromSecret(&([_]u8{0x3c} ** 32));
     const trusted_pubkey = secp.compressedPubkey(&trusted_key);
-    const trusted_id = enr.nodeIdFromCompressedPubkey(&trusted_pubkey);
+    const trusted_id = try enr.nodeIdFromCompressedPubkey(&trusted_pubkey);
     const trusted_address = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 13 }, .port = 9017 } };
     const trusted_enr = try encodeEnr(alloc, trusted_key, 1, trusted_address);
     defer alloc.free(trusted_enr);
@@ -344,7 +344,7 @@ test "network-learned endpoint changes preserve endpoint-specific local trust" {
     const alloc = std.testing.allocator;
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x3f} ** 32));
     const pubkey = secp.compressedPubkey(&key_pair);
-    const node_id = enr.nodeIdFromCompressedPubkey(&pubkey);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 20 }, .port = 9020 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 21 }, .port = 9021 } };
     const raw_a = try encodeEnr(alloc, key_pair, 1, address_a);
@@ -370,7 +370,7 @@ test "authenticated endpoint move does not migrate local trust" {
     const alloc = std.testing.allocator;
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x40} ** 32));
     const pubkey = secp.compressedPubkey(&key_pair);
-    const node_id = enr.nodeIdFromCompressedPubkey(&pubkey);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 22 }, .port = 9022 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 23 }, .port = 9023 } };
     const raw_a = try encodeEnr(alloc, key_pair, 1, address_a);
@@ -400,7 +400,7 @@ test "PeerBook knownEnrSeq reads routed and pending canonical metadata" {
 
     const routed_key = try secp.keyPairFromSecret(&([_]u8{0x3d} ** 32));
     const routed_pubkey = secp.compressedPubkey(&routed_key);
-    const routed_id = enr.nodeIdFromCompressedPubkey(&routed_pubkey);
+    const routed_id = try enr.nodeIdFromCompressedPubkey(&routed_pubkey);
     const routed_address = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 14 }, .port = 9018 } };
     const routed_enr = try encodeEnr(alloc, routed_key, 4, routed_address);
     defer alloc.free(routed_enr);
@@ -411,7 +411,7 @@ test "PeerBook knownEnrSeq reads routed and pending canonical metadata" {
 
     const pending_key = try secp.keyPairFromSecret(&([_]u8{0x3e} ** 32));
     const pending_pubkey = secp.compressedPubkey(&pending_key);
-    const pending_id = enr.nodeIdFromCompressedPubkey(&pending_pubkey);
+    const pending_id = try enr.nodeIdFromCompressedPubkey(&pending_pubkey);
     const pending_address = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 15 }, .port = 9019 } };
     const pending_enr = try encodeEnr(alloc, pending_key, 7, pending_address);
     defer alloc.free(pending_enr);

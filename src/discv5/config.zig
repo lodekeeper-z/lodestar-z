@@ -92,7 +92,8 @@ pub const Config = struct {
         if (self.addr_votes_to_update_enr == 0 or
             self.addr_votes_to_update_enr > addr_votes.MAX_ADDR_VOTES) return error.InvalidVoteThreshold;
         const local_pubkey = secp.compressedPubkey(&self.local_key_pair);
-        const derived_node_id = @import("enr.zig").nodeIdFromCompressedPubkey(&local_pubkey);
+        const derived_node_id = @import("enr.zig").nodeIdFromCompressedPubkey(&local_pubkey) catch
+            return error.InvalidLocalIdentity;
         if (!std.mem.eql(u8, &derived_node_id, &self.local_node_id)) return error.InvalidLocalIdentity;
         if (self.rate_limiter) |limiter| {
             if (limiter.by_ip_state_capacity == 0 or limiter.by_ip_state_capacity > MAX_WHOAREYOU_SOURCES or
@@ -101,7 +102,7 @@ pub const Config = struct {
         if (self.local_enr) |bytes| {
             if (bytes.len > @import("enr.zig").MAX_ENR_SIZE) return error.InvalidEnr;
             const parsed = @import("enr.zig").decode(bytes) catch return error.InvalidEnr;
-            const node_id = parsed.nodeId() orelse return error.InvalidEnr;
+            const node_id = (parsed.nodeId() catch return error.InvalidEnr) orelse return error.InvalidEnr;
             if (!std.mem.eql(u8, &node_id, &self.local_node_id)) return error.InvalidLocalIdentity;
         }
     }
@@ -117,7 +118,7 @@ pub const Options = struct {
 
 test "config keeps protocol capacities bounded" {
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var config = Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
@@ -133,7 +134,7 @@ test "config keeps protocol capacities bounded" {
 
 test "config rejects address vote thresholds above the bounded voter capacity" {
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const config = Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,

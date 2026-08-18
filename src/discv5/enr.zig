@@ -12,6 +12,7 @@ const Keccak256 = std.crypto.hash.sha3.Keccak256;
 const Address = std.Io.net.IpAddress;
 
 pub const NodeId = [32]u8;
+pub const NodeIdError = error{InvalidPublicKey};
 
 /// Maximum ENR size in bytes (per spec)
 pub const MAX_ENR_SIZE = 300;
@@ -74,9 +75,9 @@ pub const Enr = struct {
     custody_group_count: ?u64,
 
     /// Compute NodeId from ENR public key
-    pub fn nodeId(self: *const Enr) ?NodeId {
+    pub fn nodeId(self: *const Enr) NodeIdError!?NodeId {
         const pk = self.pubkey orelse return null;
-        return nodeIdFromCompressedPubkey(&pk);
+        return try nodeIdFromCompressedPubkey(&pk);
     }
 
     /// The advertised IPv4 UDP endpoint, or null if either ip/udp is absent.
@@ -100,15 +101,12 @@ pub const Enr = struct {
 };
 
 /// Compute NodeId = keccak256(uncompressed pubkey[1..]) from compressed pubkey
-pub fn nodeIdFromCompressedPubkey(compressed: *const [33]u8) NodeId {
+pub fn nodeIdFromCompressedPubkey(compressed: *const [33]u8) NodeIdError!NodeId {
     // Per discv5/v4 identity scheme:
     //   node-id = keccak256(uncompressed_pubkey[1..65])
     // Reuse the thread-local secp256k1 context from secp256k1.zig to avoid
     // allocating a new context on every call.
-    const uncompressed = secp.uncompressedFromCompressed(compressed) catch {
-        // Invalid key — return zeroed node id
-        return [_]u8{0} ** 32;
-    };
+    const uncompressed = secp.uncompressedFromCompressed(compressed) catch return NodeIdError.InvalidPublicKey;
     var node_id: NodeId = undefined;
     Keccak256.hash(uncompressed[1..65], &node_id, .{});
     return node_id;
@@ -215,7 +213,10 @@ pub fn decode(data: []const u8) Error!Enr {
     var sig_hash: [32]u8 = undefined;
     hashSignedPortion(content_payload, &sig_hash);
     const signature: [64]u8 = signature_bytes[0..64].*;
-    secp.verify(&sig_hash, &signature, &pubkey) catch return Error.InvalidSignature;
+    secp.verify(&sig_hash, &signature, &pubkey) catch |err| switch (err) {
+        secp.Error.InvalidPublicKey => return Error.InvalidPublicKey,
+        else => return Error.InvalidSignature,
+    };
 
     return enr;
 }
@@ -474,11 +475,16 @@ test "ENR nodeIdFromCompressedPubkey" {
     const secret_key = hex.hexToBytesComptime(32, "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f");
     const key_pair = try secp.keyPairFromSecret(&secret_key);
     const pubkey = secp.compressedPubkey(&key_pair);
-    const node_id = nodeIdFromCompressedPubkey(&pubkey);
+    const node_id = try nodeIdFromCompressedPubkey(&pubkey);
 
     // Expected from test vectors: node-a-id = 0xaaaa8419e9f49d0083561b48287df592939a8d19947d8c0ef88f2a4856a69fbb
     const expected = hex.hexToBytesComptime(32, "aaaa8419e9f49d0083561b48287df592939a8d19947d8c0ef88f2a4856a69fbb");
     try std.testing.expectEqualSlices(u8, &expected, &node_id);
+}
+
+test "ENR nodeIdFromCompressedPubkey rejects invalid keys" {
+    const invalid_pubkey = [_]u8{0} ** 33;
+    try std.testing.expectError(NodeIdError.InvalidPublicKey, nodeIdFromCompressedPubkey(&invalid_pubkey));
 }
 
 test "ENR bounded integers require minimal big-endian encoding" {

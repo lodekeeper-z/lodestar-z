@@ -26,7 +26,7 @@ test "Actor isolates health identity and arms exact eviction probes" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x41} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x42} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
@@ -34,7 +34,7 @@ test "Actor isolates health identity and arms exact eviction probes" {
     remote_builder.udp = 9000;
     const remote_enr = try remote_builder.encode();
     defer alloc.free(remote_enr);
-    const remote_id = (try enr.decode(remote_enr)).nodeId().?;
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
     const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9000 } };
     const endpoint = types.Endpoint{ .node_id = remote_id, .addr = address };
     const cfg = config.Config{
@@ -96,10 +96,10 @@ test "stale eviction candidate fails reservation before any send or permit" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x34} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x35} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 8 }, .port = 9006 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 9 }, .port = 9007 } };
     const cfg = config.Config{
@@ -147,10 +147,10 @@ const EvictionHarness = struct {
 
     fn init(alloc: std.mem.Allocator, io: std.Io) !EvictionHarness {
         const local_key = try secp.keyPairFromSecret(&([_]u8{0x25} ** 32));
-        const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+        const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
         const candidate_key = try secp.keyPairFromSecret(&([_]u8{0x26} ** 32));
         const candidate_pubkey = secp.compressedPubkey(&candidate_key);
-        const candidate_id = enr.nodeIdFromCompressedPubkey(&candidate_pubkey);
+        const candidate_id = try enr.nodeIdFromCompressedPubkey(&candidate_pubkey);
         const distance = kbucket_mod.logDistance(&local_id, &candidate_id) orelse return error.SameNodeId;
         // Low-byte variations below preserve the bucket only when the highest
         // differing bit is far above them.
@@ -381,7 +381,7 @@ test "health and eviction probes never queue behind endpoint establishment" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x36} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x37} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
@@ -389,7 +389,7 @@ test "health and eviction probes never queue behind endpoint establishment" {
     remote_builder.udp = 9010;
     const remote_enr = try remote_builder.encode();
     defer alloc.free(remote_enr);
-    const remote_id = (try enr.decode(remote_enr)).nodeId().?;
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 10 }, .port = 9010 } },
@@ -441,10 +441,10 @@ test "named cancellation conserves permits and queued FIFO across drain failure"
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x43} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x44} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 4 }, .port = 9004 } },
@@ -500,10 +500,10 @@ test "maintenance automatically redrains a queued lane after one transient send 
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x99} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9a} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 44 }, .port = 9244 } },
@@ -592,11 +592,11 @@ test "AdmissionPermit survives retry and releases on final timeout" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x45} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x46} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const endpoint = types.Endpoint{
-        .node_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 6 }, .port = 9006 } },
     };
     const cfg = config.Config{
@@ -641,10 +641,10 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x18} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x19} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 25 }, .port = 9025 } },
@@ -655,14 +655,14 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     builder_a.udp = 9026;
     const raw_a = try builder_a.encode();
     defer alloc.free(raw_a);
-    const id_a = (try enr.decode(raw_a)).nodeId().?;
+    const id_a = (try (try enr.decode(raw_a)).nodeId()).?;
     const discovered_key_b = try secp.keyPairFromSecret(&([_]u8{0x1b} ** 32));
     var builder_b = enr.Builder.init(alloc, discovered_key_b, 1);
     builder_b.ip = .{ 127, 0, 0, 27 };
     builder_b.udp = 9027;
     const raw_b = try builder_b.encode();
     defer alloc.free(raw_b);
-    const id_b = (try enr.decode(raw_b)).nodeId().?;
+    const id_b = (try (try enr.decode(raw_b)).nodeId()).?;
     const distance_a: u16 = if (@import("kbucket.zig").logDistance(&id_a, &remote_id)) |value| @as(u16, value) + 1 else 0;
     const distance_b: u16 = if (@import("kbucket.zig").logDistance(&id_b, &remote_id)) |value| @as(u16, value) + 1 else 0;
     const cfg = config.Config{
@@ -751,10 +751,10 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x93} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x94} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 31 }, .port = 9231 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 32 }, .port = 9232 } };
     const limits = config.Limits{
@@ -846,10 +846,10 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x95} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x96} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 33 }, .port = 9233 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 34 }, .port = 9234 } };
     const limits = config.Limits{
@@ -934,10 +934,10 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x97} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x98} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 35 }, .port = 9235 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 36 }, .port = 9236 } };
     const endpoint_a = types.Endpoint{ .node_id = id_a, .addr = address_a };
@@ -1093,11 +1093,11 @@ test "failed retry datagram does not increment sent message metrics" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x53} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x54} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const endpoint = types.Endpoint{
-        .node_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 7 }, .port = 9007 } },
     };
     const cfg = config.Config{
@@ -1138,7 +1138,7 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x58} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const local_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9058 } };
     var initial_builder = enr.Builder.init(alloc, local_key, 1);
     initial_builder.ip = local_address.ip4.bytes;
@@ -1176,7 +1176,7 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
         @memset(&secret, @as(u8, @intCast(candidate)));
         const remote_key = try secp.keyPairFromSecret(&secret);
         const remote_pubkey = secp.compressedPubkey(&remote_key);
-        const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+        const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
         if (@import("kbucket.zig").logDistance(&local_id, &remote_id) != 255) continue;
         const address = types.Address{ .ip4 = .{
             .bytes = .{ 127, 0, 0, @as(u8, @intCast(candidate)) },
@@ -1214,10 +1214,10 @@ test "NODES total is exact bounded consistent and controls final permit release"
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x47} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x48} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 8 }, .port = 9008 } },
@@ -1326,10 +1326,10 @@ test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x11} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x22} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
@@ -1394,10 +1394,10 @@ test "HANDSHAKE send failure leaves WHOAREYOU request state unchanged" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x53} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x54} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 14 }, .port = 9014 } },
@@ -1443,7 +1443,7 @@ test "failed ciphertext does not refresh stable session LRU recency" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x21} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
@@ -1497,10 +1497,10 @@ test "authenticated packets reject stale nonce and wrong source address" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x57} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x58} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 18 }, .port = 9018 } },
@@ -1548,9 +1548,9 @@ test "session nonce epoch retires at capacity and never redispatches its first r
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x5d} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x5e} ** 32));
-    const remote_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 22 }, .port = 9022 } },
@@ -1639,10 +1639,10 @@ test "successful handshake records initial probe nonce and replay is inert" {
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x63} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x64} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 23 }, .port = 9023 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 24 }, .port = 9024 } };
     const limits = config.Limits{
@@ -1732,10 +1732,10 @@ test "old key remains accepted without promotion until candidate response" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x59} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x5a} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 20 }, .port = 9020 } },
@@ -1813,10 +1813,10 @@ test "rekey lane queues stable-key requests and drains FIFO after candidate proo
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x5b} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x5c} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 21 }, .port = 9021 } },
@@ -1903,10 +1903,10 @@ test "initial tracked send failure is caller-visible and fully unwinds" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x61} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x62} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
@@ -1943,10 +1943,10 @@ test "WHOAREYOU and response send failures release prepared permits and retained
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x9b} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9c} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 45 }, .port = 9245 } },
@@ -2006,11 +2006,11 @@ test "transactional capacity-one challenge replacement send failure preserves or
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x2c} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key_a = try secp.keyPairFromSecret(&([_]u8{0x2d} ** 32));
-    const remote_id_a = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key_a));
+    const remote_id_a = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key_a));
     const remote_key_b = try secp.keyPairFromSecret(&([_]u8{0x2e} ** 32));
-    const remote_id_b = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key_b));
+    const remote_id_b = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key_b));
     const endpoint_a = types.Endpoint{
         .node_id = remote_id_a,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 46 }, .port = 9246 } },
@@ -2069,13 +2069,13 @@ test "transactional capacity-one response replacement send failure preserves ori
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x2f} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key_a = try secp.keyPairFromSecret(&([_]u8{0x30} ** 32));
     const remote_pubkey_a = secp.compressedPubkey(&remote_key_a);
-    const remote_id_a = enr.nodeIdFromCompressedPubkey(&remote_pubkey_a);
+    const remote_id_a = try enr.nodeIdFromCompressedPubkey(&remote_pubkey_a);
     const remote_key_b = try secp.keyPairFromSecret(&([_]u8{0x31} ** 32));
     const remote_pubkey_b = secp.compressedPubkey(&remote_key_b);
-    const remote_id_b = enr.nodeIdFromCompressedPubkey(&remote_pubkey_b);
+    const remote_id_b = try enr.nodeIdFromCompressedPubkey(&remote_pubkey_b);
     const endpoint_a = types.Endpoint{
         .node_id = remote_id_a,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 48 }, .port = 9248 } },
@@ -2139,9 +2139,9 @@ test "addEnr treats an older ENR for a known newer node as usable without an eve
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x2b} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x2c} ** 32));
-    const remote_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
     var older_builder = enr.Builder.init(alloc, remote_key, 1);
     older_builder.ip = .{ 127, 0, 0, 61 };
     older_builder.udp = 9061;
@@ -2187,7 +2187,7 @@ test "event payload allocation failure preserves Actor state and counts one drop
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x73} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x74} ** 32));
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
     remote_builder.ip = .{ 127, 0, 0, 2 };
@@ -2215,7 +2215,7 @@ test "event payload allocation failure preserves Actor state and counts one drop
     try std.testing.expect(added);
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
-    const remote_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
     try std.testing.expect(actor.peers.findEnr(&remote_id) != null);
     try std.testing.expect(outbox.pop() == null);
 }
@@ -2224,10 +2224,10 @@ test "response payload allocation failure still completes and releases permit" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x60} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x63} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 23 }, .port = 9023 } },
@@ -2269,10 +2269,10 @@ test "full event outbox preserves completion and queued drain with one owned dro
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x64} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x65} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 25 }, .port = 9025 } },
@@ -2316,14 +2316,14 @@ test "full event outbox preserves lookup finalization with one owned drop" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x68} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x69} ** 32));
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
     remote_builder.ip = .{ 127, 0, 0, 29 };
     remote_builder.udp = 9029;
     const remote_enr = try remote_builder.encode();
     defer alloc.free(remote_enr);
-    const remote_id = (try enr.decode(remote_enr)).nodeId().?;
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
@@ -2353,7 +2353,7 @@ test "full event outbox preserves matching health completion with one drop" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x6a} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x6b} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
@@ -2361,7 +2361,7 @@ test "full event outbox preserves matching health completion with one drop" {
     remote_builder.udp = 9031;
     const remote_enr = try remote_builder.encode();
     defer alloc.free(remote_enr);
-    const remote_id = (try enr.decode(remote_enr)).nodeId().?;
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 31 }, .port = 9031 } },
@@ -2403,7 +2403,7 @@ test "LocalRecord replacement is atomic across allocator failure" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x75} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip = .{ 127, 0, 0, 1 };
     local_builder.udp = 9000;
@@ -2460,10 +2460,10 @@ test "lookup finish allocation failure still removes and detaches lookup" {
     const alloc = failing.allocator();
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x76} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 34 }, .port = 9034 } },
@@ -2505,10 +2505,10 @@ test "detached late multipart NODES still learns emits and releases final permit
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x6e} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x6f} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 32 }, .port = 9032 } },
@@ -2519,7 +2519,7 @@ test "detached late multipart NODES still learns emits and releases final permit
     discovered_builder.udp = 9033;
     const discovered_enr = try discovered_builder.encode();
     defer alloc.free(discovered_enr);
-    const discovered_id = (try enr.decode(discovered_enr)).nodeId().?;
+    const discovered_id = (try (try enr.decode(discovered_enr)).nodeId()).?;
     const distance: u16 = if (@import("kbucket.zig").logDistance(&discovered_id, &remote_id)) |value| @as(u16, value) + 1 else 0;
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
@@ -2575,10 +2575,10 @@ test "Actor RPC NODES allocation failures preserve first and final ownership tra
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x82} ** 32));
-    const local_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x83} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const endpoint = types.Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 35 }, .port = 9035 } },
@@ -2589,14 +2589,14 @@ test "Actor RPC NODES allocation failures preserve first and final ownership tra
     builder_a.udp = 9036;
     const raw_a = try builder_a.encode();
     defer alloc.free(raw_a);
-    const id_a = (try enr.decode(raw_a)).nodeId().?;
+    const id_a = (try (try enr.decode(raw_a)).nodeId()).?;
     const discovered_key_b = try secp.keyPairFromSecret(&([_]u8{0x85} ** 32));
     var builder_b = enr.Builder.init(alloc, discovered_key_b, 1);
     builder_b.ip = .{ 127, 0, 0, 37 };
     builder_b.udp = 9037;
     const raw_b = try builder_b.encode();
     defer alloc.free(raw_b);
-    const id_b = (try enr.decode(raw_b)).nodeId().?;
+    const id_b = (try (try enr.decode(raw_b)).nodeId()).?;
     const distance_a: u16 = if (@import("kbucket.zig").logDistance(&id_a, &remote_id)) |value| @as(u16, value) + 1 else 0;
     const distance_b: u16 = if (@import("kbucket.zig").logDistance(&id_b, &remote_id)) |value| @as(u16, value) + 1 else 0;
     const cfg = config.Config{
@@ -2668,7 +2668,7 @@ test "Actor RPC NODES allocation failures preserve first and final ownership tra
 
 fn actorInitializationLifecycle(alloc: std.mem.Allocator) !void {
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x77} ** 32));
-    const node_id = enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
@@ -2691,10 +2691,10 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an existing source IP ba
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x91} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 21 }, .port = 9221 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 22 }, .port = 9222 } };
     const limits = config.Limits{
@@ -2769,10 +2769,10 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x78} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const address_a = @import("types.zig").Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9201 } };
     const address_b = @import("types.zig").Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9202 } };
     const limits = config.Limits{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 4 };
@@ -2848,14 +2848,14 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     builder_c.udp = 9203;
     const enr_c = try builder_c.encode();
     defer alloc.free(enr_c);
-    const id_c = (try enr.decode(enr_c)).nodeId().?;
+    const id_c = (try (try enr.decode(enr_c)).nodeId()).?;
     const key_d = try secp.keyPairFromSecret(&([_]u8{0x7b} ** 32));
     var builder_d = enr.Builder.init(alloc, key_d, 1);
     builder_d.ip = .{ 127, 0, 0, 4 };
     builder_d.udp = 9204;
     const enr_d = try builder_d.encode();
     defer alloc.free(enr_d);
-    const id_d = (try enr.decode(enr_d)).nodeId().?;
+    const id_d = (try (try enr.decode(enr_d)).nodeId()).?;
     try std.testing.expect(actor_b.learnDiscovered(enr_c, now_ns) != null);
     try std.testing.expect(actor_b.addEnr(&outbox_b, enr_d, now_ns));
     var added_event = outbox_b.pop() orelse return error.MissingEnrAdded;
@@ -2890,10 +2890,10 @@ test "strict handshake rejects untrusted contact without endpoint proof" {
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x7c} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x7d} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9301 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9302 } };
     const limits = config.Limits{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 };
@@ -2964,10 +2964,10 @@ fn mismatchedSignedEnrHandshake(allow_unverified: ?bool) !struct { session_insta
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x86} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x87} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const observed_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9386 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9387 } };
     var advertised = enr.Builder.init(alloc, key_a, 1);
@@ -3031,10 +3031,10 @@ fn contactHandshakeAccepted(allow_unverified: bool, runtime_contact_trusted: boo
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x7e} ** 32));
     const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
     const key_b = try secp.keyPairFromSecret(&([_]u8{0x7f} ** 32));
     const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
     const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9311 } };
     const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9312 } };
     const limits = config.Limits{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 };

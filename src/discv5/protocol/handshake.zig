@@ -89,7 +89,8 @@ pub fn buildAuthdata(
 pub fn pubkeyFromEnr(enr_bytes: []const u8, src_id: NodeId) Error![eph_key_size]u8 {
     const parsed = enr_mod.decode(enr_bytes) catch return Error.InvalidEnr;
     const pk = parsed.pubkey orelse return Error.EnrMissingPubkey;
-    if (!std.mem.eql(u8, &enr_mod.nodeIdFromCompressedPubkey(&pk), &src_id))
+    const node_id = enr_mod.nodeIdFromCompressedPubkey(&pk) catch return Error.InvalidEnr;
+    if (!std.mem.eql(u8, &node_id, &src_id))
         return Error.EnrNodeIdMismatch;
     return pk;
 }
@@ -98,7 +99,7 @@ pub fn pubkeyFromEnr(enr_bytes: []const u8, src_id: NodeId) Error![eph_key_size]
 /// unless `allow_unverified` is set. Identity is always verified.
 pub fn verifyEnrEndpoint(enr_bytes: []const u8, src_id: NodeId, observed: Address, allow_unverified: bool) Error!void {
     const parsed = enr_mod.decode(enr_bytes) catch return Error.InvalidEnr;
-    const node_id = parsed.nodeId() orelse return Error.EnrMissingPubkey;
+    const node_id = (parsed.nodeId() catch return Error.InvalidEnr) orelse return Error.EnrMissingPubkey;
     if (!std.mem.eql(u8, &node_id, &src_id)) return Error.EnrNodeIdMismatch;
     if (!endpointMatches(&parsed, observed) and !allow_unverified)
         return Error.EnrEndpointMismatch;
