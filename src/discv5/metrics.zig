@@ -54,11 +54,11 @@ pub const ProtocolMetrics = struct {
     rcvd_message_count: [message_type_count]u64 = [_]u64{0} ** message_type_count,
 
     pub fn incSent(self: *ProtocolMetrics, message_type: MessageType) void {
-        self.sent_message_count[message_type.index()] += 1;
+        self.sent_message_count[message_type.index()] +|= 1;
     }
 
     pub fn incReceived(self: *ProtocolMetrics, message_type: MessageType) void {
-        self.rcvd_message_count[message_type.index()] += 1;
+        self.rcvd_message_count[message_type.index()] +|= 1;
     }
 };
 
@@ -75,6 +75,12 @@ pub const MetricsSnapshot = struct {
     rate_limit_hit_ip: u64 = 0,
     /// TS: discv5_rate_limit_hit_total
     rate_limit_hit_total: u64 = 0,
+    /// Encoded datagrams observed before pre-decrypt admission.
+    received_packet_count: u64 = 0,
+    /// Encoded datagrams rejected by pre-decrypt admission.
+    filtered_packet_count: u64 = 0,
+    /// Admitted datagrams processed by the Actor.
+    processed_packet_count: u64 = 0,
     /// TS: discv5_sent_message_count{type}
     sent_message_count: [message_type_count]u64 = [_]u64{0} ** message_type_count,
     /// TS: discv5_rcvd_message_count{type}

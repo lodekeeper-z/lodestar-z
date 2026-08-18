@@ -83,56 +83,51 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     const pubkey = discv5.secp256k1.compressedPubkey(&key_pair);
     const local_node_id = discv5.enr.nodeIdFromCompressedPubkey(&pubkey);
 
-    const service_config = discv5.service.Config{
+    const runtime_config = discv5.Config{
         .bind_addresses = .{
             .ip4 = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
         },
-        .protocol_config = .{
-            .local_key_pair = key_pair,
-            .local_node_id = local_node_id,
-            .request_timeout_ms = 2_000,
-            .request_retries = 1,
-        },
+        .local_key_pair = key_pair,
+        .local_node_id = local_node_id,
+        .request_timeout_ms = 2_000,
+        .request_retries = 1,
         .lookup_num_results = options.max_results,
         .lookup_timeout_ms = options.timeout_ms,
-        .receive_timeout_ms = 5,
     };
-    const runtime_options = discv5.RuntimeService.Options{
-        .command_queue_capacity = 1024,
-        .event_queue_capacity = 1024,
+    const runtime_options = discv5.Options{
         .maintenance_interval_ms = 100,
     };
 
-    var runtime_service = try discv5.RuntimeService.initWithOptions(io, alloc, service_config, runtime_options);
+    const discovery_runtime = try discv5.Runtime.init(io, alloc, runtime_config, runtime_options);
     var runtime_group: std.Io.Group = .init;
-    runtime_group.concurrent(io, runRuntimeService, .{ &runtime_service, runtime_options }) catch |err| {
-        runtime_service.deinit();
+    runtime_group.concurrent(io, runRuntime, .{discovery_runtime}) catch |err| {
+        discovery_runtime.deinit();
         return err;
     };
     defer {
-        runtime_service.stop();
+        discovery_runtime.stop();
         runtime_group.await(io) catch {};
-        runtime_service.deinit();
+        discovery_runtime.deinit();
     }
 
-    try waitForRuntime(&runtime_service);
-    try setLocalEnr(alloc, &runtime_service, key_pair);
+    try waitForRuntime(discovery_runtime);
+    try setLocalEnr(alloc, discovery_runtime, key_pair);
 
     var added_bootnodes: usize = 0;
     if (options.use_default_bootnodes) {
         for (default_bootnodes) |bootnode| {
-            if (try addBootnode(alloc, &runtime_service, bootnode)) added_bootnodes += 1;
+            if (try addBootnode(alloc, discovery_runtime, bootnode)) added_bootnodes += 1;
         }
     }
     for (options.extra_bootnodes.items) |bootnode| {
-        if (try addBootnode(alloc, &runtime_service, bootnode)) added_bootnodes += 1;
+        if (try addBootnode(alloc, discovery_runtime, bootnode)) added_bootnodes += 1;
     }
     if (added_bootnodes == 0) return error.NoBootnodes;
 
-    const lookup_id = try runtime_service.startLookup(&target);
+    const lookup_id = try discovery_runtime.startLookup(target);
     try stdout.print("discv5 discovery lookup {d}\n", .{lookup_id});
     try stdout.print("bound: ", .{});
-    if (runtime_service.boundAddress(.ip4)) |addr| {
+    if (discovery_runtime.boundAddress(.ip4)) |addr| {
         try addr.format(stdout);
     } else {
         try stdout.print("<none>", .{});
@@ -150,9 +145,10 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     var lookup_timed_out = false;
 
     while (!finished) {
-        const event_value = runtime_service.nextEvent() catch |err| switch (err) {
+        const event_value = discovery_runtime.nextEvent() catch |err| switch (err) {
             error.Closed => break,
             error.Canceled => return err,
+            else => return err,
         };
         var event = event_value;
         defer event.deinit(alloc);
@@ -172,7 +168,7 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
             .lookup_finished => |lookup_finished| {
                 if (lookup_finished.lookup_id != lookup_id) continue;
                 lookup_timed_out = lookup_finished.timed_out;
-                for (lookup_finished.enrs) |raw_enr| {
+                for (lookup_finished.enrs.items) |raw_enr| {
                     if (found >= options.max_results) break;
                     if (try printFoundEnr(alloc, stdout, &seen, raw_enr)) found += 1;
                 }
@@ -191,31 +187,31 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     });
 }
 
-fn runRuntimeService(runtime_service: *discv5.RuntimeService, options: discv5.RuntimeService.Options) void {
-    runtime_service.run(options) catch |err| std.debug.print("runtime service stopped with {}\n", .{err});
+fn runRuntime(runtime: *discv5.Runtime) void {
+    runtime.run() catch |err| std.debug.print("discv5 runtime stopped with {}\n", .{err});
 }
 
-fn waitForRuntime(runtime_service: *const discv5.RuntimeService) !void {
-    while (!runtime_service.isRunning()) {
-        if (runtime_service.isClosed()) return error.ServiceStopped;
+fn waitForRuntime(runtime: *const discv5.Runtime) !void {
+    while (!runtime.isRunning()) {
+        if (runtime.isClosed()) return error.RuntimeStopped;
         try std.Thread.yield();
     }
 }
 
 fn setLocalEnr(
     alloc: Allocator,
-    runtime_service: *discv5.RuntimeService,
+    runtime: *discv5.Runtime,
     key_pair: discv5.secp256k1.KeyPair,
 ) !void {
     var builder = discv5.enr.Builder.init(alloc, key_pair, 1);
-    if (runtime_service.boundAddress(.ip4)) |addr| {
+    if (runtime.boundAddress(.ip4)) |addr| {
         builder.udp = addr.getPort();
     }
 
     const local_enr = try builder.encode();
     defer alloc.free(local_enr);
 
-    try runtime_service.setLocalEnr(local_enr);
+    try runtime.setLocalEnr(local_enr);
 }
 
 fn parseOptions(alloc: Allocator, args_value: std.process.Args) !?Options {
@@ -238,7 +234,7 @@ fn parseOptions(alloc: Allocator, args_value: std.process.Args) !?Options {
         } else if (std.mem.eql(u8, arg, "--max-results")) {
             const value = args.next() orelse return error.MissingMaxResults;
             options.max_results = try parsePositiveInt(usize, value);
-            if (options.max_results > discv5.service.MAX_LOOKUP_RESULTS) return error.TooManyResults;
+            if (options.max_results > discv5.MAX_LOOKUP_RESULTS) return error.TooManyResults;
         } else if (std.mem.eql(u8, arg, "--target")) {
             const value = args.next() orelse return error.MissingTarget;
             options.target = try parseNodeId(value);
@@ -273,14 +269,14 @@ fn parseNodeId(text: []const u8) !NodeId {
     return node_id;
 }
 
-fn addBootnode(alloc: Allocator, runtime_service: *discv5.RuntimeService, bootnode: []const u8) !bool {
+fn addBootnode(alloc: Allocator, runtime: *discv5.Runtime, bootnode: []const u8) !bool {
     const raw = discv5.enr.decodeText(alloc, bootnode) catch |err| {
         std.debug.print("skipping invalid bootnode: {}\n", .{err});
         return false;
     };
     defer alloc.free(raw);
 
-    if (!try runtime_service.addEnr(raw)) {
+    if (!try runtime.addEnr(raw)) {
         std.debug.print("skipping unusable bootnode ENR\n", .{});
         return false;
     }

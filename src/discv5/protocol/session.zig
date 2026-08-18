@@ -177,15 +177,37 @@ test "discv5 key derivation test vector" {
     try std.testing.expectEqualSlices(u8, &expected_recipient, &keys.recipient_key);
 }
 
-test "discv5 id-nonce signing verifies generated signature" {
+test "discv5 id-nonce signature matches the authoritative ChainSafe vector" {
     const hex = @import("hex");
-    const static_key_pair = secp.KeyPair.generate(std.Options.debug_io);
+    const secret_key = hex.hexToBytesComptime(32, "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736");
+    const static_key_pair = try secp.keyPairFromSecret(&secret_key);
     const static_pubkey = secp.compressedPubkey(&static_key_pair);
     const challenge_data = hex.hexToBytesComptime(63, "000000000000000000000000000000006469736376350001010102030405060708090a0b0c00180102030405060708090a0b0c0d0e0f100000000000000000");
-    const eph_key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const eph_pubkey = secp.compressedPubkey(&eph_key_pair);
-    const node_id_b = [_]u8{0xbb} ** 32;
+    const eph_pubkey = hex.hexToBytesComptime(33, "039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231");
+    const node_id_b = hex.hexToBytesComptime(32, "bbbb9d047f0488c0b5a93c1c3f2d8bafc7c8ff337024a55434a0d0555de64db9");
+    const expected = hex.hexToBytesComptime(64, "94852a1e2318c4e5e9d422c98eaf19d1d90d876b29cd06ca7cb7546d0fff7b484fe86c09a064fe72bdbef73ba8e9c34df0cd2b53e9d65528c2c7f336d5dfc6e6");
 
     const sig = try signIdNonce(&static_key_pair, &challenge_data, &eph_pubkey, &node_id_b);
+    try std.testing.expectEqualSlices(u8, &expected, &sig);
+    try verifyIdSignature(&sig, &static_pubkey, &challenge_data, &eph_pubkey, &node_id_b);
+}
+
+test "discv5 id-nonce signing normalizes a naturally high-S RFC6979 result" {
+    const hex = @import("hex");
+    const secret_key = hex.hexToBytesComptime(32, "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736");
+    const static_key_pair = try secp.keyPairFromSecret(&secret_key);
+    const static_pubkey = secp.compressedPubkey(&static_key_pair);
+    const challenge_data = hex.hexToBytesComptime(63, "000000000000000000000000000000006469736376350001010102030405060708090a0b0c00180102030405060708090a0b0c0d0e0f100000000000000000");
+    const eph_pubkey = hex.hexToBytesComptime(33, "039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231");
+    var node_id_b = [_]u8{0xbb} ** 32;
+    node_id_b[31] = 1;
+    // RFC6979 produces high S=f3fd...7286 before canonicalization for
+    // this tuple. Noble's default verifier requires the n-S form below.
+    const expected_low = hex.hexToBytesComptime(64, "2b59c4862f47364c90ada5c7e55341c26f5c93cc6c99a36cc62ba4a92e2f1f4f0c02f77e405fa082aeee361f75d458e0c5857f8cd34e89a6184fef88e155cebb");
+    const half_order = hex.hexToBytesComptime(32, "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0");
+
+    const sig = try signIdNonce(&static_key_pair, &challenge_data, &eph_pubkey, &node_id_b);
+    try std.testing.expectEqualSlices(u8, &expected_low, &sig);
+    try std.testing.expect(std.mem.order(u8, sig[32..], &half_order) != .gt);
     try verifyIdSignature(&sig, &static_pubkey, &challenge_data, &eph_pubkey, &node_id_b);
 }

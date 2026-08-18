@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 
 const lru = @import("lru.zig");
 const Address = std.Io.net.IpAddress;
+pub const MAX_SOURCE_STATE: usize = 4_096;
 
 pub const RateLimiterQuota = struct {
     /// How often `max_tokens` fully replenish, in milliseconds.
@@ -34,7 +35,11 @@ pub const IpKey = struct {
     bytes: [16]u8,
 
     pub fn fromAddress(addr: Address) IpKey {
-        return switch (addr) {
+        const normalized = switch (addr) {
+            .ip4 => addr,
+            .ip6 => |ip6| Address.fromIp6(ip6),
+        };
+        return switch (normalized) {
             .ip4 => |ip4| blk: {
                 var bytes = [_]u8{0} ** 16;
                 @memcpy(bytes[0..4], &ip4.bytes);
@@ -99,10 +104,11 @@ pub const RateLimiter = struct {
     global: RateLimiterGcra(u8),
     by_ip: RateLimiterGcra(IpKey),
     banned_ips: lru.LruCache(IpKey, u8),
-    expected_responses_by_ip: std.AutoHashMap(IpKey, u32),
     stats: Stats = .{},
 
     pub fn init(allocator: Allocator, config: Config) !RateLimiter {
+        if (config.by_ip_state_capacity == 0 or config.by_ip_state_capacity > MAX_SOURCE_STATE or
+            config.banned_ip_capacity == 0 or config.banned_ip_capacity > MAX_SOURCE_STATE) return error.InvalidRateLimiterCapacity;
         var global = try RateLimiterGcra(u8).fromQuota(allocator, config.global_quota, 1);
         errdefer global.deinit();
 
@@ -117,7 +123,6 @@ pub const RateLimiter = struct {
             .global = global,
             .by_ip = by_ip,
             .banned_ips = banned_ips,
-            .expected_responses_by_ip = std.AutoHashMap(IpKey, u32).init(allocator),
         };
     }
 
@@ -125,54 +130,29 @@ pub const RateLimiter = struct {
         self.global.deinit();
         self.by_ip.deinit();
         self.banned_ips.deinit(self.allocator);
-        self.expected_responses_by_ip.deinit();
     }
 
     pub fn allowEncodedPacket(self: *RateLimiter, addr: Address, now_ms: u64) bool {
         const ip = IpKey.fromAddress(addr);
         const now_ns = timestampMsToNs(now_ms);
-        // Correlated responses must remain admissible even if unauthenticated
-        // spoofed traffic has exhausted or temporarily banned the peer's IP.
-        if (self.expectsResponseFromIP(ip)) return true;
         if (self.banned_ips.get(ip, now_ns) != null) return false;
 
         if (!self.by_ip.allows(ip, 1, now_ms)) {
-            self.stats.rate_limit_hit_ip_total += 1;
+            self.stats.rate_limit_hit_ip_total +|= 1;
             self.banned_ips.put(ip, 1, banned_ip_duration_ms, now_ns);
             return false;
         }
 
         if (!self.global.allows(0, 1, now_ms)) {
-            self.stats.rate_limit_hit_total += 1;
+            self.stats.rate_limit_hit_total +|= 1;
             return false;
         }
 
         return true;
     }
 
-    pub fn addExpectedResponse(self: *RateLimiter, addr: Address) !void {
-        const ip = IpKey.fromAddress(addr);
-        const entry = try self.expected_responses_by_ip.getOrPut(ip);
-        if (!entry.found_existing) entry.value_ptr.* = 0;
-        entry.value_ptr.* += 1;
-    }
-
-    pub fn removeExpectedResponse(self: *RateLimiter, addr: Address) void {
-        const ip = IpKey.fromAddress(addr);
-        const current = self.expected_responses_by_ip.getPtr(ip) orelse return;
-        if (current.* > 1) {
-            current.* -= 1;
-        } else {
-            _ = self.expected_responses_by_ip.remove(ip);
-        }
-    }
-
     pub fn statsSnapshot(self: *const RateLimiter) Stats {
         return self.stats;
-    }
-
-    fn expectsResponseFromIP(self: *const RateLimiter, ip: IpKey) bool {
-        return self.expected_responses_by_ip.contains(ip);
     }
 };
 
@@ -205,9 +185,6 @@ test "rate limiter bans IP on per-IP quota hit" {
     const addr = Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 9000 } };
     try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
     try std.testing.expect(!limiter.allowEncodedPacket(addr, 0));
-    limiter.addExpectedResponse(addr) catch unreachable;
-    try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
-    limiter.removeExpectedResponse(addr);
     try std.testing.expect(!limiter.allowEncodedPacket(addr, banned_ip_duration_ms - 1));
     try std.testing.expect(limiter.allowEncodedPacket(addr, banned_ip_duration_ms));
 
@@ -215,19 +192,13 @@ test "rate limiter bans IP on per-IP quota hit" {
     try std.testing.expectEqual(@as(u64, 1), stats.rate_limit_hit_ip_total);
 }
 
-test "rate limiter expected response bypasses quotas" {
-    var limiter = try RateLimiter.init(std.testing.allocator, .{
-        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
-        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
-    });
-    defer limiter.deinit();
-
-    const addr = Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 9000 } };
-    try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
-    limiter.addExpectedResponse(addr) catch unreachable;
-    try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
-    limiter.removeExpectedResponse(addr);
-    try std.testing.expect(!limiter.allowEncodedPacket(addr, 0));
+test "IPv4-mapped IPv6 shares one normalized source-IP key" {
+    const v4 = Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 44 }, .port = 9_000 } };
+    const mapped = Address{ .ip6 = .{
+        .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 44 },
+        .port = 9_001,
+    } };
+    try std.testing.expectEqual(IpKey.fromAddress(v4), IpKey.fromAddress(mapped));
 }
 
 test "rate limiter bounds source IP state" {

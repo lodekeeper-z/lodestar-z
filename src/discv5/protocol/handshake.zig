@@ -95,23 +95,19 @@ pub fn pubkeyFromEnr(enr_bytes: []const u8, src_id: NodeId) Error![eph_key_size]
 }
 
 /// Decode `enr_bytes` and confirm its advertised endpoint matches `observed`,
-/// unless `allow_unverified` is set (an ENR with no endpoint always passes).
+/// unless `allow_unverified` is set. Identity is always verified.
 pub fn verifyEnrEndpoint(enr_bytes: []const u8, src_id: NodeId, observed: Address, allow_unverified: bool) Error!void {
     const parsed = enr_mod.decode(enr_bytes) catch return Error.InvalidEnr;
-    if (!endpointMatches(&parsed, &src_id, observed) and !allow_unverified)
+    const node_id = parsed.nodeId() orelse return Error.EnrMissingPubkey;
+    if (!std.mem.eql(u8, &node_id, &src_id)) return Error.EnrNodeIdMismatch;
+    if (!endpointMatches(&parsed, observed) and !allow_unverified)
         return Error.EnrEndpointMismatch;
 }
 
-/// True when `parsed`'s node-id equals `expected_node_id` and either it
-/// advertises no endpoint or an advertised endpoint matches `observed_addr`.
-fn endpointMatches(parsed: *const enr_mod.Enr, expected_node_id: *const NodeId, observed_addr: Address) bool {
-    const node_id = parsed.nodeId() orelse return false;
-    if (!std.mem.eql(u8, &node_id, expected_node_id)) return false;
-
-    var has_endpoint = false;
+/// True when an advertised endpoint matches `observed_addr`.
+fn endpointMatches(parsed: *const enr_mod.Enr, observed_addr: Address) bool {
     if (parsed.ip) |ip| {
         if (parsed.udp) |port| {
-            has_endpoint = true;
             switch (observed_addr) {
                 .ip4 => |ip4| {
                     if (std.mem.eql(u8, &ip, &ip4.bytes) and port == ip4.port) return true;
@@ -122,7 +118,6 @@ fn endpointMatches(parsed: *const enr_mod.Enr, expected_node_id: *const NodeId, 
     }
     if (parsed.ip6) |ip6| {
         if (parsed.udp6) |port| {
-            has_endpoint = true;
             switch (observed_addr) {
                 .ip4 => {},
                 .ip6 => |addr_ip6| {
@@ -132,7 +127,7 @@ fn endpointMatches(parsed: *const enr_mod.Enr, expected_node_id: *const NodeId, 
         }
     }
 
-    return !has_endpoint;
+    return false;
 }
 
 test "parseAuthdata round-trips a built authdata header" {

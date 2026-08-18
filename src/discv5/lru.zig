@@ -17,6 +17,11 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
 
         const Self = @This();
 
+        pub const Entry = struct {
+            key: K,
+            value: V,
+        };
+
         const Node = struct {
             key: K,
             value: V,
@@ -71,17 +76,42 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             return self.nodes[index].value;
         }
 
+        /// Read a live value without changing recency or removing expired state.
+        pub fn peek(self: *const Self, key: K, now_ns: i64) ?V {
+            const index = self.map.get(key) orelse return null;
+            if (self.isExpired(index, now_ns)) return null;
+            return self.nodes[index].value;
+        }
+
+        pub fn peekPtr(self: *const Self, key: K, now_ns: i64) ?*const V {
+            const index = self.map.get(key) orelse return null;
+            if (self.isExpired(index, now_ns)) return null;
+            return &self.nodes[index].value;
+        }
+
         pub fn put(self: *Self, key: K, value: V, ttl_ms: u64, now_ns: i64) void {
+            _ = self.putMove(key, value, ttl_ms, now_ns);
+        }
+
+        /// Moves `value` into the cache and returns ownership of a replaced or
+        /// evicted entry. Callers storing owned resources must use this API.
+        pub fn putMove(self: *Self, key: K, value: V, ttl_ms: u64, now_ns: i64) ?Entry {
             if (self.map.get(key)) |index| {
                 const node = &self.nodes[index];
+                const removed = Entry{ .key = node.key, .value = node.value };
                 node.key = key;
                 node.value = value;
                 node.expires_at_ns = expiresAt(now_ns, ttl_ms);
                 self.moveToFront(index);
-                return;
+                return removed;
             }
 
-            const index = self.free_head orelse self.evictTailForReuse();
+            var removed: ?Entry = null;
+            const index = self.free_head orelse blk: {
+                const evicted_index = self.evictTailForReuse();
+                removed = .{ .key = self.nodes[evicted_index].key, .value = self.nodes[evicted_index].value };
+                break :blk evicted_index;
+            };
             self.free_head = self.nodes[index].free_next;
             self.nodes[index] = .{
                 .key = key,
@@ -91,14 +121,39 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             self.linkFront(index);
             self.map.putAssumeCapacityNoClobber(key, index);
             self.len += 1;
+            return removed;
         }
 
         pub fn remove(self: *Self, key: K) bool {
-            const removed = self.map.fetchRemove(key) orelse return false;
+            return self.takeMove(key) != null;
+        }
+
+        pub fn takeMove(self: *Self, key: K) ?V {
+            const removed = self.map.fetchRemove(key) orelse return null;
+            const value = self.nodes[removed.value].value;
             self.unlink(removed.value);
             self.releaseNode(removed.value);
             self.len -= 1;
-            return true;
+            return value;
+        }
+
+        pub fn takeExpiredMove(self: *Self, key: K, now_ns: i64) ?V {
+            const index = self.map.get(key) orelse return null;
+            if (!self.isExpired(index, now_ns)) return null;
+            return self.takeMove(key).?;
+        }
+
+        pub fn popLruMove(self: *Self) ?Entry {
+            const index = self.tail orelse return null;
+            const entry = Entry{ .key = self.nodes[index].key, .value = self.nodes[index].value };
+            self.removeIndex(index);
+            return entry;
+        }
+
+        pub fn popExpiredLruMove(self: *Self, now_ns: i64) ?Entry {
+            const index = self.tail orelse return null;
+            if (!self.isExpired(index, now_ns)) return null;
+            return self.popLruMove();
         }
 
         pub fn pruneExpired(self: *Self, now_ns: i64) void {

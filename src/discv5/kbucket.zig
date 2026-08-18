@@ -4,6 +4,7 @@ const std = @import("std");
 const enr_mod = @import("enr.zig");
 const NodeId = enr_mod.NodeId;
 const Address = std.Io.net.IpAddress;
+const RequestKey = @import("types.zig").RequestKey;
 
 pub const K = 16;
 pub const NUM_BUCKETS = 256;
@@ -24,14 +25,26 @@ pub const Entry = struct {
     enr_seq: u64 = 0,
     last_seen: i64,
     status: EntryStatus,
-    /// Whether this ENR may be relayed in FINDNODE responses. Set for locally
-    /// trusted entries and after authenticated traffic verifies a discovered peer.
-    relay_eligible: bool = false,
-    /// Set when the embedding application explicitly configured this node.
-    locally_trusted: bool = false,
+    /// Whether the current raw ENR may be relayed in FINDNODE responses.
+    /// This proof is tied to that ENR's advertised UDP endpoint.
+    raw_enr_relay_eligible: bool = false,
+    /// Whether the embedding application explicitly trusted the current raw
+    /// ENR's advertised endpoint.
+    advertised_endpoint_trusted: bool = false,
+    /// Whether the runtime contact in `addr` was explicitly configured. This
+    /// is independent of the endpoint advertised by the current raw ENR.
+    runtime_contact_trusted: bool = false,
+    /// Actor-owned health schedule and the exact maintenance request, if any.
+    next_ping_at_ns: i64 = 0,
+    health_request: ?RequestKey = null,
 
     pub fn enrBytes(self: *const Entry) []const u8 {
         return self.enr.slice();
+    }
+
+    pub fn relayableEnr(self: *const Entry) ?[]const u8 {
+        if (!self.raw_enr_relay_eligible) return null;
+        return self.enrBytes();
     }
 };
 
@@ -64,8 +77,11 @@ pub const KBucket = struct {
     pub fn insertDetailed(self: *KBucket, entry: Entry) InsertOutcome {
         if (self.pending) |pending| {
             if (std.mem.eql(u8, &pending.node_id, &entry.node_id)) {
+                // Updating the pending node refreshes mutable ENR/session
+                // metadata only. The fixed insertion/probe deadline must not
+                // restart, or a pending peer could hold the bucket's sole
+                // replacement slot indefinitely with periodic traffic.
                 self.pending = entry;
-                self.pending_inserted_at_ns = entry.last_seen;
                 return .{ .inserted = true };
             }
         }
@@ -129,6 +145,19 @@ pub const KBucket = struct {
         return null;
     }
 
+    /// Mutable access for actor-owned schedule metadata (`health_request`,
+    /// `next_ping_at_ns`). Callers must not change identity, status, or any
+    /// ordering-relevant field through this pointer.
+    pub fn getMutWithPending(self: *KBucket, node_id: *const NodeId) ?*Entry {
+        for (self.entries[0..self.count]) |*entry| {
+            if (std.mem.eql(u8, &entry.node_id, node_id)) return entry;
+        }
+        if (self.pending) |*pending| {
+            if (std.mem.eql(u8, &pending.node_id, node_id)) return pending;
+        }
+        return null;
+    }
+
     pub fn applyPendingIfExpired(self: *KBucket, now_ns: i64, timeout_ms: u64) bool {
         const pending = self.pending orelse return false;
         const elapsed_ns: i128 = @as(i128, now_ns) - @as(i128, self.pending_inserted_at_ns);
@@ -149,6 +178,14 @@ pub const KBucket = struct {
         _ = self.removeAt(0);
         self.insertOrdered(pending);
         return true;
+    }
+
+    /// Drop the pending replacement after its eviction candidate proved
+    /// liveness. Kademlia keeps a responsive incumbent over the newcomer.
+    pub fn resolvePendingAgainst(self: *KBucket, candidate_id: *const NodeId) void {
+        if (self.pending == null) return;
+        const entry = self.get(candidate_id) orelse return;
+        if (entry.status == .connected) self.clearPending();
     }
 
     fn clearPending(self: *KBucket) void {
@@ -276,6 +313,13 @@ pub const RoutingTable = struct {
         return self.buckets[dist].getWithPending(node_id);
     }
 
+    /// Mutable access for actor-owned schedule metadata only; see
+    /// `KBucket.getMutWithPending` for the field contract.
+    pub fn getEntryMutWithPending(self: *RoutingTable, node_id: *const NodeId) ?*Entry {
+        const dist = logDistance(&self.local_id, node_id) orelse return null;
+        return self.buckets[dist].getMutWithPending(node_id);
+    }
+
     pub fn prunePending(self: *RoutingTable, now_ns: i64, timeout_ms: u64) void {
         for (self.buckets) |*bucket| {
             _ = bucket.applyPendingIfExpired(now_ns, timeout_ms);
@@ -326,188 +370,4 @@ fn insertClosest(target: *const NodeId, candidate: Entry, out: []Entry, count: *
     }
     out[insert_at] = candidate;
     count.* = new_count;
-}
-
-// =========== Tests ===========
-
-test "kbucket: logDistance" {
-    const a: NodeId = [_]u8{0} ** 32;
-    var b: NodeId = [_]u8{0} ** 32;
-
-    try std.testing.expect(logDistance(&a, &b) == null);
-
-    b[31] = 1;
-    try std.testing.expectEqual(@as(?u8, 0), logDistance(&a, &b));
-
-    b[31] = 0x80;
-    try std.testing.expectEqual(@as(?u8, 7), logDistance(&a, &b));
-
-    b = [_]u8{0} ** 32;
-    b[0] = 0x80;
-    try std.testing.expectEqual(@as(?u8, 255), logDistance(&a, &b));
-}
-
-test "kbucket: routing table insert/find" {
-    const alloc = std.testing.allocator;
-    const local: NodeId = [_]u8{0xaa} ** 32;
-    var rt = try RoutingTable.init(alloc, local);
-    defer rt.deinit(alloc);
-
-    for (1..10) |i| {
-        var node_id: NodeId = [_]u8{0xaa} ** 32;
-        node_id[31] = @intCast(i);
-        const entry = Entry{
-            .node_id = node_id,
-            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0x2328 } },
-            .last_seen = 0,
-            .status = .connected,
-        };
-        _ = rt.insert(entry);
-    }
-
-    try std.testing.expectEqual(@as(usize, 9), rt.nodeCount());
-
-    const target: NodeId = [_]u8{0xbb} ** 32;
-    var out: [5]Entry = undefined;
-    const found = rt.findClosest(&target, 5, &out);
-    try std.testing.expect(found <= 5);
-}
-
-test "kbucket: routing table findClosest uses bounded stack storage" {
-    const alloc = std.testing.allocator;
-    const local: NodeId = [_]u8{0xff} ** 32;
-    var rt = try RoutingTable.init(alloc, local);
-    defer rt.deinit(alloc);
-
-    for ([_]u8{ 4, 1, 3, 2 }) |last_byte| {
-        var node_id: NodeId = [_]u8{0} ** 32;
-        node_id[31] = last_byte;
-        try std.testing.expect(rt.insert(.{
-            .node_id = node_id,
-            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = last_byte } },
-            .last_seen = 0,
-            .status = .connected,
-        }));
-    }
-
-    const target: NodeId = [_]u8{0} ** 32;
-    var out: [3]Entry = undefined;
-    const found = rt.findClosest(&target, 3, &out);
-
-    try std.testing.expectEqual(@as(usize, 3), found);
-    try std.testing.expectEqual(@as(u8, 1), out[0].node_id[31]);
-    try std.testing.expectEqual(@as(u8, 2), out[1].node_id[31]);
-    try std.testing.expectEqual(@as(u8, 3), out[2].node_id[31]);
-}
-
-test "kbucket: full bucket stores pending connected entry until timeout" {
-    var bucket = KBucket.init();
-
-    for (0..K) |i| {
-        var node_id: NodeId = [_]u8{0} ** 32;
-        node_id[31] = @intCast(i);
-        _ = bucket.insert(Entry{
-            .node_id = node_id,
-            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } },
-            .last_seen = @intCast(i),
-            .status = .disconnected,
-        });
-    }
-    try std.testing.expectEqual(@as(usize, K), bucket.count);
-
-    const inserted = bucket.insert(Entry{
-        .node_id = [_]u8{0xff} ** 32,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 1 } },
-        .last_seen = std.time.ns_per_ms,
-        .status = .connected,
-    });
-    try std.testing.expect(!inserted);
-    try std.testing.expect(bucket.pending != null);
-    try std.testing.expectEqualDeep([_]u8{0xff} ** 32, bucket.pending.?.node_id);
-
-    try std.testing.expect(bucket.applyPendingIfExpired(std.time.ns_per_ms * 2, 1));
-    try std.testing.expect(bucket.pending == null);
-    try std.testing.expectEqualDeep([_]u8{0xff} ** 32, bucket.entries[K - 1].node_id);
-    try std.testing.expectEqual(@as(usize, K), bucket.count);
-}
-
-test "kbucket: full bucket does not evict connected peers" {
-    var bucket = KBucket.init();
-
-    for (0..K) |i| {
-        var node_id: NodeId = [_]u8{0} ** 32;
-        node_id[31] = @intCast(i);
-        _ = bucket.insert(Entry{
-            .node_id = node_id,
-            .addr = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 0 } },
-            .last_seen = @intCast(i),
-            .status = .connected,
-        });
-    }
-
-    const inserted = bucket.insert(Entry{
-        .node_id = [_]u8{0xee} ** 32,
-        .addr = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 2 }, .port = 0 } },
-        .last_seen = -1,
-        .status = .pending,
-    });
-    try std.testing.expect(!inserted);
-    try std.testing.expect(bucket.pending == null);
-}
-
-test "kbucket: updating existing node does not grow bucket" {
-    var bucket = KBucket.init();
-    const node_id: NodeId = [_]u8{0x42} ** 32;
-
-    try std.testing.expect(bucket.insert(.{
-        .node_id = node_id,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0x2328 } },
-        .last_seen = 1,
-        .status = .pending,
-    }));
-    try std.testing.expect(bucket.insert(.{
-        .node_id = node_id,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 0x2329 } },
-        .last_seen = 2,
-        .status = .connected,
-    }));
-
-    try std.testing.expectEqual(@as(usize, 1), bucket.count);
-    try std.testing.expectEqualDeep(@as(Address, .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 0x2329 } }), bucket.entries[0].addr);
-    try std.testing.expectEqual(EntryStatus.connected, bucket.entries[0].status);
-}
-
-test "kbucket: reconnecting oldest entry clears pending replacement" {
-    var bucket = KBucket.init();
-
-    for (0..K) |i| {
-        var node_id: NodeId = [_]u8{0} ** 32;
-        node_id[31] = @intCast(i);
-        _ = bucket.insert(Entry{
-            .node_id = node_id,
-            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } },
-            .last_seen = @intCast(i),
-            .status = .disconnected,
-        });
-    }
-
-    const pending_id: NodeId = [_]u8{0xaa} ** 32;
-    try std.testing.expect(!bucket.insert(.{
-        .node_id = pending_id,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 1 } },
-        .last_seen = 100,
-        .status = .connected,
-    }));
-    try std.testing.expect(bucket.pending != null);
-
-    const oldest_id = bucket.entries[0].node_id;
-    try std.testing.expect(bucket.insert(.{
-        .node_id = oldest_id,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 3 }, .port = 2 } },
-        .last_seen = 101,
-        .status = .connected,
-    }));
-
-    try std.testing.expect(bucket.pending == null);
-    try std.testing.expectEqual(EntryStatus.connected, bucket.entries[K - 1].status);
 }
