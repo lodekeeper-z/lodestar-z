@@ -15,6 +15,8 @@ const request_book = @import("state/request_book.zig");
 const session_book = @import("state/session_book.zig");
 const transport = @import("transport.zig");
 const types = @import("types.zig");
+const ActorHarness = @import("test_support/actor_harness.zig").ActorHarness;
+const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
 
 test "request completion has one canonical finish path" {
     try std.testing.expect(@hasDecl(completion, "finish"));
@@ -44,14 +46,9 @@ test "Actor isolates health identity and arms exact eviction probes" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 4 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.peers.learnEnr(remote_enr, 0) != null);
     _ = actor.peers.markResponsive(remote_id, address, 0, null);
 
@@ -59,21 +56,21 @@ test "Actor isolates health identity and arms exact eviction probes" {
     const unrelated = types.RequestKey.init(endpoint, try message.ReqId.fromSlice(&.{2}));
     const newer = types.RequestKey.init(endpoint, try message.ReqId.fromSlice(&.{3}));
     try std.testing.expect(actor.peers.armHealthRequest(health, .connected_only));
-    actor.onRequestCompletion(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, unrelated, .api, true, &.{});
-    try expectActorHealthRequest(&actor, remote_id, health);
-    actor.onRequestCompletion(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, health, .api, false, &.{});
-    try expectActorHealthRequest(&actor, remote_id, health);
-    actor.onRequestCompletion(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, health, .{ .maintenance = .enr_refresh }, false, &.{});
-    try expectActorHealthRequest(&actor, remote_id, health);
+    actor.onRequestCompletion(harness.env(), unrelated, .api, true, &.{});
+    try expectActorHealthRequest(actor, remote_id, health);
+    actor.onRequestCompletion(harness.env(), health, .api, false, &.{});
+    try expectActorHealthRequest(actor, remote_id, health);
+    actor.onRequestCompletion(harness.env(), health, .{ .maintenance = .enr_refresh }, false, &.{});
+    try expectActorHealthRequest(actor, remote_id, health);
 
     try std.testing.expect(!actor.peers.armHealthRequest(newer, .connected_only));
-    actor.onRequestCompletion(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, unrelated, .{ .maintenance = .health }, false, &.{});
-    try expectActorHealthRequest(&actor, remote_id, health);
-    actor.onRequestCompletion(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, health, .{ .maintenance = .health }, true, &.{});
+    actor.onRequestCompletion(harness.env(), unrelated, .{ .maintenance = .health }, false, &.{});
+    try expectActorHealthRequest(actor, remote_id, health);
+    actor.onRequestCompletion(harness.env(), health, .{ .maintenance = .health }, true, &.{});
     try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
 
     try std.testing.expect(actor.peers.armHealthRequest(newer, .connected_only));
-    actor.onRequestCompletion(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, newer, .{ .maintenance = .eviction }, false, &.{});
+    actor.onRequestCompletion(harness.env(), newer, .{ .maintenance = .eviction }, false, &.{});
     // Exact-candidate eviction timeout on a still-connected entry keeps the
     // incumbent (liveness proven by other authenticated traffic) and only
     // releases the probe reservation.
@@ -81,7 +78,7 @@ test "Actor isolates health identity and arms exact eviction probes" {
     try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
     _ = actor.peers.markResponsive(remote_id, address, 0, null);
     const candidate = actor.peers.routing.getEntry(&remote_id).?.*;
-    actor.probeEviction(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, candidate);
+    actor.probeEviction(harness.env(), candidate);
     const eviction_key = actor.peers.routing.getEntry(&remote_id).?.health_request orelse return error.MissingEvictionHealthRequest;
     try std.testing.expect(types.EndpointContext.eql(.{}, eviction_key.endpoint, endpoint));
     const request = actor.requests.get(eviction_key) orelse return error.MissingEvictionRequest;
@@ -109,14 +106,9 @@ test "stale eviction candidate fails reservation before any send or permit" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, address_b, null, outbound.nowNs(io)));
     const stale = @import("kbucket.zig").Entry{
         .node_id = remote_id,
@@ -126,16 +118,16 @@ test "stale eviction candidate fails reservation before any send or permit" {
         .status = .connected,
     };
 
-    actor.probeEviction(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, stale);
+    actor.probeEviction(harness.env(), stale);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 }
 
 const EvictionHarness = struct {
     ingress: admission.IngressAdmission,
     outbox: events.EventOutbox,
     actor: actor_mod.Actor,
-    recording: transport.RecordingSender,
+    recording: RecordingSender,
     candidate: @import("kbucket.zig").Entry,
     candidate_key: secp.KeyPair,
     candidate_id: types.NodeId,
@@ -215,7 +207,7 @@ const EvictionHarness = struct {
             .ingress = ingress,
             .outbox = outbox,
             .actor = actor,
-            .recording = transport.RecordingSender.init(alloc),
+            .recording = RecordingSender.init(alloc),
             .candidate = candidate,
             .candidate_key = candidate_key,
             .candidate_id = candidate_id,
@@ -404,30 +396,25 @@ test "health and eviction probes never queue behind endpoint establishment" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.peers.learnEnr(remote_enr, 0) != null);
     _ = actor.peers.markResponsive(remote_id, endpoint.addr, 0, null);
 
-    _ = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 1, .api);
-    try std.testing.expectError(error.EndpointBusy, actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 1, .{ .maintenance = .health }));
-    actor.probeEviction(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, actor.peers.routing.getEntry(&remote_id).?.*);
+    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    try std.testing.expectError(error.EndpointBusy, actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .{ .maintenance = .health }));
+    actor.probeEviction(harness.env(), actor.peers.routing.getEntry(&remote_id).?.*);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
-    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
 
     try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox });
+    actor.maintenance(harness.env());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expectEqual(@import("kbucket.zig").EntryStatus.connected, actor.peers.routing.getEntry(&remote_id).?.status);
 }
 
@@ -456,44 +443,39 @@ test "named cancellation conserves permits and queued FIFO across drain failure"
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
 
-    const first = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 1, .api);
-    const second = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 2, .api);
-    const third = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 3, .api);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    const first = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    const second = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 2, .api);
+    const third = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 3, .api);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 2), actor.requests.queuedCount());
 
-    try std.testing.expect(actor.cancelRequest(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, .init(endpoint, second)));
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expect(actor.cancelRequest(harness.env(), .init(endpoint, second)));
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
 
-    recording.fail_next = true;
-    try std.testing.expect(actor.cancelRequest(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, .init(endpoint, first)));
-    try std.testing.expect(!actor.cancelRequest(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, .init(endpoint, first)));
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    harness.recording.fail_next = true;
+    try std.testing.expect(actor.cancelRequest(harness.env(), .init(endpoint, first)));
+    try std.testing.expect(!actor.cancelRequest(harness.env(), .init(endpoint, first)));
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
 
     const stable = session_book.StableSession{
         .initiator_key = [_]u8{0x51} ** 16,
         .recipient_key = [_]u8{0x52} ** 16,
     };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    outbound.drainEndpoint(&actor, .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint);
+    outbound.drainEndpoint(actor, harness.env(), endpoint);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
-    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
-    try std.testing.expectEqualSlices(u8, third.slice(), (try decodeSentPing(&recording.datagrams.items[1].bytes, &remote_id, &stable.initiator_key)).req_id.slice());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expectEqualSlices(u8, third.slice(), (try decodeSentPing(&harness.recording.datagrams.items[1].bytes, &remote_id, &stable.initiator_key)).req_id.slice());
 }
 
 test "maintenance automatically redrains a queued lane after one transient send failure" {
@@ -522,29 +504,12 @@ test "maintenance automatically redrains a queued lane after one transient send 
             .command_capacity = 2,
         },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
 
-    const first = try actor.sendPing(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
-        endpoint,
-        &remote_pubkey,
-        0,
-        .api,
-    );
-    const second = try actor.sendPing(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
-        endpoint,
-        &remote_pubkey,
-        0,
-        .api,
-    );
+    const first = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    const second = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
 
@@ -553,21 +518,21 @@ test "maintenance automatically redrains a queued lane after one transient send 
         .recipient_key = [_]u8{0xc2} ** 16,
     };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    recording.fail_next = true;
+    harness.recording.fail_next = true;
     try std.testing.expect(actor.cancelRequest(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         .init(endpoint, first),
     ));
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 
-    actor.maintenance(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox });
+    actor.maintenance(harness.env());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
-    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
-    const retried = try decodeSentPing(&recording.datagrams.items[1].bytes, &remote_id, &stable.initiator_key);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    const retried = try decodeSentPing(&harness.recording.datagrams.items[1].bytes, &remote_id, &stable.initiator_key);
     try std.testing.expectEqualSlices(u8, second.slice(), retried.req_id.slice());
 }
 
@@ -608,31 +573,26 @@ test "AdmissionPermit survives retry and releases on final timeout" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 }, outbound.nowNs(io));
-    _ = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 0, .api);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(u64, 1), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
 
     try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox });
+    actor.maintenance(harness.env());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
-    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(u64, 2), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
 
     try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox });
+    actor.maintenance(harness.env());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
-    var timeout_event = outbox.pop() orelse return error.MissingTimeoutEvent;
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    var timeout_event = harness.outbox.pop() orelse return error.MissingTimeoutEvent;
     defer timeout_event.deinit(alloc);
     try std.testing.expect(timeout_event == .request_timeout);
 }
@@ -681,62 +641,57 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
             .command_capacity = 1,
         },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const stable = session_book.StableSession{
         .initiator_key = [_]u8{0x1c} ** 16,
         .recipient_key = [_]u8{0x1d} ** 16,
     };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
     const req_id = try actor.sendFindNode(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         endpoint,
         &remote_pubkey,
         &.{ distance_a, distance_b },
         .api,
     );
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     var first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const first = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{raw_a} };
     const first_plaintext = try first.encodeInto(&first_buffer);
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, first_plaintext, 0x21);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, first_plaintext, 0x21);
     const partial = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
     try std.testing.expectEqual(@as(u64, 2), partial.total_responses.?);
     try std.testing.expectEqual(@as(u64, 1), partial.responses_received);
     try std.testing.expectEqual(@as(usize, 1), partial.enrs.items.len);
 
     try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox });
+    actor.maintenance(harness.env());
     const fresh = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
     try std.testing.expect(fresh.total_responses == null);
     try std.testing.expectEqual(@as(u64, 0), fresh.responses_received);
     try std.testing.expectEqual(@as(usize, 0), fresh.enrs.items.len);
     try std.testing.expectEqual(@as(usize, request_book.MAX_NODES_RESPONSE), fresh.enrs.capacity);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, first_plaintext, 0x22);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, first_plaintext, 0x22);
     const repeated = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
     try std.testing.expectEqual(@as(u64, 1), repeated.responses_received);
     try std.testing.expectEqual(@as(usize, 1), repeated.enrs.items.len);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     var final_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const final = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{raw_b} };
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 0x23);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 0x23);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     var saw_nodes = false;
     var processed: usize = 0;
     while (processed < cfg.limits.event_capacity) : (processed += 1) {
-        var event = outbox.pop() orelse break;
+        var event = harness.outbox.pop() orelse break;
         if (event == .nodes) {
             try std.testing.expectEqual(@as(usize, 2), event.nodes.enrs.items.len);
             saw_nodes = true;
@@ -793,9 +748,9 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
@@ -888,9 +843,9 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
@@ -976,9 +931,9 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
@@ -1109,29 +1064,24 @@ test "failed retry datagram does not increment sent message metrics" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 }, outbound.nowNs(io));
-    const req_id = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 0, .api);
-    var initial = recording.datagrams.items[0].bytes;
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    var initial = harness.recording.datagrams.items[0].bytes;
     const initial_nonce = (try packet.decode(initial.bytes[0..initial.len], &endpoint.node_id)).static_header.nonce;
 
-    recording.fail_next = true;
+    harness.recording.fail_next = true;
     try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox });
+    actor.maintenance(harness.env());
     try std.testing.expectEqual(@as(u64, 1), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
-    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
     const active = actor.requests.get(.init(endpoint, req_id)) orelse return error.MissingRequestAfterRetryFailure;
     try std.testing.expect(active.phase == .awaiting_response);
     try std.testing.expectEqual(initial_nonce, active.phase.awaiting_response.recovery.nonce);
     try std.testing.expect(actor.requests.hasChallenge(&initial_nonce, endpoint.addr));
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 }
 
 test "local ENR update pings every connected peer in a live bucket exactly once" {
@@ -1159,14 +1109,9 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 8, .max_queued_requests = 8, .event_capacity = 8, .command_capacity = 4 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
 
     var peer_ids: [3]types.NodeId = undefined;
     var peer_addresses: [3]types.Address = undefined;
@@ -1196,14 +1141,14 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
     }
     try std.testing.expectEqual(peer_ids.len, peer_count);
 
-    try actor.setLocalEnr(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, replacement_enr);
-    try std.testing.expectEqual(peer_ids.len, recording.datagrams.items.len);
+    try actor.setLocalEnr(harness.env(), replacement_enr);
+    try std.testing.expectEqual(peer_ids.len, harness.recording.datagrams.items.len);
     try std.testing.expectEqual(peer_ids.len, actor.requests.activeCount());
-    try std.testing.expectEqual(peer_ids.len, ingress.permitCount());
+    try std.testing.expectEqual(peer_ids.len, harness.ingress.permitCount());
     for (peer_ids, peer_addresses) |peer_id, address| {
         try std.testing.expect(actor.peers.routing.getEntry(&peer_id).?.health_request != null);
         var address_count: usize = 0;
-        for (recording.datagrams.items) |datagram| {
+        for (harness.recording.datagrams.items) |datagram| {
             if (datagram.address.eql(&address)) address_count += 1;
         }
         try std.testing.expectEqual(@as(usize, 1), address_count);
@@ -1229,45 +1174,40 @@ test "NODES total is exact bounded consistent and controls final permit release"
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const stable = session_book.StableSession{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const req_id = try actor.sendFindNode(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, &.{0}, .api);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{0}, .api);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     var invalid_buffer: [128]u8 = undefined;
     const invalid = message.Nodes{ .req_id = req_id, .total = 17, .enrs = &.{} };
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try invalid.encodeInto(&invalid_buffer), 1);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try invalid.encodeInto(&invalid_buffer), 1);
     try std.testing.expect(actor.requests.get(.init(endpoint, req_id)).?.response.nodes.total_responses == null);
     try std.testing.expectEqual(@as(u64, 0), actor.requests.get(.init(endpoint, req_id)).?.response.nodes.responses_received);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     var nodes_buffer: [128]u8 = undefined;
     const nodes = message.Nodes{ .req_id = req_id, .total = 10, .enrs = &.{} };
     const plaintext = try nodes.encodeInto(&nodes_buffer);
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, plaintext, 2);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, plaintext, 2);
     try std.testing.expectEqual(@as(u64, 10), actor.requests.get(.init(endpoint, req_id)).?.response.nodes.total_responses.?);
     try std.testing.expectEqual(@as(u64, 1), actor.requests.get(.init(endpoint, req_id)).?.response.nodes.responses_received);
 
     var inconsistent_buffer: [128]u8 = undefined;
     const inconsistent = message.Nodes{ .req_id = req_id, .total = 9, .enrs = &.{} };
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try inconsistent.encodeInto(&inconsistent_buffer), 3);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try inconsistent.encodeInto(&inconsistent_buffer), 3);
     try std.testing.expectEqual(@as(u64, 1), actor.requests.get(.init(endpoint, req_id)).?.response.nodes.responses_received);
 
     for (4..9) |nonce| try deliverEncrypted(
-        &actor,
+        actor,
         io,
-        recording.sender(),
-        &ingress,
-        &outbox,
+        harness.recording.sender(),
+        &harness.ingress,
+        &harness.outbox,
         endpoint,
         &stable.recipient_key,
         plaintext,
@@ -1275,22 +1215,22 @@ test "NODES total is exact bounded consistent and controls final permit release"
     );
     try std.testing.expectEqual(@as(u64, 6), actor.requests.get(.init(endpoint, req_id)).?.response.nodes.responses_received);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     for (9..13) |nonce| try deliverEncrypted(
-        &actor,
+        actor,
         io,
-        recording.sender(),
-        &ingress,
-        &outbox,
+        harness.recording.sender(),
+        &harness.ingress,
+        &harness.outbox,
         endpoint,
         &stable.recipient_key,
         plaintext,
         @intCast(nonce),
     );
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
-    var nodes_event = outbox.pop() orelse return error.MissingNodesEvent;
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    var nodes_event = harness.outbox.pop() orelse return error.MissingNodesEvent;
     defer nodes_event.deinit(alloc);
     try std.testing.expect(nodes_event == .nodes);
 }
@@ -1337,14 +1277,9 @@ test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 8 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const address = @import("types.zig").Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } };
     const endpoint = @import("types.zig").Endpoint{ .node_id = remote_id, .addr = address };
     const stable = session_book.StableSession{
@@ -1354,10 +1289,10 @@ test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
     const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
     actor.sessions.put(endpoint, stable, now_ns);
 
-    const req_a = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 1, .api);
-    const req_b = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 1, .api);
-    var sent_a = recording.datagrams.items[0].bytes;
-    var sent_b = recording.datagrams.items[1].bytes;
+    const req_a = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    const req_b = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    var sent_a = harness.recording.datagrams.items[0].bytes;
+    var sent_b = harness.recording.datagrams.items[1].bytes;
     const nonce_a = (try packet.decode(sent_a.bytes[0..sent_a.len], &remote_id)).static_header.nonce;
     const nonce_b = (try packet.decode(sent_b.bytes[0..sent_b.len], &remote_id)).static_header.nonce;
     var challenge_a: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
@@ -1376,12 +1311,12 @@ test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
         .id_nonce = &([_]u8{0x52} ** 16),
         .enr_seq = 0,
     }, null);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, first, address);
-    try std.testing.expectEqual(@as(usize, 3), recording.datagrams.items.len);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, first, address);
-    try std.testing.expectEqual(@as(usize, 3), recording.datagrams.items.len);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, second, address);
-    try std.testing.expectEqual(@as(usize, 3), recording.datagrams.items.len);
+    actor.handlePacket(harness.env(), first, address);
+    try std.testing.expectEqual(@as(usize, 3), harness.recording.datagrams.items.len);
+    actor.handlePacket(harness.env(), first, address);
+    try std.testing.expectEqual(@as(usize, 3), harness.recording.datagrams.items.len);
+    actor.handlePacket(harness.env(), second, address);
+    try std.testing.expectEqual(@as(usize, 3), harness.recording.datagrams.items.len);
     const retained = actor.sessions.get(endpoint, now_ns) orelse return error.MissingStableSession;
     try std.testing.expectEqual(stable.initiator_key, retained.initiator_key);
     try std.testing.expectEqual(stable.recipient_key, retained.recipient_key);
@@ -1409,16 +1344,11 @@ test "HANDSHAKE send failure leaves WHOAREYOU request state unchanged" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
-    const req_id = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 0, .api);
-    var probe = recording.datagrams.items[0].bytes;
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    var probe = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(probe.bytes[0..probe.len], &remote_id)).static_header.nonce;
     var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
     const challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
@@ -1428,11 +1358,11 @@ test "HANDSHAKE send failure leaves WHOAREYOU request state unchanged" {
         .id_nonce = &([_]u8{0x56} ** 16),
         .enr_seq = 0,
     }, null);
-    recording.fail_next = true;
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, challenge, endpoint.addr);
+    harness.recording.fail_next = true;
+    actor.handlePacket(harness.env(), challenge, endpoint.addr);
 
-    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expect(actor.requests.hasChallenge(&request_nonce, endpoint.addr));
     try std.testing.expect(actor.requests.pendingKeys(endpoint) == null);
     const active = actor.requests.get(.init(endpoint, req_id)) orelse return error.MissingRequestAfterSendFailure;
@@ -1457,14 +1387,9 @@ test "failed ciphertext does not refresh stable session LRU recency" {
             .command_capacity = 2,
         },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const lru_endpoint = types.Endpoint{
         .node_id = [_]u8{0xa1} ** 32,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 41 }, .port = 9041 } },
@@ -1483,8 +1408,8 @@ test "failed ciphertext does not refresh stable session LRU recency" {
 
     // A source-spoofing attacker sends undecryptable ciphertext for the LRU
     // session. Tentative decrypt must peek and leave eviction order unchanged.
-    var garbage = try encodeEncryptedPacket(&actor, lru_endpoint.node_id, &([_]u8{0xff} ** 16), &.{message.MSG_PING}, 21);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, garbage.bytes[0..garbage.len], lru_endpoint.addr);
+    var garbage = try encodeEncryptedPacket(actor, lru_endpoint.node_id, &([_]u8{0xff} ** 16), &.{message.MSG_PING}, 21);
+    actor.handlePacket(harness.env(), garbage.bytes[0..garbage.len], lru_endpoint.addr);
     try std.testing.expect(actor.sessions.peek(lru_endpoint, 2) != null);
 
     actor.sessions.put(third_endpoint, stable, 3);
@@ -1513,33 +1438,28 @@ test "authenticated packets reject stale nonce and wrong source address" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x61} ** 16, .recipient_key = [_]u8{0x62} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
     const ping = message.Ping{ .req_id = try message.ReqId.fromSlice(&.{1}), .enr_seq = 0 };
     var plaintext_buffer: [128]u8 = undefined;
     const plaintext = try ping.encodeInto(&plaintext_buffer);
-    const replay = try encodeEncryptedPacket(&actor, endpoint.node_id, &stable.recipient_key, plaintext, 1);
+    const replay = try encodeEncryptedPacket(actor, endpoint.node_id, &stable.recipient_key, plaintext, 1);
     var first = replay;
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, first.bytes[0..first.len], endpoint.addr);
-    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+    actor.handlePacket(harness.env(), first.bytes[0..first.len], endpoint.addr);
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
     var duplicate = replay;
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, duplicate.bytes[0..duplicate.len], endpoint.addr);
-    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+    actor.handlePacket(harness.env(), duplicate.bytes[0..duplicate.len], endpoint.addr);
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
 
-    var wrong_source = try encodeEncryptedPacket(&actor, endpoint.node_id, &stable.recipient_key, plaintext, 2);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, wrong_source.bytes[0..wrong_source.len], wrong_address);
-    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
-    try std.testing.expect(recording.datagrams.items[1].address.eql(&wrong_address));
-    var whoareyou = recording.datagrams.items[1].bytes;
+    var wrong_source = try encodeEncryptedPacket(actor, endpoint.node_id, &stable.recipient_key, plaintext, 2);
+    actor.handlePacket(harness.env(), wrong_source.bytes[0..wrong_source.len], wrong_address);
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expect(harness.recording.datagrams.items[1].address.eql(&wrong_address));
+    var whoareyou = harness.recording.datagrams.items[1].bytes;
     try std.testing.expectEqual(packet.FLAG_WHOAREYOU, (try packet.decode(whoareyou.bytes[0..whoareyou.len], &remote_id)).static_header.flag);
     try std.testing.expectEqual(@as(u64, 1), actor.metrics.rcvd_message_count[metrics.MessageType.ping.index()]);
 }
@@ -1569,14 +1489,9 @@ test "session nonce epoch retires at capacity and never redispatches its first r
             .command_capacity = 1,
         },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const stable = session_book.StableSession{
         .initiator_key = [_]u8{0x5f} ** 16,
         .recipient_key = [_]u8{0x60} ** 16,
@@ -1590,14 +1505,14 @@ test "session nonce epoch retires at capacity and never redispatches its first r
     };
     var original_plaintext_buffer: [128]u8 = undefined;
     var original_packet = try encodeEncryptedPacket(
-        &actor,
+        actor,
         remote_id,
         &stable.recipient_key,
         try original_request.encodeInto(&original_plaintext_buffer),
         1,
     );
     actor.handlePacket(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         original_packet.bytes[0..original_packet.len],
         endpoint.addr,
     );
@@ -1607,31 +1522,31 @@ test "session nonce epoch retires at capacity and never redispatches its first r
     const filler_plaintext = try filler.encodeInto(&filler_plaintext_buffer);
     for (0..session_book.SEEN_NONCES_CAP) |index| {
         var filler_packet = try encodeEncryptedPacket(
-            &actor,
+            actor,
             remote_id,
             &stable.recipient_key,
             filler_plaintext,
             @intCast(index + 2),
         );
         actor.handlePacket(
-            .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+            harness.env(),
             filler_packet.bytes[0..filler_packet.len],
             endpoint.addr,
         );
     }
     try std.testing.expect(actor.sessions.peek(endpoint, outbound.nowNs(io)) == null);
     try std.testing.expectEqual(@as(usize, 1), actor.sessions.challengeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
-    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
 
     actor.handlePacket(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         original_packet.bytes[0..original_packet.len],
         endpoint.addr,
     );
     try std.testing.expectEqual(@as(u64, 1), actor.metrics.rcvd_message_count[metrics.MessageType.talkreq.index()]);
     try std.testing.expectEqual(@as(u64, session_book.SEEN_NONCES_CAP - 1), actor.metrics.rcvd_message_count[metrics.MessageType.talkresp.index()]);
-    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
 }
 
 test "successful handshake records initial probe nonce and replay is inert" {
@@ -1679,9 +1594,9 @@ test "successful handshake records initial probe nonce and replay is inert" {
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, outbound.nowNs(io)));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, outbound.nowNs(io)));
@@ -1747,19 +1662,14 @@ test "old key remains accepted without promotion until candidate response" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
     const old = session_book.StableSession{ .initiator_key = [_]u8{0x71} ** 16, .recipient_key = [_]u8{0x72} ** 16 };
     actor.sessions.put(endpoint, old, outbound.nowNs(io));
-    const req_id = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 0, .api);
-    var sent = recording.datagrams.items[0].bytes;
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    var sent = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id)).static_header.nonce;
     var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
     const challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
@@ -1769,14 +1679,14 @@ test "old key remains accepted without promotion until candidate response" {
         .id_nonce = &([_]u8{0x74} ** 16),
         .enr_seq = 0,
     }, null);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, challenge, endpoint.addr);
+    actor.handlePacket(harness.env(), challenge, endpoint.addr);
     const pending = actor.requests.pendingKeys(endpoint) orelse return error.MissingPendingRekey;
-    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
 
     const old_ping = message.Ping{ .req_id = try message.ReqId.fromSlice(&.{0xa1}), .enr_seq = 0 };
     var old_ping_buffer: [128]u8 = undefined;
-    var old_response = try encodeEncryptedPacket(&actor, remote_id, &old.recipient_key, try old_ping.encodeInto(&old_ping_buffer), 9);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, old_response.bytes[0..old_response.len], endpoint.addr);
+    var old_response = try encodeEncryptedPacket(actor, remote_id, &old.recipient_key, try old_ping.encodeInto(&old_ping_buffer), 9);
+    actor.handlePacket(harness.env(), old_response.bytes[0..old_response.len], endpoint.addr);
     const still_pending = actor.requests.pendingKeys(endpoint) orelse return error.PendingRekeyWasPromotedByOldKey;
     try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.key, still_pending.key));
     try std.testing.expect(actor.requests.shouldQueue(endpoint));
@@ -1784,7 +1694,7 @@ test "old key remains accepted without promotion until candidate response" {
     const still_old = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingOldSession;
     try std.testing.expectEqual(old.initiator_key, still_old.initiator_key);
     try std.testing.expectEqual(old.recipient_key, still_old.recipient_key);
-    try std.testing.expectEqual(@as(usize, 3), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 3), harness.recording.datagrams.items.len);
 
     const pong = message.Pong{
         .req_id = req_id,
@@ -1793,18 +1703,18 @@ test "old key remains accepted without promotion until candidate response" {
         .recipient_port = 9000,
     };
     var pong_buffer: [128]u8 = undefined;
-    var response = try encodeEncryptedPacket(&actor, remote_id, &pending.keys.recipient_key, try pong.encodeInto(&pong_buffer), 10);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, response.bytes[0..response.len], endpoint.addr);
+    var response = try encodeEncryptedPacket(actor, remote_id, &pending.keys.recipient_key, try pong.encodeInto(&pong_buffer), 10);
+    actor.handlePacket(harness.env(), response.bytes[0..response.len], endpoint.addr);
 
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
-    actor.responses.prune(std.math.maxInt(i64), &ingress);
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    actor.responses.prune(std.math.maxInt(i64), &harness.ingress);
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expect(actor.requests.pendingKeys(endpoint) == null);
     const promoted = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingPromotedSession;
     try std.testing.expectEqual(pending.keys.initiator_key, promoted.initiator_key);
     try std.testing.expectEqual(pending.keys.recipient_key, promoted.recipient_key);
-    var pong_event = outbox.pop() orelse return error.MissingPongEvent;
+    var pong_event = harness.outbox.pop() orelse return error.MissingPongEvent;
     defer pong_event.deinit(alloc);
     try std.testing.expect(pong_event == .pong);
 }
@@ -1834,20 +1744,15 @@ test "rekey lane queues stable-key requests and drains FIFO after candidate proo
             .command_capacity = 2,
         },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
     const old = session_book.StableSession{ .initiator_key = [_]u8{0x75} ** 16, .recipient_key = [_]u8{0x76} ** 16 };
     actor.sessions.put(endpoint, old, outbound.nowNs(io));
 
-    _ = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 0, .api);
-    var sent = recording.datagrams.items[0].bytes;
+    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    var sent = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id)).static_header.nonce;
     var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
     const challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
@@ -1857,32 +1762,32 @@ test "rekey lane queues stable-key requests and drains FIFO after candidate proo
         .id_nonce = &([_]u8{0x78} ** 16),
         .enr_seq = 0,
     }, null);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, challenge, endpoint.addr);
+    actor.handlePacket(harness.env(), challenge, endpoint.addr);
     const pending = actor.requests.pendingKeys(endpoint) orelse return error.MissingPendingRekey;
-    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
 
-    const second_id = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 1, .api);
-    const third_id = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 2, .api);
-    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
+    const second_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    const third_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 2, .api);
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 2), actor.requests.queuedCount());
 
     const proof_ping = message.Ping{ .req_id = try message.ReqId.fromSlice(&.{0xa2}), .enr_seq = 0 };
     var proof_buffer: [128]u8 = undefined;
-    var proof = try encodeEncryptedPacket(&actor, remote_id, &pending.keys.recipient_key, try proof_ping.encodeInto(&proof_buffer), 11);
-    actor.handlePacket(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, proof.bytes[0..proof.len], endpoint.addr);
+    var proof = try encodeEncryptedPacket(actor, remote_id, &pending.keys.recipient_key, try proof_ping.encodeInto(&proof_buffer), 11);
+    actor.handlePacket(harness.env(), proof.bytes[0..proof.len], endpoint.addr);
 
     try std.testing.expect(actor.requests.pendingKeys(endpoint) == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 5), recording.datagrams.items.len);
-    const second_plaintext = try decryptRecorded(&recording, 3, remote_id, &pending.keys.initiator_key);
-    const third_plaintext = try decryptRecorded(&recording, 4, remote_id, &pending.keys.initiator_key);
+    try std.testing.expectEqual(@as(usize, 5), harness.recording.datagrams.items.len);
+    const second_plaintext = try decryptRecorded(&harness.recording, 3, remote_id, &pending.keys.initiator_key);
+    const third_plaintext = try decryptRecorded(&harness.recording, 4, remote_id, &pending.keys.initiator_key);
     const second_ping = try message.Ping.decode(second_plaintext.slice());
     const third_ping = try message.Ping.decode(third_plaintext.slice());
     try std.testing.expectEqualSlices(u8, second_id.slice(), second_ping.req_id.slice());
     try std.testing.expectEqualSlices(u8, third_id.slice(), third_ping.req_id.slice());
 }
 
-fn decryptRecorded(recording: *const transport.RecordingSender, index: usize, recipient_id: types.NodeId, read_key: *const [16]u8) !types.PacketBytes {
+fn decryptRecorded(recording: *const RecordingSender, index: usize, recipient_id: types.NodeId, read_key: *const [16]u8) !types.PacketBytes {
     var raw = recording.datagrams.items[index].bytes;
     var parsed = try packet.decode(raw.bytes[0..raw.len], &recipient_id);
     var plaintext_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
@@ -1914,28 +1819,23 @@ test "initial tracked send failure is caller-visible and fully unwinds" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
-    recording.fail_next = true;
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    harness.recording.fail_next = true;
     const endpoint = @import("types.zig").Endpoint{
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9000 } },
     };
 
     try std.testing.expectError(
-        error.RecordingSendFailure,
-        actor.sendFindNode(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, &.{1}, .api),
+        error.TransportSendFailed,
+        actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{1}, .api),
     );
-    try std.testing.expectEqual(@as(usize, 0), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     actor.requests.assertInvariants();
 }
 
@@ -1965,41 +1865,36 @@ test "WHOAREYOU and response send failures release prepared permits and retained
             .command_capacity = 2,
         },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
     actor.sessions.put(endpoint, .{
         .initiator_key = [_]u8{0xe1} ** 16,
         .recipient_key = [_]u8{0xe2} ** 16,
     }, outbound.nowNs(io));
 
-    recording.fail_next = true;
-    try std.testing.expectError(error.RecordingSendFailure, actor.sendTalkResponse(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+    harness.recording.fail_next = true;
+    try std.testing.expectError(error.TransportSendFailed, actor.sendTalkResponse(
+        harness.env(),
         endpoint,
         try message.ReqId.fromSlice(&.{1}),
         "failed",
     ));
     try std.testing.expectEqual(@as(usize, 0), actor.responses.count());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 
     try std.testing.expect(actor.sessions.remove(endpoint));
-    var undecryptable = try encodeEncryptedPacket(&actor, remote_id, &([_]u8{0xff} ** 16), &.{message.MSG_PING}, 0xe3);
-    recording.fail_next = true;
+    var undecryptable = try encodeEncryptedPacket(actor, remote_id, &([_]u8{0xff} ** 16), &.{message.MSG_PING}, 0xe3);
+    harness.recording.fail_next = true;
     actor.handlePacket(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         undecryptable.bytes[0..undecryptable.len],
         endpoint.addr,
     );
     try std.testing.expectEqual(@as(usize, 0), actor.sessions.challengeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
-    try std.testing.expectEqual(@as(usize, 0), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
 }
 
 test "transactional capacity-one challenge replacement send failure preserves original" {
@@ -2033,36 +1928,31 @@ test "transactional capacity-one challenge replacement send failure preserves or
             .command_capacity = 1,
         },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
 
-    var first = try encodeEncryptedPacket(&actor, remote_id_a, &([_]u8{0xa1} ** 16), &.{message.MSG_PING}, 0xa2);
+    var first = try encodeEncryptedPacket(actor, remote_id_a, &([_]u8{0xa1} ** 16), &.{message.MSG_PING}, 0xa2);
     actor.handlePacket(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         first.bytes[0..first.len],
         endpoint_a.addr,
     );
     try std.testing.expect(actor.sessions.peekChallenge(endpoint_a, outbound.nowNs(io)) != null);
     try std.testing.expectEqual(@as(usize, 1), actor.sessions.challengeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
-    recording.fail_next = true;
-    var second = try encodeEncryptedPacket(&actor, remote_id_b, &([_]u8{0xb1} ** 16), &.{message.MSG_PING}, 0xb2);
+    harness.recording.fail_next = true;
+    var second = try encodeEncryptedPacket(actor, remote_id_b, &([_]u8{0xb1} ** 16), &.{message.MSG_PING}, 0xb2);
     actor.handlePacket(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         second.bytes[0..second.len],
         endpoint_b.addr,
     );
     try std.testing.expect(actor.sessions.peekChallenge(endpoint_a, outbound.nowNs(io)) != null);
     try std.testing.expect(actor.sessions.peekChallenge(endpoint_b, outbound.nowNs(io)) == null);
     try std.testing.expectEqual(@as(usize, 1), actor.sessions.challengeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 }
 
 test "transactional capacity-one response replacement send failure preserves original" {
@@ -2098,41 +1988,36 @@ test "transactional capacity-one response replacement send failure preserves ori
             .command_capacity = 1,
         },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.addNode(remote_id_a, &remote_pubkey_a, endpoint_a.addr, null, outbound.nowNs(io)));
     try std.testing.expect(actor.addNode(remote_id_b, &remote_pubkey_b, endpoint_b.addr, null, outbound.nowNs(io)));
     actor.sessions.put(endpoint_a, .{ .initiator_key = [_]u8{0xc1} ** 16, .recipient_key = [_]u8{0xc2} ** 16 }, outbound.nowNs(io));
     actor.sessions.put(endpoint_b, .{ .initiator_key = [_]u8{0xd1} ** 16, .recipient_key = [_]u8{0xd2} ** 16 }, outbound.nowNs(io));
 
     try actor.sendTalkResponse(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         endpoint_a,
         try message.ReqId.fromSlice(&.{1}),
         "first",
     );
-    var sent = recording.datagrams.items[0].bytes;
+    var sent = harness.recording.datagrams.items[0].bytes;
     const first_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id_a)).static_header.nonce;
     try std.testing.expect(actor.responses.hasLive(endpoint_a.addr, &first_nonce, outbound.nowNs(io)));
     try std.testing.expectEqual(@as(usize, 1), actor.responses.count());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
-    recording.fail_next = true;
-    try std.testing.expectError(error.RecordingSendFailure, actor.sendTalkResponse(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+    harness.recording.fail_next = true;
+    try std.testing.expectError(error.TransportSendFailed, actor.sendTalkResponse(
+        harness.env(),
         endpoint_b,
         try message.ReqId.fromSlice(&.{2}),
         "second",
     ));
     try std.testing.expect(actor.responses.hasLive(endpoint_a.addr, &first_nonce, outbound.nowNs(io)));
     try std.testing.expectEqual(@as(usize, 1), actor.responses.count());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 }
 
 test "addEnr treats an older ENR for a known newer node as usable without an event" {
@@ -2159,28 +2044,25 @@ test "addEnr treats an older ENR for a known newer node as usable without an eve
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
 
-    try std.testing.expect(actor.addEnr(&outbox, newer_enr, 1));
-    var added_event = outbox.pop() orelse return error.MissingEnrAdded;
+    try std.testing.expect(actor.addEnr(&harness.outbox, newer_enr, 1));
+    var added_event = harness.outbox.pop() orelse return error.MissingEnrAdded;
     defer added_event.deinit(alloc);
     try std.testing.expect(added_event == .enr_added);
 
     // The stored ENR is newer: local-trust merge succeeds, the node stays
     // usable, and no duplicate/stale event is emitted.
-    try std.testing.expect(actor.addEnr(&outbox, older_enr, 2));
+    try std.testing.expect(actor.addEnr(&harness.outbox, older_enr, 2));
     try std.testing.expect(actor.peers.known(&remote_id).?.runtime_contact_trusted);
     try std.testing.expectEqualSlices(u8, newer_enr, actor.peers.findEnr(&remote_id).?);
-    try std.testing.expect(outbox.pop() == null);
+    try std.testing.expect(harness.outbox.pop() == null);
 
     // An exact duplicate of the stored ENR also stays usable without an event.
-    try std.testing.expect(actor.addEnr(&outbox, newer_enr, 3));
-    try std.testing.expect(outbox.pop() == null);
+    try std.testing.expect(actor.addEnr(&harness.outbox, newer_enr, 3));
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "event payload allocation failure preserves Actor state and counts one drop" {
@@ -2239,30 +2121,25 @@ test "response payload allocation failure still completes and releases permit" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x64} ** 16, .recipient_key = [_]u8{0x65} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const req_id = try actor.sendTalkRequest(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, "test", "request");
+    const req_id = try actor.sendTalkRequest(harness.env(), endpoint, &remote_pubkey, "test", "request");
     const response = message.TalkResp{ .req_id = req_id, .response = "allocation must fail" };
     var response_buffer: [128]u8 = undefined;
     const plaintext = try response.encodeInto(&response_buffer);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     actor.alloc = failing.allocator();
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, plaintext, 10);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, plaintext, 10);
     actor.alloc = alloc;
 
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
-    try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
-    try std.testing.expect(outbox.pop() == null);
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "full event outbox preserves completion and queued drain with one owned drop" {
@@ -2284,32 +2161,27 @@ test "full event outbox preserves completion and queued drain with one owned dro
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 3, .max_queued_requests = 3, .event_capacity = 1, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x66} ** 16, .recipient_key = [_]u8{0x67} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const talk_id = try actor.sendTalkRequest(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, "test", "request");
+    const talk_id = try actor.sendTalkRequest(harness.env(), endpoint, &remote_pubkey, "test", "request");
     const queued_id = try message.ReqId.fromSlice(&.{9});
     const queued_ping = message.Ping{ .req_id = queued_id, .enr_seq = 0 };
     var queued_buffer: [128]u8 = undefined;
     try actor.requests.queue(try .init(.api, endpoint, &remote_pubkey, queued_id, .ping, &.{}, try queued_ping.encodeInto(&queued_buffer), std.math.maxInt(i64)));
-    outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
+    harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
 
     const response = message.TalkResp{ .req_id = talk_id, .response = "owned response" };
     var response_buffer: [128]u8 = undefined;
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try response.encodeInto(&response_buffer), 11);
-    try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try response.encodeInto(&response_buffer), 11);
+    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
     try std.testing.expect(actor.requests.get(.init(endpoint, talk_id)) == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expect(actor.requests.get(.init(endpoint, queued_id)) != null);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
-    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
 }
 
 test "full event outbox preserves lookup finalization with one owned drop" {
@@ -2331,22 +2203,19 @@ test "full event outbox preserves lookup finalization with one owned drop" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 1, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.peers.learnEnr(remote_enr, 0) != null);
     var lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{remote_id}, 0, actor.lookup_config);
     const contacted = lookup.nextPeer(actor.lookup_config).?;
     lookup.onSuccess(&contacted, &.{}, actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(1, lookup);
-    outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
+    harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
 
-    actor.finishLookup(&outbox, 1, false);
+    actor.finishLookup(&harness.outbox, 1, false);
     try std.testing.expectEqual(@as(usize, 0), actor.lookups.count());
-    try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
 }
 
 test "full event outbox preserves matching health completion with one drop" {
@@ -2373,30 +2242,25 @@ test "full event outbox preserves matching health completion with one drop" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 1, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     try std.testing.expect(actor.peers.learnEnr(remote_enr, 0) != null);
     _ = actor.peers.markResponsive(remote_id, endpoint.addr, 0, null);
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x6c} ** 16, .recipient_key = [_]u8{0x6d} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const req_id = try actor.sendPing(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, 1, .{ .maintenance = .health });
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .{ .maintenance = .health });
     const key = types.RequestKey.init(endpoint, req_id);
     try std.testing.expect(actor.peers.armHealthRequest(key, .connected_only));
-    outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
+    harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
     const pong = message.Pong{ .req_id = req_id, .enr_seq = 1, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 };
     var pong_buffer: [128]u8 = undefined;
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try pong.encodeInto(&pong_buffer), 12);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try pong.encodeInto(&pong_buffer), 12);
 
-    try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
     try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 }
 
 test "LocalRecord replacement is atomic across allocator failure" {
@@ -2418,19 +2282,14 @@ test "LocalRecord replacement is atomic across allocator failure" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const before = actor.local.raw.?;
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     actor.alloc = failing.allocator();
     actor.observeAddressVote(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 1 } },
         .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 2 }, .port = 9100 } },
     );
@@ -2440,17 +2299,17 @@ test "LocalRecord replacement is atomic across allocator failure" {
     try std.testing.expectEqual(@as(u64, 1), actor.local.seq);
     try std.testing.expectEqualSlices(u8, before.slice(), actor.local.raw.?.slice());
     try std.testing.expectEqual(@as(usize, 1), actor.votes_ip4.currentVoteCount());
-    try std.testing.expect(outbox.pop() == null);
+    try std.testing.expect(harness.outbox.pop() == null);
 
     actor.observeAddressVote(
-        .{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox },
+        harness.env(),
         .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 2 } },
         .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 2 }, .port = 9100 } },
     );
     try std.testing.expectEqual(@as(u64, 2), actor.local.seq);
     try std.testing.expect(!std.mem.eql(u8, before.slice(), actor.local.raw.?.slice()));
     try std.testing.expectEqual(@as(usize, 0), actor.votes_ip4.currentVoteCount());
-    var updated = outbox.pop() orelse return error.MissingLocalEnrUpdated;
+    var updated = harness.outbox.pop() orelse return error.MissingLocalEnrUpdated;
     defer updated.deinit(alloc);
     try std.testing.expect(updated == .local_enr_updated);
 }
@@ -2475,30 +2334,25 @@ test "lookup finish allocation failure still removes and detaches lookup" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     actor.sessions.put(endpoint, .{
         .initiator_key = [_]u8{0x7a} ** 16,
         .recipient_key = [_]u8{0x7b} ** 16,
     }, outbound.nowNs(io));
     const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{1} ** 32, &.{}, 0, actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(1, lookup);
-    const req_id = try actor.sendFindNode(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, &.{1}, .{ .lookup = 1 });
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{1}, .{ .lookup = 1 });
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     failing.fail_index = failing.alloc_index;
 
-    actor.finishLookup(&outbox, 1, true);
+    actor.finishLookup(&harness.outbox, 1, true);
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), actor.lookups.count());
-    try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
     try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(.init(endpoint, req_id)).?.origin);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 }
 
 test "detached late multipart NODES still learns emits and releases final permit" {
@@ -2528,43 +2382,38 @@ test "detached late multipart NODES still learns emits and releases final permit
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 },
     };
-    var ingress = try admission.IngressAdmission.init(alloc, null, cfg.limits.max_active_requests);
-    defer ingress.deinit();
-    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
-    defer outbox.deinit();
-    var actor = try actor_mod.Actor.init(alloc, cfg);
-    defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
-    defer recording.deinit();
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x75} ** 16, .recipient_key = [_]u8{0x76} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
     const lookup_id: u32 = 42;
     const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{}, 0, actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
-    const req_id = try actor.sendFindNode(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, &.{distance}, .{ .lookup = lookup_id });
-    actor.finishLookup(&outbox, lookup_id, false);
-    var lookup_event = outbox.pop() orelse return error.MissingLookupFinished;
+    const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{distance}, .{ .lookup = lookup_id });
+    actor.finishLookup(&harness.outbox, lookup_id, false);
+    var lookup_event = harness.outbox.pop() orelse return error.MissingLookupFinished;
     defer lookup_event.deinit(alloc);
     try std.testing.expect(lookup_event == .lookup_finished);
     try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(.init(endpoint, req_id)).?.origin);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     var first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const first = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{discovered_enr} };
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try first.encodeInto(&first_buffer), 13);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try first.encodeInto(&first_buffer), 13);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expect(actor.peers.findEnr(&discovered_id) != null);
-    var discovered_event = outbox.pop() orelse return error.MissingDiscoveredEvent;
+    var discovered_event = harness.outbox.pop() orelse return error.MissingDiscoveredEvent;
     defer discovered_event.deinit(alloc);
     try std.testing.expect(discovered_event == .discovered_enr);
 
     var final_buffer: [128]u8 = undefined;
     const final = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{} };
-    try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 14);
+    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 14);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
-    var nodes_event = outbox.pop() orelse return error.MissingNodesEvent;
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    var nodes_event = harness.outbox.pop() orelse return error.MissingNodesEvent;
     defer nodes_event.deinit(alloc);
     try std.testing.expect(nodes_event == .nodes);
     try std.testing.expectEqual(@as(usize, 1), nodes_event.nodes.enrs.items.len);
@@ -2612,7 +2461,7 @@ test "Actor RPC NODES allocation failures preserve first and final ownership tra
     defer outbox.deinit();
     var actor = try actor_mod.Actor.init(alloc, cfg);
     defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
+    var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x86} ** 16, .recipient_key = [_]u8{0x87} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
@@ -2734,9 +2583,9 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an existing source IP ba
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
@@ -2802,9 +2651,9 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
     const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
@@ -2924,9 +2773,9 @@ test "strict handshake rejects untrusted contact without endpoint proof" {
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
 
     actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
@@ -3004,9 +2853,9 @@ fn mismatchedSignedEnrHandshake(allow_unverified: ?bool) !struct { session_insta
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
 
     _ = try actor_a.sendPing(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
@@ -3065,9 +2914,9 @@ fn contactHandshakeAccepted(allow_unverified: bool, runtime_contact_trusted: boo
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
     defer actor_b.deinit(&ingress_b);
-    var sender_a = transport.RecordingSender.init(alloc);
+    var sender_a = RecordingSender.init(alloc);
     defer sender_a.deinit();
-    var sender_b = transport.RecordingSender.init(alloc);
+    var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
 
     if (runtime_contact_trusted) {
@@ -3085,7 +2934,7 @@ fn contactHandshakeAccepted(allow_unverified: bool, runtime_contact_trusted: boo
 }
 
 fn deliver(
-    source: *const transport.RecordingSender,
+    source: *const RecordingSender,
     index: usize,
     destination: *actor_mod.Actor,
     io: std.Io,

@@ -54,7 +54,6 @@ pub const Error = error{
     PacketTooLarge,
     PermitGenerationExhausted,
     ProbeUnavailable,
-    RecordingSendFailure,
     RuntimeNotRunning,
     RuntimeStopped,
     StaleEnrSeq,

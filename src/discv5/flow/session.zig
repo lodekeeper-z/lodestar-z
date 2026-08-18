@@ -8,7 +8,6 @@ const session_crypto = @import("../protocol/session.zig");
 const session_book = @import("../state/session_book.zig");
 const request_book = @import("../state/request_book.zig");
 const response_book = @import("../state/response_book.zig");
-const transport = @import("../transport.zig");
 const types = @import("../types.zig");
 const outbound = @import("outbound.zig");
 const rpc = @import("rpc.zig");
@@ -242,6 +241,7 @@ fn generateEphemeral(candidates: anytype, attempts_out: ?*usize) ?secp.KeyPair {
 }
 
 test "invalid ephemeral candidates exhaust the fixed bound before wire output" {
+    const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
     const ZeroCandidates = struct {
         generated: usize = 0,
 
@@ -252,7 +252,7 @@ test "invalid ephemeral candidates exhaust the fixed bound before wire output" {
     };
     var candidates = ZeroCandidates{};
     var attempts: usize = 0;
-    var recording = transport.RecordingSender.init(std.testing.allocator);
+    var recording = RecordingSender.init(std.testing.allocator);
     defer recording.deinit();
 
     try std.testing.expect(generateEphemeral(&candidates, &attempts) == null);

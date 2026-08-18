@@ -6,7 +6,7 @@ const config = @import("config.zig");
 const enr = @import("enr.zig");
 const events = @import("events.zig");
 const secp = @import("secp256k1.zig");
-const transport = @import("transport.zig");
+const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
 const types = @import("types.zig");
 
 fn ip6(prefix: [8]u8, host: u64, port: u16) types.Address {
@@ -46,7 +46,7 @@ test "Actor address votes count one voter per native IPv6 source prefix" {
     defer outbox.deinit();
     var actor = try actor_mod.Actor.init(alloc, cfg);
     defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
+    var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
 
@@ -85,7 +85,7 @@ test "Actor address vote window expires old observations deterministically" {
     defer outbox.deinit();
     var actor = try actor_mod.Actor.init(alloc, cfg);
     defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
+    var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
     const observed = ip4(.{ 198, 51, 100, 20 }, 9100);
@@ -126,7 +126,7 @@ test "Actor rejects invalid observed endpoints but accepts private unicast" {
     defer outbox.deinit();
     var actor = try actor_mod.Actor.init(alloc, cfg);
     defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
+    var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
     const voter = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 10_000 } };
@@ -176,7 +176,7 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     defer outbox.deinit();
     var actor = try actor_mod.Actor.init(alloc, cfg);
     defer actor.deinit(&ingress);
-    var recording = transport.RecordingSender.init(alloc);
+    var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
 
