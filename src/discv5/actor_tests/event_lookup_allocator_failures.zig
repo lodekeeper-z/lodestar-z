@@ -213,6 +213,56 @@ test "full event outbox preserves lookup finalization with one owned drop" {
     try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
 }
 
+test "maintenance times out every expired lookup once and retains live lookups" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x7c} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .rate_limiter = null,
+        .lookup_timeout_ms = 10,
+        .ping_interval_ms = 0,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 16, .command_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const now_ns: i64 = 20 * std.time.ns_per_ms;
+
+    for (1..10) |lookup_id| {
+        var target = [_]u8{0} ** 32;
+        target[0] = @intCast(lookup_id);
+        const started_at_ns = if (lookup_id <= 6) 0 else now_ns;
+        const lookup = try lookup_mod.Lookup.init(alloc, target, &.{}, started_at_ns, actor.lookup_config);
+        actor.lookups.putAssumeCapacityNoClobber(@intCast(lookup_id), lookup);
+    }
+
+    actor.maintenanceAt(harness.env(), now_ns);
+
+    var timed_out = [_]bool{false} ** 10;
+    var event_count: usize = 0;
+    while (harness.outbox.pop()) |event_value| {
+        var event = event_value;
+        defer event.deinit(alloc);
+        try std.testing.expect(event == .lookup_finished);
+        try std.testing.expect(event.lookup_finished.timed_out);
+        const lookup_id = event.lookup_finished.lookup_id;
+        try std.testing.expect(lookup_id <= 6);
+        try std.testing.expect(!timed_out[lookup_id]);
+        timed_out[lookup_id] = true;
+        event_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), event_count);
+    for (1..7) |lookup_id| {
+        try std.testing.expect(timed_out[lookup_id]);
+        try std.testing.expect(!actor.lookups.contains(@intCast(lookup_id)));
+    }
+    for (7..10) |lookup_id| try std.testing.expect(actor.lookups.contains(@intCast(lookup_id)));
+}
+
 test "full event outbox preserves matching health completion with one drop" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;

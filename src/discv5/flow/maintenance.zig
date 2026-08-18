@@ -1,5 +1,6 @@
 const std = @import("std");
 const actor_mod = @import("../actor.zig");
+const config = @import("../config.zig");
 const events = @import("../events.zig");
 const outbound = @import("outbound.zig");
 const completion = @import("completion.zig");
@@ -142,28 +143,32 @@ fn timeout(actor: *Actor, env: Env, key: types.RequestKey) void {
 }
 
 fn pruneQueued(actor: *Actor, env: Env, now_ns: i64) void {
-    var processed: usize = 0;
-    while (processed < actor.limits.max_queued_requests) : (processed += 1) {
-        const queued = actor.requests.takeOneExpiredQueued(now_ns) orelse break;
-        const key = types.RequestKey.init(queued.endpoint, queued.req_id);
-        actor.onRequestCompletion(env, key, queued.origin, false, &.{});
-        env.outbox.publish(.{ .request_timeout = .{ .peer_id = queued.endpoint.node_id, .req_id = queued.req_id, .kind = queued.kind } });
+    var scan = request_book.RequestBook.QueuedScan{};
+    var keys: [config.MAX_QUEUED_PER_ENDPOINT]types.RequestKey = undefined;
+    while (!scan.done) {
+        const count = actor.requests.collectExpiredQueuedBatch(&keys, now_ns, &scan);
+        for (keys[0..count]) |key| {
+            const queued = actor.requests.takeQueued(key) orelse unreachable;
+            actor.onRequestCompletion(env, key, queued.origin, false, &.{});
+            env.outbox.publish(.{ .request_timeout = .{ .peer_id = key.endpoint.node_id, .req_id = key.req_id, .kind = queued.kind } });
+        }
     }
 }
 
 fn pruneLookups(actor: *Actor, outbox: *events.EventOutbox, now_ns: i64) void {
-    var processed: usize = 0;
-    while (processed < 1_024) : (processed += 1) {
-        var timed_out: ?u32 = null;
+    var timed_out: [actor_mod.MAX_LOOKUPS]u32 = undefined;
+    const count = blk: {
+        var count: usize = 0;
         var iterator = actor.lookups.iterator();
         while (iterator.next()) |entry| {
-            if (entry.value_ptr.isTimedOut(now_ns, actor.lookup_config)) {
-                timed_out = entry.key_ptr.*;
-                break;
-            }
+            if (!entry.value_ptr.isTimedOut(now_ns, actor.lookup_config)) continue;
+            std.debug.assert(count < timed_out.len);
+            timed_out[count] = entry.key_ptr.*;
+            count += 1;
         }
-        actor.finishLookup(outbox, timed_out orelse break, true);
-    }
+        break :blk count;
+    };
+    for (timed_out[0..count]) |lookup_id| actor.finishLookup(outbox, lookup_id, true);
 }
 
 fn pingDue(actor: *Actor, env: Env, now_ns: i64) void {

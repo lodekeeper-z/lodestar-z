@@ -427,6 +427,45 @@ pub const RequestBook = struct {
         slots_scanned: usize = 0,
         done: bool = false,
     };
+
+    pub const QueuedScan = struct {
+        index: usize = 0,
+        done: bool = false,
+    };
+
+    pub fn collectExpiredQueuedBatch(self: *const RequestBook, out: []types.RequestKey, now_ns: i64, scan: *QueuedScan) usize {
+        std.debug.assert(out.len >= self.limits.max_queued_requests_per_endpoint);
+        std.debug.assert(out.len <= config_mod.MAX_QUEUED_REQUESTS);
+        if (scan.done) return 0;
+
+        var iterator = self.lanes.iterator();
+        iterator.index = @intCast(scan.index);
+        var count: usize = 0;
+        while (iterator.next()) |entry| {
+            const lane_slot: usize = @intCast(iterator.index - 1);
+            var expired_count: usize = 0;
+            for (entry.value_ptr.queued.items.items[entry.value_ptr.queued.head..]) |queued| {
+                if (now_ns >= queued.deadline_ns) expired_count += 1;
+            }
+            std.debug.assert(expired_count <= self.limits.max_queued_requests_per_endpoint);
+            if (expired_count > out.len - count) {
+                std.debug.assert(count > 0);
+                scan.index = lane_slot;
+                return count;
+            }
+            for (entry.value_ptr.queued.items.items[entry.value_ptr.queued.head..]) |queued| {
+                if (now_ns < queued.deadline_ns) continue;
+                out[count] = .init(queued.endpoint, queued.req_id);
+                count += 1;
+            }
+            scan.index = iterator.index;
+            if (count == out.len) return count;
+        }
+        scan.index = self.lanes.capacity();
+        scan.done = true;
+        return count;
+    }
+
     pub fn collectTimedOutBatch(self: *const RequestBook, out: []types.RequestKey, now_ns: i64, scan: *ActiveScan) usize {
         if (scan.done or out.len == 0) return 0;
         const capacity = self.active.capacity();
@@ -512,26 +551,6 @@ pub const RequestBook = struct {
         var previous_admission = active.admission;
         active.admission = next_admission;
         previous_admission.release(admission);
-    }
-
-    pub fn takeOneExpiredQueued(self: *RequestBook, now_ns: i64) ?QueuedRequest {
-        var iterator = self.lanes.iterator();
-        while (iterator.next()) |entry| {
-            var live_index: usize = 0;
-            while (live_index < entry.value_ptr.queued.len()) : (live_index += 1) {
-                const absolute = entry.value_ptr.queued.head + live_index;
-                const queued = entry.value_ptr.queued.items.items[absolute];
-                if (now_ns < queued.deadline_ns) continue;
-                const endpoint = entry.key_ptr.*;
-                const removed = entry.value_ptr.queued.items.orderedRemove(absolute);
-                std.debug.assert(self.queued_total > 0);
-                self.queued_total -= 1;
-                if (entry.value_ptr.queued.len() == 0) entry.value_ptr.queued.compact();
-                self.removeEmptyLane(endpoint);
-                return removed;
-            }
-        }
-        return null;
     }
 
     pub fn takeQueued(self: *RequestBook, key: types.RequestKey) ?QueuedRequest {

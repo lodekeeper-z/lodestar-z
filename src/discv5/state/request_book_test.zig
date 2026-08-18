@@ -197,6 +197,68 @@ test "RequestBook takes an exact queued request without disturbing lane FIFO" {
     book.assertInvariants();
 }
 
+test "queued expiry removes mixed requests across lanes and preserves live FIFO order" {
+    const scan_limits = config_mod.Limits{
+        .max_active_requests = 1,
+        .max_queued_requests = 24,
+        .max_queued_requests_per_endpoint = config_mod.MAX_QUEUED_PER_ENDPOINT,
+    };
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 1);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, scan_limits);
+    defer book.deinit(&ingress);
+    const pubkey = [_]u8{4} ** 33;
+    const now_ns: i64 = 100;
+
+    for (0..24) |index| {
+        const lane = if (index < 16) endpoint(20) else if (index < 21) endpoint(21) else endpoint(22);
+        const expired = index < 12 or (index >= 16 and index < 21);
+        try book.queue(try .init(
+            .api,
+            lane,
+            &pubkey,
+            try message.ReqId.fromSlice(&.{@intCast(index)}),
+            .ping,
+            &.{},
+            &.{1},
+            if (expired) now_ns else now_ns + 1,
+        ));
+    }
+
+    var removed = [_]bool{false} ** 24;
+    var removed_count: usize = 0;
+    var scan = book_mod.RequestBook.QueuedScan{};
+    var keys: [config_mod.MAX_QUEUED_PER_ENDPOINT]types.RequestKey = undefined;
+    while (!scan.done) {
+        const count = book.collectExpiredQueuedBatch(&keys, now_ns, &scan);
+        for (keys[0..count]) |key| {
+            const queued = book.takeQueued(key) orelse return error.MissingExpiredQueuedRequest;
+            const index = queued.req_id.slice()[0];
+            try std.testing.expect(!removed[index]);
+            removed[index] = true;
+            removed_count += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 17), removed_count);
+    try std.testing.expectEqual(@as(usize, 7), book.queuedCount());
+    for (removed, 0..) |was_removed, index| {
+        try std.testing.expectEqual(index < 12 or (index >= 16 and index < 21), was_removed);
+    }
+    for (12..16) |index| {
+        const queued = book.takeQueued(.init(endpoint(20), try message.ReqId.fromSlice(&.{@intCast(index)}))) orelse
+            return error.MissingLiveQueuedRequest;
+        try std.testing.expectEqual(@as(u8, @intCast(index)), queued.req_id.slice()[0]);
+    }
+    for (21..24) |index| {
+        const queued = book.takeQueued(.init(endpoint(22), try message.ReqId.fromSlice(&.{@intCast(index)}))) orelse
+            return error.MissingLiveQueuedRequest;
+        try std.testing.expectEqual(@as(u8, @intCast(index)), queued.req_id.slice()[0]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), book.queuedCount());
+    book.assertInvariants();
+}
+
 test "round robin drain selection reaches lane seventeen while first batch remains" {
     const fair_limits = @import("../config.zig").Limits{
         .max_active_requests = 1,

@@ -20,7 +20,7 @@ const transport = @import("transport.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
-const MAX_LOOKUPS: usize = 1_024;
+pub const MAX_LOOKUPS: usize = 1_024;
 
 const LookupAttempt = struct {
     peer_id: types.NodeId,
