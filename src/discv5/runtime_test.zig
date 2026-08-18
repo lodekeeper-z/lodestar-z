@@ -384,12 +384,13 @@ test "Runtime cancellation drains accepted owned commands and replies" {
     const io = threaded.io();
     const runtime = try initTestRuntime(io, alloc, 0x72, .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 }, .{ .maintenance_interval_ms = 1 });
     defer runtime.deinit();
+    var gate = runtime_mod.Testing.CommandGate{};
+    runtime_mod.Testing.setCommandGate(runtime, &gate);
+    try runtime_mod.Testing.putMaintenance(runtime);
     var reply_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
     var reply = runtime_mod.Testing.BoolReply.init(&reply_buffer);
     const owned = try alloc.dupe(u8, &.{0xff});
     try runtime_mod.Testing.enqueueAddEnr(runtime, owned, &reply);
-    var gate = runtime_mod.Testing.CommandGate{};
-    runtime_mod.Testing.setCommandGate(runtime, &gate);
 
     var run_error: ?anyerror = null;
     var reply_observed: std.atomic.Value(bool) = .init(false);
