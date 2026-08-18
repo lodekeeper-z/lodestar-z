@@ -7,7 +7,6 @@ const events = @import("events.zig");
 const message = @import("protocol/message.zig");
 const metrics = @import("metrics.zig");
 const packet = @import("protocol/packet.zig");
-const command_handler = @import("runtime_command_handler.zig");
 const transport_mod = @import("transport.zig");
 const types = @import("types.zig");
 
@@ -16,8 +15,8 @@ const Io = std.Io;
 const MAX_RECEIVE_ERROR_BACKOFF_MS: u64 = 100;
 pub const Error = @import("runtime_error.zig").Error;
 
-/// Internal implementation behind the opaque `Runtime` handle. Public within
-/// the module so the command handler can name an explicit typed contract.
+/// Internal implementation behind the opaque `Runtime` handle. Exposed for
+/// structural runtime tests.
 pub const RuntimeImpl = struct {
     io: Io,
     allocator: Allocator,
@@ -232,7 +231,7 @@ pub const RuntimeImpl = struct {
     /// Bind the actor execution context from heap-pinned runtime state.
     /// `Runtime.init` allocates RuntimeImpl on the heap, so these interior
     /// pointers are stable for the lifetime of the dispatch.
-    pub fn env(self: *RuntimeImpl) actor_mod.Env {
+    fn actorEnv(self: *RuntimeImpl) actor_mod.Env {
         return .{
             .io = self.io,
             .sender = self.transport.sender(),
@@ -257,7 +256,66 @@ pub const RuntimeImpl = struct {
                 error.Closed => unreachable,
             };
         };
-        return command_handler.handle(self, command);
+        const env = self.actorEnv();
+        switch (command) {
+            .inbound => |value| {
+                var bytes = value.bytes;
+                self.actor.handlePacket(env, bytes.bytes[0..bytes.len], value.from);
+                self.admission.noteProcessed();
+            },
+            .maintenance => {
+                if (self.maintenance_due.swap(false, .acq_rel)) self.actor.maintenance(env);
+            },
+            .add_node => |value| {
+                defer if (value.enr) |bytes| self.allocator.free(bytes);
+                var pubkey = value.pubkey;
+                const result = self.actor.addNode(value.node_id, if (pubkey) |*key| key else null, value.address, value.enr, nowNs(self.io));
+                value.reply.putOneUncancelable(self.io, result) catch {};
+            },
+            .add_enr => |value| {
+                defer self.allocator.free(value.enr);
+                value.reply.putOneUncancelable(self.io, self.actor.addEnr(&self.outbox, value.enr, nowNs(self.io))) catch {};
+            },
+            .set_local_enr => |value| {
+                defer self.allocator.free(value.enr);
+                try replyResult(self.io, value.reply, self.actor.setLocalEnr(env, value.enr));
+            },
+            .send_ping => |value| try replyResult(self.io, value.reply, self.actor.sendPing(env, value.endpoint, &value.pubkey, value.enr_seq, .api)),
+            .send_findnode => |value| try replyResult(self.io, value.reply, self.actor.sendFindNode(env, value.endpoint, &value.pubkey, value.distances[0..value.distances_len], .api)),
+            .send_talk_request => |value| {
+                defer self.allocator.free(value.protocol_name);
+                defer self.allocator.free(value.request);
+                try replyResult(self.io, value.reply, self.actor.sendTalkRequest(env, value.endpoint, &value.pubkey, value.protocol_name, value.request));
+            },
+            .send_talk_response => |value| {
+                defer self.allocator.free(value.response);
+                try replyResult(self.io, value.reply, self.actor.sendTalkResponse(env, value.endpoint, value.req_id, value.response));
+            },
+            .cancel_request => |value| value.reply.putOneUncancelable(
+                self.io,
+                self.actor.cancelRequest(env, value.key),
+            ) catch {},
+            .start_lookup => |value| try replyResult(self.io, value.reply, self.actor.startLookup(env, value.target)),
+            .start_random_lookup => |reply| {
+                var target: types.NodeId = undefined;
+                self.io.random(&target);
+                try replyResult(self.io, reply, self.actor.startLookup(env, target));
+            },
+            .metrics_snapshot => |reply| {
+                var snapshot = self.actor.metricsSnapshot(nowNs(self.io));
+                const admission = self.admission.snapshot();
+                snapshot.rate_limit_hit_ip = admission.rate_limit_hit_ip_total;
+                snapshot.rate_limit_hit_total = admission.rate_limit_hit_total;
+                snapshot.received_packet_count = admission.received_total;
+                snapshot.filtered_packet_count = admission.filtered_total;
+                snapshot.processed_packet_count = admission.processed_total;
+                snapshot.dropped_event_count = self.outbox.droppedCount();
+                reply.putOneUncancelable(self.io, snapshot) catch {};
+            },
+            .local_enr => |reply| reply.putOneUncancelable(self.io, self.actor.localEnr()) catch {},
+            .peer_enr => |value| value.reply.putOneUncancelable(self.io, self.actor.peerEnr(&value.node_id)) catch {},
+            .local_enr_seq => |reply| reply.putOneUncancelable(self.io, self.actor.localEnrSeq()) catch {},
+        }
     }
 
     fn receiveLoop(self: *RuntimeImpl, family: types.Address.Family) Io.Cancelable!void {
@@ -310,6 +368,15 @@ pub const RuntimeImpl = struct {
         };
     }
 };
+
+fn replyResult(io: std.Io, reply: anytype, result: anytype) std.Io.Cancelable!void {
+    reply.putOneUncancelable(io, result) catch {};
+    if (result) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
+}
+
+fn nowNs(io: std.Io) i64 {
+    return @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+}
 
 pub const Runtime = opaque {
     pub fn init(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) Error!*Runtime {
