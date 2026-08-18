@@ -169,21 +169,28 @@ fn pruneLookups(actor: *Actor, outbox: *events.EventOutbox, now_ns: i64) void {
 
 fn pingDue(actor: *Actor, env: Env, now_ns: i64) void {
     if (actor.ping_interval_ms == 0) return;
-    var entries: [kbucket.K]kbucket.Entry = undefined;
     for (actor.peers.routing.buckets) |*bucket| {
-        const count = bucket.count;
-        @memcpy(entries[0..count], bucket.entries[0..count]);
-        for (entries[0..count]) |entry| {
+        var snapshots: [kbucket.K]actor_mod.ProbeSnapshot = undefined;
+        var count: usize = 0;
+        for (bucket.entries[0..bucket.count]) |entry| {
             if (entry.status != .connected or entry.health_request != null or entry.next_ping_at_ns > now_ns) continue;
             const known = actor.peers.known(&entry.node_id) orelse continue;
+            std.debug.assert(count < snapshots.len);
+            snapshots[count] = .{
+                .endpoint = .{ .node_id = entry.node_id, .addr = entry.addr },
+                .pubkey = known.pubkey,
+            };
+            count += 1;
+        }
+        for (snapshots[0..count]) |*snapshot| {
             _ = actor.sendProbe(
                 env,
-                .{ .node_id = entry.node_id, .addr = entry.addr },
-                &known.pubkey,
+                snapshot.endpoint,
+                &snapshot.pubkey,
                 .health,
                 .connected_only,
             ) catch continue;
-            if (actor.peers.routing.getEntryMutWithPending(&entry.node_id)) |current| {
+            if (actor.peers.routing.getEntryMutWithPending(&snapshot.endpoint.node_id)) |current| {
                 current.next_ping_at_ns = outbound.deadlineNs(now_ns, actor.ping_interval_ms);
             }
         }

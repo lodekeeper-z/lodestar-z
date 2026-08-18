@@ -474,6 +474,54 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
     }
 }
 
+test "maintenance schedules the next health probe only after a successful send" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x59} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const local_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9059 } };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = local_address },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .ping_interval_ms = 60_000,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x5a} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 90 }, .port = 10_059 } };
+    try std.testing.expect(actor.peers.routing.insert(.{
+        .node_id = remote_id,
+        .pubkey = remote_pubkey,
+        .addr = remote_address,
+        .last_seen = outbound.nowNs(io),
+        .status = .connected,
+    }));
+
+    harness.recording.fail_next = true;
+    actor.maintenance(harness.env());
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+
+    actor.maintenance(harness.env());
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    const health_request = actor.peers.routing.getEntry(&remote_id).?.health_request orelse
+        return error.MissingHealthRequest;
+    try std.testing.expect(actor.cancelRequest(harness.env(), health_request));
+
+    actor.maintenance(harness.env());
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+}
+
 test "NODES total is exact bounded consistent and controls final permit release" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;

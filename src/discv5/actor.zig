@@ -39,6 +39,11 @@ pub const Env = struct {
     outbox: *events.EventOutbox,
 };
 
+pub const ProbeSnapshot = struct {
+    endpoint: types.Endpoint,
+    pubkey: [33]u8,
+};
+
 pub const Actor = struct {
     alloc: Allocator,
     local_key_pair: @import("secp256k1.zig").KeyPair,
@@ -549,15 +554,20 @@ pub const Actor = struct {
 
     fn pingAll(self: *Actor, env: Env) void {
         for (self.peers.routing.buckets) |*bucket| {
-            var snapshot: [kbucket.K]kbucket.Entry = undefined;
-            const count = bucket.count;
-            std.debug.assert(count <= snapshot.len);
-            @memcpy(snapshot[0..count], bucket.entries[0..count]);
-            for (snapshot[0..count]) |entry| {
+            var snapshots: [kbucket.K]ProbeSnapshot = undefined;
+            var count: usize = 0;
+            for (bucket.entries[0..bucket.count]) |entry| {
                 if (entry.status != .connected or entry.health_request != null) continue;
                 const known = self.peers.known(&entry.node_id) orelse continue;
-                const endpoint = types.Endpoint{ .node_id = entry.node_id, .addr = entry.addr };
-                _ = self.sendProbe(env, endpoint, &known.pubkey, .health, .connected_only) catch continue;
+                std.debug.assert(count < snapshots.len);
+                snapshots[count] = .{
+                    .endpoint = .{ .node_id = entry.node_id, .addr = entry.addr },
+                    .pubkey = known.pubkey,
+                };
+                count += 1;
+            }
+            for (snapshots[0..count]) |*snapshot| {
+                _ = self.sendProbe(env, snapshot.endpoint, &snapshot.pubkey, .health, .connected_only) catch continue;
             }
         }
     }
