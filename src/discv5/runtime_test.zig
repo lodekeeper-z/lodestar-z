@@ -181,12 +181,10 @@ const CancellationObserver = struct {
 const CancelTransportContext = struct {
     io: std.Io,
     group: *std.Io.Group,
-    entered: std.atomic.Value(bool) = .init(false),
     completed: std.atomic.Value(bool) = .init(false),
 };
 
 fn cancelTransportTask(context: *CancelTransportContext) void {
-    context.entered.store(true, .release);
     context.group.cancel(context.io);
     context.completed.store(true, .release);
 }
@@ -411,13 +409,16 @@ test "Runtime cancellation drains accepted owned commands and replies" {
         if (caller_group_started) caller_group.await(io) catch {};
     }
     try caller_group.concurrent(io, awaitBoolReply, .{ io, &reply, &reply_observed });
+    var observer: CancellationObserver = undefined;
+    observer.init(io);
+    try caller_group.concurrent(io, CancellationObserver.wait, .{&observer});
     for (0..10_000) |_| {
         if (runtime.isRunning() and gate.entered.load(.acquire)) break;
         try std.Thread.yield();
     } else return error.RuntimeDidNotEnter;
     var cancel_context = CancelTransportContext{ .io = io, .group = &caller_group };
     cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
-    try awaitFlag(&cancel_context.entered, error.CancellationDidNotStart);
+    try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
     gate.proceed.store(true, .release);
     cancel_thread.?.join();
     cancel_thread_joined = true;
