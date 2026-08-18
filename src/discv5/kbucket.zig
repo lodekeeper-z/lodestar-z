@@ -320,12 +320,6 @@ pub const RoutingTable = struct {
         return self.buckets[dist].getMutWithPending(node_id);
     }
 
-    pub fn prunePending(self: *RoutingTable, now_ns: i64, timeout_ms: u64) void {
-        for (self.buckets) |*bucket| {
-            _ = bucket.applyPendingIfExpired(now_ns, timeout_ms);
-        }
-    }
-
     pub fn findClosest(self: *const RoutingTable, target: *const NodeId, comptime n: usize, out: *[n]Entry) usize {
         var count: usize = 0;
         if (n == 0) return 0;

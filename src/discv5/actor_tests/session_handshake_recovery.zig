@@ -633,7 +633,7 @@ test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
         .initiator_key = [_]u8{0x31} ** 16,
         .recipient_key = [_]u8{0x32} ** 16,
     };
-    const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+    const now_ns = outbound.nowNs(io);
     actor.sessions.put(endpoint, stable, now_ns);
 
     const req_a = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);

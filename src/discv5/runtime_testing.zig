@@ -4,7 +4,7 @@ const runtime_error = @import("runtime_error.zig");
 const transport = @import("transport.zig");
 const types = @import("types.zig");
 
-pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime receive_backoff: anytype) type {
+pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdown: anytype, comptime receive_backoff: anytype) type {
     return if (@import("builtin").is_test) struct {
         pub const CommandGate = struct {
             entered: std.atomic.Value(bool) = .init(false),
@@ -32,7 +32,9 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime receiv
         pub const PingReply = std.Io.Queue(PingResult);
 
         pub fn actorLoop(runtime: *Runtime) std.Io.Cancelable!void {
-            return impl(runtime).actorLoopForTesting();
+            const storage = impl(runtime);
+            defer shutdown(storage);
+            return storage.actorLoop();
         }
 
         pub fn enqueueAddEnr(runtime: *Runtime, bytes: []u8, reply: *EnrAdmissionReply) !void {

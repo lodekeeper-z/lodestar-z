@@ -9,27 +9,26 @@ const metrics = @import("metrics.zig");
 const packet = @import("protocol/packet.zig");
 const transport_mod = @import("transport.zig");
 const types = @import("types.zig");
+const util = @import("util.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const MAX_RECEIVE_ERROR_BACKOFF_MS: u64 = 100;
 const runtime_error = @import("runtime_error.zig");
-pub const InitError = runtime_error.InitError;
-pub const RunError = runtime_error.RunError;
-pub const EventError = runtime_error.EventError;
-pub const CommandError = runtime_error.CommandError;
-pub const EnrAdmissionError = runtime_error.EnrAdmissionError;
-pub const SetLocalEnrError = runtime_error.SetLocalEnrError;
-pub const RequestError = runtime_error.RequestError;
-pub const FindNodeError = runtime_error.FindNodeError;
-pub const TalkRequestError = runtime_error.TalkRequestError;
-pub const TalkResponseError = runtime_error.TalkResponseError;
-pub const LookupError = runtime_error.LookupError;
+const InitError = runtime_error.InitError;
+const RunError = runtime_error.RunError;
+const EventError = runtime_error.EventError;
+const CommandError = runtime_error.CommandError;
+const EnrAdmissionError = runtime_error.EnrAdmissionError;
+const SetLocalEnrError = runtime_error.SetLocalEnrError;
+const RequestError = runtime_error.RequestError;
+const FindNodeError = runtime_error.FindNodeError;
+const TalkRequestError = runtime_error.TalkRequestError;
+const TalkResponseError = runtime_error.TalkResponseError;
+const LookupError = runtime_error.LookupError;
 pub const Error = runtime_error.Error;
 
-/// Internal implementation behind the opaque `Runtime` handle. Exposed for
-/// structural runtime tests.
-pub const RuntimeImpl = struct {
+const RuntimeImpl = struct {
     io: Io,
     allocator: Allocator,
     transport: transport_mod.Transport,
@@ -97,7 +96,7 @@ pub const RuntimeImpl = struct {
         reply: *FindNodeReply,
     };
 
-    pub const Command = union(enum) {
+    const Command = union(enum) {
         inbound: Inbound,
         maintenance,
         add_node: AddNode,
@@ -216,7 +215,7 @@ pub const RuntimeImpl = struct {
         self.command_queue.close(self.io);
     }
 
-    pub fn shutdown(self: *RuntimeImpl) void {
+    fn shutdown(self: *RuntimeImpl) void {
         self.stop();
         self.drainAcceptedCommands();
         self.group.cancel(self.io);
@@ -262,11 +261,6 @@ pub const RuntimeImpl = struct {
             };
             try self.handleCommand(command);
         }
-    }
-
-    pub fn actorLoopForTesting(self: *RuntimeImpl) Io.Cancelable!void {
-        defer self.shutdown();
-        return self.actorLoop();
     }
 
     fn drainAcceptedCommands(self: *RuntimeImpl) void {
@@ -323,12 +317,12 @@ pub const RuntimeImpl = struct {
             .add_node => |value| {
                 defer if (value.enr) |bytes| self.allocator.free(bytes);
                 var pubkey = value.pubkey;
-                const result = self.actor.addNode(value.node_id, if (pubkey) |*key| key else null, value.address, value.enr, nowNs(self.io));
+                const result = self.actor.addNode(value.node_id, if (pubkey) |*key| key else null, value.address, value.enr, util.nowNs(self.io));
                 value.reply.putOneUncancelable(self.io, result) catch {};
             },
             .add_enr => |value| {
                 defer self.allocator.free(value.enr);
-                value.reply.putOneUncancelable(self.io, self.actor.addEnr(&self.outbox, value.enr, nowNs(self.io))) catch {};
+                value.reply.putOneUncancelable(self.io, self.actor.addEnr(&self.outbox, value.enr, util.nowNs(self.io))) catch {};
             },
             .set_local_enr => |value| {
                 defer self.allocator.free(value.enr);
@@ -356,7 +350,7 @@ pub const RuntimeImpl = struct {
                 try replyResult(self.io, reply, startLookupResult(&self.actor, env, target));
             },
             .metrics_snapshot => |reply| {
-                var snapshot = self.actor.metricsSnapshot(nowNs(self.io));
+                var snapshot = self.actor.metricsSnapshot(util.nowNs(self.io));
                 const admission = self.admission.snapshot();
                 snapshot.rate_limit_hit_ip = admission.rate_limit_hit_ip_total;
                 snapshot.rate_limit_hit_total = admission.rate_limit_hit_total;
@@ -392,7 +386,7 @@ pub const RuntimeImpl = struct {
                 },
             };
             consecutive_errors = 0;
-            if (!self.admission.accept(received.from, nowMs(self.io))) continue;
+            if (!self.admission.accept(received.from, util.nowMs(self.io))) continue;
             const bytes = types.PacketBytes.init(received.data) catch continue;
             self.enqueueCommand(.{ .inbound = .{ .from = received.from, .bytes = bytes } }) catch |err| switch (err) {
                 error.CommandQueueFull => continue,
@@ -591,10 +585,6 @@ fn startLookupResult(actor: *actor_mod.Actor, env: actor_mod.Env, target: types.
 fn replyResult(io: std.Io, reply: anytype, result: anytype) std.Io.Cancelable!void {
     reply.putOneUncancelable(io, result) catch {};
     if (result) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
-}
-
-fn nowNs(io: std.Io) i64 {
-    return @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
 }
 
 pub const Runtime = opaque {
@@ -846,14 +836,9 @@ pub const Runtime = opaque {
     }
 };
 
-fn nowMs(io: Io) u64 {
-    const value = Io.Timestamp.now(io, .real).toMilliseconds();
-    return if (value < 0) 0 else @intCast(value);
-}
-
 fn receiveErrorBackoffMs(consecutive_errors: u8) u64 {
     const shift: u3 = @intCast(@min(consecutive_errors -| 1, 7));
     return @min(@as(u64, 1) << shift, MAX_RECEIVE_ERROR_BACKOFF_MS);
 }
 
-pub const Testing = @import("runtime_testing.zig").Hooks(Runtime, RuntimeImpl, receiveErrorBackoffMs);
+pub const Testing = @import("runtime_testing.zig").Hooks(Runtime, RuntimeImpl, RuntimeImpl.shutdown, receiveErrorBackoffMs);

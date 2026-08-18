@@ -5,6 +5,7 @@ const metrics = @import("../metrics.zig");
 const packet = @import("../protocol/packet.zig");
 const request_book = @import("../state/request_book.zig");
 const types = @import("../types.zig");
+const util = @import("../util.zig");
 
 const Actor = actor_mod.Actor;
 const Env = actor_mod.Env;
@@ -178,11 +179,5 @@ pub fn noteSentRequest(actor: *Actor, kind: types.RequestKind) void {
     });
 }
 
-pub fn nowNs(io: std.Io) i64 {
-    return @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
-}
-
-pub fn deadlineNs(now_ns: i64, timeout_ms: u64) i64 {
-    const deadline = @as(i128, now_ns) + @as(i128, timeout_ms) * std.time.ns_per_ms;
-    return if (deadline > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(deadline);
-}
+pub const nowNs = util.nowNs;
+pub const deadlineNs = util.deadlineNs;

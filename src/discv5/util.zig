@@ -4,7 +4,6 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const Address = net.IpAddress;
-const NodeId = @import("enr.zig").NodeId;
 
 /// Bind a UDP (datagram) socket to `address`, restricting IPv6 sockets to v6-only.
 pub fn bindDatagramSocket(io: Io, address: Address) !net.Socket {
@@ -17,11 +16,6 @@ pub fn bindDatagramSocket(io: Io, address: Address) !net.Socket {
     });
 }
 
-/// First 4 bytes of a node id as lowercase hex, for compact logging.
-pub fn shortNodeId(node_id: *const NodeId) [8]u8 {
-    return std.fmt.bytesToHex(node_id[0..4].*, .lower);
-}
-
 /// Current real-clock time in nanoseconds.
 pub fn nowNs(io: Io) i64 {
     return @intCast(Io.Timestamp.now(io, .real).toNanoseconds());
@@ -31,4 +25,9 @@ pub fn nowNs(io: Io) i64 {
 pub fn nowMs(io: Io) u64 {
     const ms = Io.Timestamp.now(io, .real).toMilliseconds();
     return if (ms < 0) 0 else @intCast(ms);
+}
+
+pub fn deadlineNs(now_ns: i64, timeout_ms: u64) i64 {
+    const deadline = @as(i128, now_ns) + @as(i128, timeout_ms) * std.time.ns_per_ms;
+    return if (deadline > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(deadline);
 }

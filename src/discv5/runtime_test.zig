@@ -375,10 +375,6 @@ test "actor cancellation closes command intake before draining" {
     try std.testing.expectError(error.Closed, runtime_mod.Testing.putMaintenance(runtime));
 }
 
-test "Runtime has one authoritative shutdown cleanup path" {
-    try std.testing.expect(@hasDecl(runtime_mod.RuntimeImpl, "shutdown"));
-}
-
 test "Runtime cancellation drains accepted owned commands and replies" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -712,23 +708,23 @@ fn expectErrorSet(comptime function: anytype, comptime expected: type) void {
 
 test "public Runtime APIs expose exact operation error contracts" {
     comptime {
-        expectErrorSet(runtime_mod.Runtime.init, runtime_mod.InitError);
-        expectErrorSet(runtime_mod.Runtime.run, runtime_mod.RunError);
-        expectErrorSet(runtime_mod.Runtime.nextEvent, runtime_mod.EventError);
-        expectErrorSet(runtime_mod.Runtime.addNode, runtime_mod.EnrAdmissionError);
-        expectErrorSet(runtime_mod.Runtime.addEnr, runtime_mod.EnrAdmissionError);
-        expectErrorSet(runtime_mod.Runtime.setLocalEnr, runtime_mod.SetLocalEnrError);
-        expectErrorSet(runtime_mod.Runtime.sendPing, runtime_mod.RequestError);
-        expectErrorSet(runtime_mod.Runtime.sendFindNode, runtime_mod.FindNodeError);
-        expectErrorSet(runtime_mod.Runtime.sendTalkRequest, runtime_mod.TalkRequestError);
-        expectErrorSet(runtime_mod.Runtime.sendTalkResponse, runtime_mod.TalkResponseError);
-        expectErrorSet(runtime_mod.Runtime.startLookup, runtime_mod.LookupError);
-        expectErrorSet(runtime_mod.Runtime.cancelRequest, runtime_mod.CommandError);
-        expectErrorSet(runtime_mod.Runtime.startRandomLookup, runtime_mod.LookupError);
-        expectErrorSet(runtime_mod.Runtime.metricsSnapshot, runtime_mod.CommandError);
-        expectErrorSet(runtime_mod.Runtime.localEnr, runtime_mod.CommandError);
-        expectErrorSet(runtime_mod.Runtime.peerEnr, runtime_mod.CommandError);
-        expectErrorSet(runtime_mod.Runtime.localEnrSeq, runtime_mod.CommandError);
+        expectErrorSet(runtime_mod.Runtime.init, runtime_mod.Runtime.InitError);
+        expectErrorSet(runtime_mod.Runtime.run, runtime_mod.Runtime.RunError);
+        expectErrorSet(runtime_mod.Runtime.nextEvent, runtime_mod.Runtime.EventError);
+        expectErrorSet(runtime_mod.Runtime.addNode, runtime_mod.Runtime.EnrAdmissionError);
+        expectErrorSet(runtime_mod.Runtime.addEnr, runtime_mod.Runtime.EnrAdmissionError);
+        expectErrorSet(runtime_mod.Runtime.setLocalEnr, runtime_mod.Runtime.SetLocalEnrError);
+        expectErrorSet(runtime_mod.Runtime.sendPing, runtime_mod.Runtime.RequestError);
+        expectErrorSet(runtime_mod.Runtime.sendFindNode, runtime_mod.Runtime.FindNodeError);
+        expectErrorSet(runtime_mod.Runtime.sendTalkRequest, runtime_mod.Runtime.TalkRequestError);
+        expectErrorSet(runtime_mod.Runtime.sendTalkResponse, runtime_mod.Runtime.TalkResponseError);
+        expectErrorSet(runtime_mod.Runtime.startLookup, runtime_mod.Runtime.LookupError);
+        expectErrorSet(runtime_mod.Runtime.cancelRequest, runtime_mod.Runtime.CommandError);
+        expectErrorSet(runtime_mod.Runtime.startRandomLookup, runtime_mod.Runtime.LookupError);
+        expectErrorSet(runtime_mod.Runtime.metricsSnapshot, runtime_mod.Runtime.CommandError);
+        expectErrorSet(runtime_mod.Runtime.localEnr, runtime_mod.Runtime.CommandError);
+        expectErrorSet(runtime_mod.Runtime.peerEnr, runtime_mod.Runtime.CommandError);
+        expectErrorSet(runtime_mod.Runtime.localEnrSeq, runtime_mod.Runtime.CommandError);
     }
 }
 

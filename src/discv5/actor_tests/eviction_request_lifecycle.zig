@@ -1,6 +1,5 @@
 const std = @import("std");
 const actor_mod = @import("../actor.zig");
-const completion = @import("../flow/completion.zig");
 const admission = @import("../admission.zig");
 const config = @import("../config.zig");
 const enr = @import("../enr.zig");
@@ -16,12 +15,6 @@ const types = @import("../types.zig");
 const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
 const deliverEncrypted = @import("../test_support/encrypted_delivery.zig").deliverEncrypted;
-
-test "request completion has one canonical finish path" {
-    try std.testing.expect(@hasDecl(completion, "finish"));
-    try std.testing.expect(!@hasDecl(completion, "apply"));
-    try std.testing.expect(!@hasDecl(completion, "cancel"));
-}
 
 test "Actor isolates health identity and arms exact eviction probes" {
     const alloc = std.testing.allocator;

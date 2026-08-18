@@ -1,4 +1,5 @@
 const std = @import("std");
+const util = @import("util.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Error = Allocator.Error || error{
@@ -101,7 +102,7 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
                 const removed = Entry{ .key = node.key, .value = node.value };
                 node.key = key;
                 node.value = value;
-                node.expires_at_ns = expiresAt(now_ns, ttl_ms);
+                node.expires_at_ns = util.deadlineNs(now_ns, ttl_ms);
                 self.moveToFront(index);
                 return removed;
             }
@@ -116,7 +117,7 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             self.nodes[index] = .{
                 .key = key,
                 .value = value,
-                .expires_at_ns = expiresAt(now_ns, ttl_ms),
+                .expires_at_ns = util.deadlineNs(now_ns, ttl_ms),
             };
             self.linkFront(index);
             self.map.putAssumeCapacityNoClobber(key, index);
@@ -276,11 +277,6 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
 
 pub fn LruCache(comptime K: type, comptime V: type) type {
     return LruCacheWithContext(K, V, std.hash_map.AutoContext(K));
-}
-
-fn expiresAt(now_ns: i64, ttl_ms: u64) i64 {
-    const expires_at = @as(i128, now_ns) + @as(i128, ttl_ms) * std.time.ns_per_ms;
-    return if (expires_at > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(expires_at);
 }
 
 test "lru rejects zero capacity" {
