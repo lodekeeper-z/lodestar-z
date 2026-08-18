@@ -242,7 +242,7 @@ pub const PeerBook = struct {
         }
         const pending_before = bucket.pending;
         _ = bucket.remove(&key.endpoint.node_id);
-        const pending = pending_before orelse return null;
+        const pending = (pending_before orelse return null).entry;
         if (bucket.pending != null or pending.status != .connected) return null;
         if (bucket.get(&pending.node_id) == null) return null;
         self.forgetRepresentedContact(&pending.node_id);
@@ -274,7 +274,7 @@ pub const PeerBook = struct {
     pub fn prune(self: *PeerBook, now_ns: i64, timeout_ms: u64, transitions: []ConnectionEvent) usize {
         var count: usize = 0;
         for (self.routing.buckets) |*bucket| {
-            const pending = bucket.pending orelse continue;
+            const pending = (bucket.pending orelse continue).entry;
             if (!bucket.applyPendingIfExpired(now_ns, timeout_ms)) continue;
             self.forgetRepresentedContact(&pending.node_id);
             if (pending.status != .connected) continue;

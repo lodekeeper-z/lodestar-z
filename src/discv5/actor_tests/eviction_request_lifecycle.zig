@@ -364,7 +364,7 @@ test "real eviction probe send failure rolls back reservation and bucket state" 
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id).?.health_request == null);
     try std.testing.expect(harness.bucket().pending != null);
-    try std.testing.expectEqualSlices(u8, &harness.pending_id, &harness.bucket().pending.?.node_id);
+    try std.testing.expectEqualSlices(u8, &harness.pending_id, &harness.bucket().pending.?.entry.node_id);
     harness.actor.requests.assertInvariants();
 }
 

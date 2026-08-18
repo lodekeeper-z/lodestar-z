@@ -103,7 +103,7 @@ test "kbucket: full bucket stores pending connected entry until timeout" {
     });
     try std.testing.expect(!inserted);
     try std.testing.expect(bucket.pending != null);
-    try std.testing.expectEqualDeep([_]u8{0xff} ** 32, bucket.pending.?.node_id);
+    try std.testing.expectEqualDeep([_]u8{0xff} ** 32, bucket.pending.?.entry.node_id);
 
     try std.testing.expect(bucket.applyPendingIfExpired(std.time.ns_per_ms * 2, 1));
     try std.testing.expect(bucket.pending == null);
@@ -182,7 +182,7 @@ test "kbucket: refreshing the pending node preserves the original eviction deadl
         .status = .connected,
     }));
     try std.testing.expect(bucket.pending != null);
-    try std.testing.expectEqual(t0, bucket.pending_inserted_at_ns);
+    try std.testing.expectEqual(t0, bucket.pending.?.inserted_at_ns);
 
     // Authenticated traffic repeatedly refreshes the pending peer's record
     // just before every expiry; the fixed insertion deadline must not move.
@@ -195,8 +195,8 @@ test "kbucket: refreshing the pending node preserves the original eviction deadl
             .last_seen = refresh_time,
             .status = .connected,
         }));
-        try std.testing.expectEqual(t0, bucket.pending_inserted_at_ns);
-        try std.testing.expectEqual(refresh_time, bucket.pending.?.last_seen);
+        try std.testing.expectEqual(t0, bucket.pending.?.inserted_at_ns);
+        try std.testing.expectEqual(refresh_time, bucket.pending.?.entry.last_seen);
     }
 
     // Resolution still occurs exactly at t0 + timeout.
@@ -214,8 +214,8 @@ test "kbucket: refreshing the pending node preserves the original eviction deadl
         .status = .connected,
     }));
     try std.testing.expect(bucket.pending != null);
-    try std.testing.expectEqualDeep(next_candidate, bucket.pending.?.node_id);
-    try std.testing.expectEqual(t0 + timeout_ns + 1, bucket.pending_inserted_at_ns);
+    try std.testing.expectEqualDeep(next_candidate, bucket.pending.?.entry.node_id);
+    try std.testing.expectEqual(t0 + timeout_ns + 1, bucket.pending.?.inserted_at_ns);
 }
 
 test "kbucket: reconnecting oldest entry clears pending replacement" {

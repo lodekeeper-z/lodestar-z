@@ -53,12 +53,16 @@ pub const InsertOutcome = struct {
     pending_eviction: ?Entry = null,
 };
 
+const PendingReplacement = struct {
+    entry: Entry,
+    inserted_at_ns: i64,
+};
+
 pub const KBucket = struct {
     entries: [K]Entry,
     count: usize,
     first_connected_index: ?usize,
-    pending: ?Entry,
-    pending_inserted_at_ns: i64,
+    pending: ?PendingReplacement,
 
     pub fn init() KBucket {
         return .{
@@ -66,7 +70,6 @@ pub const KBucket = struct {
             .count = 0,
             .first_connected_index = null,
             .pending = null,
-            .pending_inserted_at_ns = 0,
         };
     }
 
@@ -75,13 +78,13 @@ pub const KBucket = struct {
     }
 
     pub fn insertDetailed(self: *KBucket, entry: Entry) InsertOutcome {
-        if (self.pending) |pending| {
-            if (std.mem.eql(u8, &pending.node_id, &entry.node_id)) {
+        if (self.pending) |*pending| {
+            if (std.mem.eql(u8, &pending.entry.node_id, &entry.node_id)) {
                 // Updating the pending node refreshes mutable ENR/session
                 // metadata only. The fixed insertion/probe deadline must not
                 // restart, or a pending peer could hold the bucket's sole
                 // replacement slot indefinitely with periodic traffic.
-                self.pending = entry;
+                pending.entry = entry;
                 return .{ .inserted = true };
             }
         }
@@ -89,7 +92,7 @@ pub const KBucket = struct {
         for (self.entries[0..self.count], 0..) |existing, i| {
             if (!std.mem.eql(u8, &existing.node_id, &entry.node_id)) continue;
             if (i == 0 and entry.status == .connected) {
-                self.clearPending();
+                self.pending = null;
             }
             _ = self.removeAt(i);
             self.insertOrdered(entry);
@@ -104,8 +107,10 @@ pub const KBucket = struct {
         if (entry.status == .connected or entry.status == .pending) {
             if (self.first_connected_index != 0 and self.pending == null) {
                 const pending_eviction = self.entries[0];
-                self.pending = entry;
-                self.pending_inserted_at_ns = entry.last_seen;
+                self.pending = .{
+                    .entry = entry,
+                    .inserted_at_ns = entry.last_seen,
+                };
                 return .{ .inserted = false, .pending_eviction = pending_eviction };
             }
         }
@@ -115,8 +120,8 @@ pub const KBucket = struct {
 
     pub fn remove(self: *KBucket, node_id: *const NodeId) bool {
         if (self.pending) |pending| {
-            if (std.mem.eql(u8, &pending.node_id, node_id)) {
-                self.clearPending();
+            if (std.mem.eql(u8, &pending.entry.node_id, node_id)) {
+                self.pending = null;
                 return true;
             }
         }
@@ -140,7 +145,7 @@ pub const KBucket = struct {
     pub fn getWithPending(self: *const KBucket, node_id: *const NodeId) ?*const Entry {
         if (self.get(node_id)) |entry| return entry;
         if (self.pending) |*pending| {
-            if (std.mem.eql(u8, &pending.node_id, node_id)) return pending;
+            if (std.mem.eql(u8, &pending.entry.node_id, node_id)) return &pending.entry;
         }
         return null;
     }
@@ -153,21 +158,21 @@ pub const KBucket = struct {
             if (std.mem.eql(u8, &entry.node_id, node_id)) return entry;
         }
         if (self.pending) |*pending| {
-            if (std.mem.eql(u8, &pending.node_id, node_id)) return pending;
+            if (std.mem.eql(u8, &pending.entry.node_id, node_id)) return &pending.entry;
         }
         return null;
     }
 
     pub fn applyPendingIfExpired(self: *KBucket, now_ns: i64, timeout_ms: u64) bool {
         const pending = self.pending orelse return false;
-        const elapsed_ns: i128 = @as(i128, now_ns) - @as(i128, self.pending_inserted_at_ns);
+        const elapsed_ns: i128 = @as(i128, now_ns) - @as(i128, pending.inserted_at_ns);
         const timeout_ns: i128 = @as(i128, timeout_ms) * std.time.ns_per_ms;
         if (elapsed_ns < timeout_ns) return false;
 
-        self.clearPending();
+        self.pending = null;
 
         if (self.count < K) {
-            self.insertOrdered(pending);
+            self.insertOrdered(pending.entry);
             return true;
         }
 
@@ -176,7 +181,7 @@ pub const KBucket = struct {
         }
 
         _ = self.removeAt(0);
-        self.insertOrdered(pending);
+        self.insertOrdered(pending.entry);
         return true;
     }
 
@@ -185,19 +190,14 @@ pub const KBucket = struct {
     pub fn resolvePendingAgainst(self: *KBucket, candidate_id: *const NodeId) void {
         if (self.pending == null) return;
         const entry = self.get(candidate_id) orelse return;
-        if (entry.status == .connected) self.clearPending();
-    }
-
-    fn clearPending(self: *KBucket) void {
-        self.pending = null;
-        self.pending_inserted_at_ns = 0;
+        if (entry.status == .connected) self.pending = null;
     }
 
     fn maybeInsertPending(self: *KBucket) void {
         if (self.count >= K) return;
         const pending = self.pending orelse return;
-        self.clearPending();
-        self.insertOrdered(pending);
+        self.pending = null;
+        self.insertOrdered(pending.entry);
     }
 
     fn removeAt(self: *KBucket, index: usize) Entry {
