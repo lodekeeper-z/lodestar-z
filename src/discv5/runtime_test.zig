@@ -203,16 +203,32 @@ test "Transport send re-arms consumed runtime cancellation" {
 
     var context = TransportCancellationContext{ .io = io, .transport = &transport };
     var group: std.Io.Group = .init;
+    var group_started = false;
+    var cancel_thread: ?std.Thread = null;
+    var cancel_thread_joined = false;
     try group.concurrent(io, consumeCancellationInTransport, .{&context});
+    group_started = true;
+    defer {
+        context.allow_send.store(true, .release);
+        if (cancel_thread) |thread| {
+            if (!cancel_thread_joined) thread.join();
+        } else if (group_started) {
+            group.cancel(io);
+        }
+        if (group_started) group.await(io) catch {};
+    }
     var observer: CancellationObserver = undefined;
     observer.init(io);
     try group.concurrent(io, CancellationObserver.wait, .{&observer});
     var cancel_context = CancelTransportContext{ .io = io, .group = &group };
-    const cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
+    cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
     try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
     context.allow_send.store(true, .release);
     try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
-    cancel_thread.join();
+    cancel_thread.?.join();
+    cancel_thread_joined = true;
+    try group.await(io);
+    group_started = false;
 
     try std.testing.expectEqual(error.Canceled, context.send_error.?);
     try std.testing.expectEqual(error.Canceled, context.next_error.?);
@@ -250,11 +266,31 @@ test "Runtime send cancellation closes drains joins and releases command state" 
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     }, .{});
+    defer runtime.deinit();
     var gate = transport_mod.Testing.SendGate{};
     runtime_mod.Testing.setSendGate(runtime, &gate);
     var run_error: ?anyerror = null;
     var runtime_group: std.Io.Group = .init;
+    var runtime_group_started = false;
+    var api_group: std.Io.Group = .init;
+    var api_group_started = false;
+    var cancel_thread: ?std.Thread = null;
+    var cancel_thread_joined = false;
     try runtime_group.concurrent(io, runRuntime, .{ runtime, &run_error });
+    runtime_group_started = true;
+    defer {
+        gate.proceed.store(true, .release);
+        if (cancel_thread) |thread| {
+            if (!cancel_thread_joined) thread.join();
+        } else if (runtime_group_started) {
+            runtime_group.cancel(io);
+        }
+        if (api_group_started) {
+            api_group.cancel(io);
+            api_group.await(io) catch {};
+        }
+        if (runtime_group_started) runtime_group.await(io) catch {};
+    }
     var observer: CancellationObserver = undefined;
     observer.init(io);
     try runtime_group.concurrent(io, CancellationObserver.wait, .{&observer});
@@ -269,17 +305,21 @@ test "Runtime send cancellation closes drains joins and releases command state" 
         .remote_pubkey = remote_pubkey,
         .remote_address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9399 } },
     };
-    var api_group: std.Io.Group = .init;
     try api_group.concurrent(io, sendRuntimePing, .{&ping_context});
+    api_group_started = true;
     try awaitFlag(&gate.entered, error.RuntimeDidNotEnter);
 
     var cancel_context = CancelTransportContext{ .io = io, .group = &runtime_group };
-    const cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
+    cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
     try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
     gate.proceed.store(true, .release);
     try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
-    cancel_thread.join();
+    cancel_thread.?.join();
+    cancel_thread_joined = true;
     try api_group.await(io);
+    api_group_started = false;
+    try runtime_group.await(io);
+    runtime_group_started = false;
 
     try std.testing.expectEqual(error.Canceled, ping_context.result_error.?);
     try std.testing.expectEqual(error.Canceled, run_error.?);
@@ -288,7 +328,6 @@ test "Runtime send cancellation closes drains joins and releases command state" 
     const counts = runtime_mod.Testing.activeAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.permits);
-    runtime.deinit();
 }
 
 test "actor cancellation closes command intake before draining" {
@@ -303,19 +342,34 @@ test "actor cancellation closes command intake before draining" {
     try runtime_mod.Testing.putMaintenance(runtime);
     var loop_error: ?anyerror = null;
     var group: std.Io.Group = .init;
+    var group_started = false;
+    var cancel_thread: ?std.Thread = null;
+    var cancel_thread_joined = false;
     try group.concurrent(io, runActorLoop, .{ runtime, &loop_error });
+    group_started = true;
+    defer {
+        gate.proceed.store(true, .release);
+        if (cancel_thread) |thread| {
+            if (!cancel_thread_joined) thread.join();
+        } else if (group_started) {
+            group.cancel(io);
+        }
+        if (group_started) group.await(io) catch {};
+    }
     var observer: CancellationObserver = undefined;
     observer.init(io);
     try group.concurrent(io, CancellationObserver.wait, .{&observer});
     try std.testing.expect(!runtime.isClosed());
     try awaitFlag(&gate.entered, error.RuntimeDidNotEnter);
     var cancel_context = CancelTransportContext{ .io = io, .group = &group };
-    const cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
+    cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
     try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
     gate.proceed.store(true, .release);
     try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
-    cancel_thread.join();
+    cancel_thread.?.join();
+    cancel_thread_joined = true;
     try group.await(io);
+    group_started = false;
     try std.testing.expectEqual(error.Canceled, loop_error.?);
     try std.testing.expect(runtime.isClosed());
     try std.testing.expectError(error.Closed, runtime_mod.Testing.putMaintenance(runtime));
@@ -342,17 +396,33 @@ test "Runtime cancellation drains accepted owned commands and replies" {
     var run_error: ?anyerror = null;
     var reply_observed: std.atomic.Value(bool) = .init(false);
     var caller_group: std.Io.Group = .init;
+    var caller_group_started = false;
+    var cancel_thread: ?std.Thread = null;
+    var cancel_thread_joined = false;
     try caller_group.concurrent(io, runRuntime, .{ runtime, &run_error });
+    caller_group_started = true;
+    defer {
+        gate.proceed.store(true, .release);
+        if (cancel_thread) |thread| {
+            if (!cancel_thread_joined) thread.join();
+        } else if (caller_group_started) {
+            caller_group.cancel(io);
+        }
+        if (caller_group_started) caller_group.await(io) catch {};
+    }
     try caller_group.concurrent(io, awaitBoolReply, .{ io, &reply, &reply_observed });
     for (0..10_000) |_| {
         if (runtime.isRunning() and gate.entered.load(.acquire)) break;
         try std.Thread.yield();
     } else return error.RuntimeDidNotEnter;
     var cancel_context = CancelTransportContext{ .io = io, .group = &caller_group };
-    const cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
+    cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
     try awaitFlag(&cancel_context.entered, error.CancellationDidNotStart);
     gate.proceed.store(true, .release);
-    cancel_thread.join();
+    cancel_thread.?.join();
+    cancel_thread_joined = true;
+    try caller_group.await(io);
+    caller_group_started = false;
     try std.testing.expectEqual(error.Canceled, run_error.?);
     try std.testing.expect(reply_observed.load(.acquire));
     try std.testing.expect(runtime.isClosed());
