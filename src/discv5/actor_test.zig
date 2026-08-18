@@ -16,6 +16,7 @@ const session_book = @import("state/session_book.zig");
 const transport = @import("transport.zig");
 const types = @import("types.zig");
 const ActorHarness = @import("test_support/actor_harness.zig").ActorHarness;
+const PacketLink = @import("test_support/packet_link.zig").PacketLink;
 const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
 
 test "request completion has one canonical finish path" {
@@ -752,6 +753,8 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -773,8 +776,9 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
         0,
         .api,
     );
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
+    try link_b_to_a.dropNext();
     var first_packet = sender_a.datagrams.items[0].bytes;
     const first_nonce = (try packet.decode(first_packet.bytes[0..first_packet.len], &id_b)).static_header.nonce;
 
@@ -784,9 +788,9 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     var retry_packet = sender_a.datagrams.items[1].bytes;
     const retry_nonce = (try packet.decode(retry_packet.bytes[0..retry_packet.len], &id_b)).static_header.nonce;
     try std.testing.expect(!std.mem.eql(u8, &first_nonce, &retry_nonce));
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 2), sender_b.datagrams.items.len);
-    deliver(&sender_b, 1, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
+    try link_b_to_a.deliverNext();
 
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
@@ -847,6 +851,8 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -858,21 +864,22 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
         0,
         .api,
     );
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
+    try link_b_to_a.dropNext();
 
     try std.Io.sleep(io, .fromMilliseconds(2), .awake);
     actor_a.maintenance(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
     try std.testing.expectEqualSlices(u8, sender_a.datagrams.items[0].bytes.slice(), sender_a.datagrams.items[1].bytes.slice());
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 2), sender_b.datagrams.items.len);
     try std.testing.expectEqualSlices(u8, sender_b.datagrams.items[0].bytes.slice(), sender_b.datagrams.items[1].bytes.slice());
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
 
-    deliver(&sender_b, 1, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
-    deliver(&sender_a, 2, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
-    deliver(&sender_b, 2, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
+    try link_b_to_a.deliverNext();
+    try link_a_to_b.deliverNext();
+    try link_b_to_a.deliverNext();
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
@@ -935,6 +942,8 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -950,20 +959,16 @@ test "response recovery keeps stable keys until candidate proof then promotes an
         0,
         .api,
     );
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
     try std.testing.expect(actor_a.sessions.remove(endpoint_b));
-    deliver(&sender_b, 0, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
+    try link_b_to_a.deliverNext();
     try std.testing.expectEqual(@as(usize, 2), sender_a.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 1), actor_b.responses.count());
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
     const wrong_address = types.Address{ .ip4 = .{ .bytes = address_a.ip4.bytes, .port = address_a.ip4.port + 1 } };
-    var retained_challenge = sender_a.datagrams.items[1].bytes;
-    actor_b.handlePacket(
-        .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b },
-        retained_challenge.bytes[0..retained_challenge.len],
-        wrong_address,
-    );
+    const retained_challenge = try link_a_to_b.snapshotNext();
+    try link_a_to_b.replayFrom(retained_challenge, wrong_address);
     var wrong_nonce_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
     const wrong_nonce_challenge = try packet.encodeWhoareyouPacketInto(&wrong_nonce_buffer, .{
         .masking_iv = &([_]u8{0xd1} ** packet.MASKING_IV_SIZE),
@@ -980,7 +985,7 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 1), actor_b.responses.count());
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 2), sender_b.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 1), actor_b.responses.count());
     try std.testing.expectEqual(@as(usize, 0), ingress_b.permitCount());
@@ -1010,7 +1015,7 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     try std.testing.expectEqual(b_to_a, stable_after_old_packet.initiator_key);
     try std.testing.expectEqual(a_to_b, stable_after_old_packet.recipient_key);
 
-    deliver(&sender_b, 1, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
+    try link_b_to_a.deliverNext();
 
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
@@ -1598,6 +1603,8 @@ test "successful handshake records initial probe nonce and replay is inert" {
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, outbound.nowNs(io)));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, outbound.nowNs(io)));
 
@@ -1608,21 +1615,18 @@ test "successful handshake records initial probe nonce and replay is inert" {
         0,
         .api,
     );
-    var original_probe = sender_a.datagrams.items[0].bytes;
+    const original_probe_index = try link_a_to_b.snapshotNext();
+    var original_probe = sender_a.datagrams.items[original_probe_index].bytes;
     const probe_nonce = (try packet.decode(original_probe.bytes[0..original_probe.len], &id_b)).static_header.nonce;
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
-    deliver(&sender_b, 0, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
+    try link_b_to_a.deliverNext();
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 0), actor_b.sessions.challengeCount());
     try std.testing.expectEqual(@as(usize, 2), sender_b.datagrams.items.len);
     const established = actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, outbound.nowNs(io)) orelse return error.MissingEstablishedSession;
     try std.testing.expect(established.seen_nonces.contains(&probe_nonce));
 
-    actor_b.handlePacket(
-        .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b },
-        original_probe.bytes[0..original_probe.len],
-        address_a,
-    );
+    try link_a_to_b.replay(original_probe_index);
     try std.testing.expectEqual(@as(u64, 1), actor_b.metrics.rcvd_message_count[metrics.MessageType.ping.index()]);
     try std.testing.expectEqual(@as(usize, 0), actor_b.sessions.challengeCount());
     try std.testing.expectEqual(@as(usize, 2), sender_b.datagrams.items.len);
@@ -2587,6 +2591,8 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an existing source IP ba
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -2602,12 +2608,12 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an existing source IP ba
         "permit",
         "handshake",
     );
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
     try std.testing.expect(ingress_a.accept(address_b, 1));
-    deliver(&sender_b, 0, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
+    try link_b_to_a.deliverNext();
     try std.testing.expect(ingress_b.accept(address_a, 1));
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
 
     try std.testing.expect(actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, outbound.nowNs(io)) != null);
     try std.testing.expectEqual(@as(usize, 0), ingress_b.permitCount());
@@ -2655,15 +2661,17 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
     const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
 
     const ping_id = try actor_a.sendPing(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
-    deliver(&sender_b, 0, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
-    deliver(&sender_b, 1, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
+    try link_a_to_b.deliverNext();
+    try link_b_to_a.deliverNext();
+    try link_a_to_b.deliverNext();
+    try link_b_to_a.deliverNext();
 
     var pong_event = outbox_a.pop() orelse return error.MissingPongEvent;
     defer pong_event.deinit(alloc);
@@ -2675,7 +2683,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expect(actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, now_ns) != null);
 
     const talk_id = try actor_a.sendTalkRequest(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, "test", "request");
-    deliver(&sender_a, 2, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
     var request_event = outbox_b.pop() orelse return error.MissingTalkRequest;
     defer request_event.deinit(alloc);
     try std.testing.expect(request_event == .talkreq);
@@ -2683,7 +2691,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expectEqualStrings("request", request_event.talkreq.request);
     try std.testing.expectEqualSlices(u8, talk_id.slice(), request_event.talkreq.req_id.slice());
     try actor_b.sendTalkResponse(.{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b }, .{ .node_id = id_a, .addr = address_a }, request_event.talkreq.req_id, "response");
-    deliver(&sender_b, 2, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
+    try link_b_to_a.deliverNext();
     var response_event = outbox_a.pop() orelse return error.MissingTalkResponse;
     defer response_event.deinit(alloc);
     try std.testing.expect(response_event == .talkresp);
@@ -2719,8 +2727,8 @@ test "paired Actors complete handshake PING and TALK request response flows" {
         &.{ distance_c, distance_d },
         .api,
     );
-    deliver(&sender_a, 3, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
-    deliver(&sender_b, 3, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
+    try link_a_to_b.deliverNext();
+    try link_b_to_a.deliverNext();
     var discovered_event = outbox_a.pop() orelse return error.MissingDiscoveredEnr;
     defer discovered_event.deinit(alloc);
     try std.testing.expect(discovered_event == .discovered_enr);
@@ -2777,12 +2785,14 @@ test "strict handshake rejects untrusted contact without endpoint proof" {
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
 
     actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
     _ = try actor_a.sendPing(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
-    deliver(&sender_b, 0, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
+    try link_b_to_a.deliverNext();
+    try link_a_to_b.deliverNext();
 
     try std.testing.expect(actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, outbound.nowNs(io)) == null);
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
@@ -2857,11 +2867,13 @@ fn mismatchedSignedEnrHandshake(allow_unverified: ?bool) !struct { session_insta
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, observed_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, observed_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
 
     _ = try actor_a.sendPing(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, observed_a);
-    deliver(&sender_b, 0, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, observed_a);
+    try link_a_to_b.deliverNext();
+    try link_b_to_a.deliverNext();
+    try link_a_to_b.deliverNext();
 
     var established_event = false;
     while (outbox_b.pop()) |value| {
@@ -2918,6 +2930,8 @@ fn contactHandshakeAccepted(allow_unverified: bool, runtime_contact_trusted: boo
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
 
     if (runtime_contact_trusted) {
         try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, outbound.nowNs(io)));
@@ -2926,23 +2940,9 @@ fn contactHandshakeAccepted(allow_unverified: bool, runtime_contact_trusted: boo
     }
     try std.testing.expectEqual(runtime_contact_trusted, actor_b.peers.known(&id_a).?.runtime_contact_trusted);
     _ = try actor_a.sendPing(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
-    deliver(&sender_a, 0, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
-    deliver(&sender_b, 0, &actor_a, io, sender_a.sender(), &ingress_a, &outbox_a, address_b);
-    deliver(&sender_a, 1, &actor_b, io, sender_b.sender(), &ingress_b, &outbox_b, address_a);
+    try link_a_to_b.deliverNext();
+    try link_b_to_a.deliverNext();
+    try link_a_to_b.deliverNext();
     try std.testing.expectEqual(runtime_contact_trusted, actor_b.peers.known(&id_a).?.runtime_contact_trusted);
     return actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, outbound.nowNs(io)) != null;
-}
-
-fn deliver(
-    source: *const RecordingSender,
-    index: usize,
-    destination: *actor_mod.Actor,
-    io: std.Io,
-    sender: transport.Sender,
-    ingress: *admission.IngressAdmission,
-    outbox: *events.EventOutbox,
-    source_address: @import("types.zig").Address,
-) void {
-    var datagram = source.datagrams.items[index].bytes;
-    destination.handlePacket(.{ .io = io, .sender = sender, .ingress = ingress, .outbox = outbox }, datagram.bytes[0..datagram.len], source_address);
 }
