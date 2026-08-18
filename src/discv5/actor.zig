@@ -270,7 +270,11 @@ pub const Actor = struct {
     }
 
     pub fn maintenance(self: *Actor, env: Env) void {
-        maintenance_flow.run(self, env);
+        self.maintenanceAt(env, outbound.nowNs(env.io));
+    }
+
+    pub fn maintenanceAt(self: *Actor, env: Env, now_real_ns: i64) void {
+        maintenance_flow.run(self, env, now_real_ns);
     }
 
     pub fn cancelRequest(self: *Actor, env: Env, key: types.RequestKey) bool {

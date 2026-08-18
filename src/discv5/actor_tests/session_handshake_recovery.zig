@@ -96,8 +96,15 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     var first_packet = sender_a.datagrams.items[0].bytes;
     const first_nonce = (try packet.decode(first_packet.bytes[0..first_packet.len], &id_b)).static_header.nonce;
 
-    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor_a.maintenance(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
+    const request_key = types.RequestKey.init(.{ .node_id = id_b, .addr = address_b }, req_id);
+    const deadline_ns = actor_a.requests.get(request_key).?.deadline_ns;
+    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a };
+    actor_a.maintenanceAt(env_a, deadline_ns - 1);
+    try std.testing.expectEqual(@as(usize, 1), actor_a.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress_a.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), sender_a.datagrams.items.len);
+    try std.testing.expect(outbox_a.pop() == null);
+    actor_a.maintenanceAt(env_a, deadline_ns);
     try std.testing.expectEqual(@as(usize, 2), sender_a.datagrams.items.len);
     var retry_packet = sender_a.datagrams.items[1].bytes;
     const retry_nonce = (try packet.decode(retry_packet.bytes[0..retry_packet.len], &id_b)).static_header.nonce;
@@ -183,8 +190,8 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
     try link_b_to_a.dropNext();
 
-    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor_a.maintenance(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
+    const deadline_ns = actor_a.requests.get(.init(.{ .node_id = id_b, .addr = address_b }, req_id)).?.deadline_ns;
+    actor_a.maintenanceAt(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, deadline_ns);
     try std.testing.expectEqualSlices(u8, sender_a.datagrams.items[0].bytes.slice(), sender_a.datagrams.items[1].bytes.slice());
     try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 2), sender_b.datagrams.items.len);
@@ -392,8 +399,8 @@ test "failed retry datagram does not increment sent message metrics" {
     const initial_nonce = (try packet.decode(initial.bytes[0..initial.len], &endpoint.node_id)).static_header.nonce;
 
     harness.recording.fail_next = true;
-    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(harness.env());
+    const deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
+    actor.maintenanceAt(harness.env(), deadline_ns);
     try std.testing.expectEqual(@as(u64, 1), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
     const active = actor.requests.get(.init(endpoint, req_id)) orelse return error.MissingRequestAfterRetryFailure;

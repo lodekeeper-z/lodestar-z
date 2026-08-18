@@ -330,10 +330,10 @@ test "real eviction probe timeout removes the exact candidate and promotes pendi
     defer harness.deinit();
 
     harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
-    _ = try harness.expectProbeRequest();
+    const key = try harness.expectProbeRequest();
 
-    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    harness.actor.maintenance(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox });
+    const deadline_ns = harness.actor.requests.get(key).?.deadline_ns;
+    harness.actor.maintenanceAt(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, deadline_ns);
 
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
@@ -401,7 +401,7 @@ test "health and eviction probes never queue behind endpoint establishment" {
     try std.testing.expect(actor.peers.learnEnr(remote_enr, 0) != null);
     _ = actor.peers.markResponsive(remote_id, endpoint.addr, 0, null);
 
-    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
     try std.testing.expectError(error.EndpointBusy, actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .{ .maintenance = .health }));
     actor.probeEviction(harness.env(), actor.peers.routing.getEntry(&remote_id).?.*);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
@@ -410,8 +410,8 @@ test "health and eviction probes never queue behind endpoint establishment" {
     try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
 
-    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(harness.env());
+    const deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
+    actor.maintenanceAt(harness.env(), deadline_ns);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, actor.peers.routing.getEntry(&remote_id).?.status);
@@ -552,6 +552,78 @@ fn decodeSentPing(datagram: *const types.PacketBytes, recipient_id: *const types
     return message.Ping.decode(plaintext);
 }
 
+test "queued request expires exactly at its actor maintenance deadline" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xa1} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xa2} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 62 }, .port = 9062 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .request_timeout_ms = 60_000,
+        .request_retries = 1,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 1,
+            .max_queued_requests = 1,
+            .max_queued_requests_per_endpoint = 1,
+            .event_capacity = 1,
+            .command_capacity = 1,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+
+    const active_req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    const queued_req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 2, .api);
+    const active_key = types.RequestKey.init(endpoint, active_req_id);
+    const queued_key = types.RequestKey.init(endpoint, queued_req_id);
+    const active_deadline_ns = actor.requests.get(active_key).?.deadline_ns;
+    const queued = (actor.requests.lanes.get(endpoint) orelse return error.MissingQueuedLane).queued.first() orelse return error.MissingQueuedRequest;
+    const queued_deadline_ns = queued.deadline_ns;
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, queued_key, .init(queued.endpoint, queued.req_id)));
+    try std.testing.expect(active_deadline_ns <= queued_deadline_ns);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    try std.testing.expect(harness.outbox.pop() == null);
+
+    actor.maintenanceAt(harness.env(), queued_deadline_ns - 1);
+    const queued_before_deadline = (actor.requests.lanes.get(endpoint) orelse return error.MissingQueuedLane).queued.first() orelse return error.QueuedExpiredEarly;
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, queued_key, .init(queued_before_deadline.endpoint, queued_before_deadline.req_id)));
+    try std.testing.expect(actor.requests.get(active_key) != null);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    const datagrams_before_boundary: usize = if (active_deadline_ns < queued_deadline_ns) 2 else 1;
+    try std.testing.expectEqual(datagrams_before_boundary, harness.recording.datagrams.items.len);
+    try std.testing.expect(harness.outbox.pop() == null);
+
+    actor.maintenanceAt(harness.env(), queued_deadline_ns);
+    try std.testing.expect(actor.requests.get(active_key) != null);
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.lanes.get(endpoint).?.queued.len());
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    var timeout_event = harness.outbox.pop() orelse return error.MissingQueuedTimeoutEvent;
+    defer timeout_event.deinit(alloc);
+    try std.testing.expect(timeout_event == .request_timeout);
+    try std.testing.expectEqualSlices(u8, &endpoint.node_id, &timeout_event.request_timeout.peer_id);
+    try std.testing.expectEqualSlices(u8, queued_req_id.slice(), timeout_event.request_timeout.req_id.slice());
+    try std.testing.expectEqual(types.RequestKind.ping, timeout_event.request_timeout.kind);
+    try std.testing.expect(harness.outbox.pop() == null);
+}
+
 test "AdmissionPermit survives retry and releases on final timeout" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -576,19 +648,19 @@ test "AdmissionPermit survives retry and releases on final timeout" {
     defer harness.deinit();
     const actor = &harness.actor;
     actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 }, outbound.nowNs(io));
-    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(u64, 1), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
 
-    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(harness.env());
+    const first_deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
+    actor.maintenanceAt(harness.env(), first_deadline_ns);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(u64, 2), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
 
-    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(harness.env());
+    const retry_deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
+    actor.maintenanceAt(harness.env(), retry_deadline_ns);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     var timeout_event = harness.outbox.pop() orelse return error.MissingTimeoutEvent;
@@ -666,8 +738,8 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     try std.testing.expectEqual(@as(u64, 1), partial.responses_received);
     try std.testing.expectEqual(@as(usize, 1), partial.enrs.items.len);
 
-    try std.Io.sleep(io, .fromMilliseconds(2), .awake);
-    actor.maintenance(harness.env());
+    const deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
+    actor.maintenanceAt(harness.env(), deadline_ns);
     const fresh = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
     try std.testing.expect(fresh.total_responses == null);
     try std.testing.expectEqual(@as(u64, 0), fresh.responses_received);

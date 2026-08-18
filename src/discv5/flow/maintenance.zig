@@ -19,8 +19,7 @@ const RetryState = struct {
     phase: request_book.Phase,
 };
 
-pub fn run(actor: *Actor, env: Env) void {
-    const now_ns = outbound.nowNs(env.io);
+pub fn run(actor: *Actor, env: Env, now_ns: i64) void {
     actor.sessions.pruneChallenges(now_ns, env.ingress);
     actor.responses.prune(now_ns, env.ingress);
     pruneActive(actor, env, now_ns);
