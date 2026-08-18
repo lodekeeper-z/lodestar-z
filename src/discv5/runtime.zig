@@ -33,6 +33,7 @@ pub const RuntimeImpl = struct {
     closed: std.atomic.Value(bool) = .init(false),
     maintenance_due: std.atomic.Value(bool) = .init(false),
     test_command_gate: if (@import("builtin").is_test) ?*Testing.CommandGate else void = if (@import("builtin").is_test) null else {},
+    test_cancellation_gate: if (@import("builtin").is_test) ?*Testing.CancellationGate else void = if (@import("builtin").is_test) null else {},
 
     const ReqResult = Error!message.ReqId;
     const IdResult = Error!u32;
@@ -244,6 +245,17 @@ pub const RuntimeImpl = struct {
         if (@import("builtin").is_test) if (self.test_command_gate) |gate| {
             gate.entered.store(true, .release);
             while (!gate.proceed.load(.acquire)) std.atomic.spinLoopHint();
+        };
+        if (@import("builtin").is_test) if (self.test_cancellation_gate) |gate| {
+            self.test_cancellation_gate = null;
+            gate.entered.store(true, .release);
+            _ = gate.queue.getOne(self.io) catch |err| switch (err) {
+                error.Canceled => {
+                    gate.cancellation_observed.store(true, .release);
+                    return error.Canceled;
+                },
+                error.Closed => unreachable,
+            };
         };
         return command_handler.handle(self, command);
     }

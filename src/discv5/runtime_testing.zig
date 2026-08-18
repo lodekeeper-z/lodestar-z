@@ -9,6 +9,22 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime Runtim
             entered: std.atomic.Value(bool) = .init(false),
             proceed: std.atomic.Value(bool) = .init(false),
         };
+        pub const CancellationGate = struct {
+            queue: std.Io.Queue(u8),
+            buffer: [1]u8 = undefined,
+            entered: std.atomic.Value(bool) = .init(false),
+            cancellation_observed: std.atomic.Value(bool) = .init(false),
+
+            pub fn init(self: *CancellationGate) void {
+                self.* = .{ .queue = undefined };
+                self.queue = .init(&self.buffer);
+            }
+
+            pub fn release(self: *CancellationGate, io: std.Io) void {
+                if (self.cancellation_observed.load(.acquire)) return;
+                self.queue.putOneUncancelable(io, 0) catch unreachable;
+            }
+        };
         pub const BoolResult = RuntimeError!bool;
         pub const BoolReply = std.Io.Queue(BoolResult);
         pub const ReqResult = RuntimeError!message.ReqId;
@@ -43,6 +59,10 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime Runtim
 
         pub fn setCommandGate(runtime: *Runtime, gate: ?*CommandGate) void {
             impl(runtime).test_command_gate = gate;
+        }
+
+        pub fn setCancellationGate(runtime: *Runtime, gate: ?*CancellationGate) void {
+            impl(runtime).test_cancellation_gate = gate;
         }
 
         pub fn setSendGate(runtime: *Runtime, gate: ?*transport.Testing.SendGate) void {

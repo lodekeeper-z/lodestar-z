@@ -384,8 +384,9 @@ test "Runtime cancellation drains accepted owned commands and replies" {
     const io = threaded.io();
     const runtime = try initTestRuntime(io, alloc, 0x72, .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 }, .{ .maintenance_interval_ms = 1 });
     defer runtime.deinit();
-    var gate = runtime_mod.Testing.CommandGate{};
-    runtime_mod.Testing.setCommandGate(runtime, &gate);
+    var gate: runtime_mod.Testing.CancellationGate = undefined;
+    gate.init();
+    runtime_mod.Testing.setCancellationGate(runtime, &gate);
     try runtime_mod.Testing.putMaintenance(runtime);
     var reply_buffer: [1]runtime_mod.Testing.BoolResult = undefined;
     var reply = runtime_mod.Testing.BoolReply.init(&reply_buffer);
@@ -401,7 +402,7 @@ test "Runtime cancellation drains accepted owned commands and replies" {
     try caller_group.concurrent(io, runRuntime, .{ runtime, &run_error });
     caller_group_started = true;
     defer {
-        gate.proceed.store(true, .release);
+        gate.release(io);
         if (cancel_thread) |thread| {
             if (!cancel_thread_joined) thread.join();
         } else if (caller_group_started) {
@@ -410,17 +411,13 @@ test "Runtime cancellation drains accepted owned commands and replies" {
         if (caller_group_started) caller_group.await(io) catch {};
     }
     try caller_group.concurrent(io, awaitBoolReply, .{ io, &reply, &reply_observed });
-    var observer: CancellationObserver = undefined;
-    observer.init(io);
-    try caller_group.concurrent(io, CancellationObserver.wait, .{&observer});
     for (0..10_000) |_| {
         if (runtime.isRunning() and gate.entered.load(.acquire)) break;
         try std.Thread.yield();
     } else return error.RuntimeDidNotEnter;
     var cancel_context = CancelTransportContext{ .io = io, .group = &caller_group };
     cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
-    try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
-    gate.proceed.store(true, .release);
+    try awaitFlag(&gate.cancellation_observed, error.CancellationWasNotObserved);
     cancel_thread.?.join();
     cancel_thread_joined = true;
     try caller_group.await(io);
