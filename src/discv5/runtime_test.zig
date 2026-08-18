@@ -12,6 +12,66 @@ fn runRuntime(runtime: *runtime_mod.Runtime, result: *?anyerror) void {
     };
 }
 
+fn awaitFlag(flag: *const std.atomic.Value(bool), comptime timeout_error: anyerror) !void {
+    for (0..10_000) |_| {
+        if (flag.load(.acquire)) return;
+        try std.Thread.yield();
+    }
+    return timeout_error;
+}
+
+const RunningRuntime = struct {
+    io: std.Io,
+    runtime: ?*runtime_mod.Runtime = null,
+    caller_group: std.Io.Group = .init,
+    run_result: ?anyerror = null,
+    started: bool = false,
+    awaited: bool = false,
+
+    fn init(io: std.Io) RunningRuntime {
+        return .{ .io = io };
+    }
+
+    fn start(self: *RunningRuntime, runtime: *runtime_mod.Runtime) !void {
+        std.debug.assert(self.runtime == null);
+        self.runtime = runtime;
+        try self.caller_group.concurrent(self.io, runRuntime, .{ runtime, &self.run_result });
+        self.started = true;
+    }
+
+    fn awaitStarted(self: *RunningRuntime) !void {
+        std.debug.assert(self.started);
+        const runtime = self.runtime.?;
+        for (0..10_000) |_| {
+            if (runtime.isRunning()) return;
+            try std.Thread.yield();
+        }
+        return error.RuntimeDidNotStart;
+    }
+
+    fn stop(self: *RunningRuntime) void {
+        std.debug.assert(self.started and !self.awaited);
+        self.runtime.?.stop();
+    }
+
+    fn await(self: *RunningRuntime) !void {
+        std.debug.assert(self.started and !self.awaited);
+        defer self.awaited = true;
+        try self.caller_group.await(self.io);
+    }
+
+    fn deinit(self: *RunningRuntime) void {
+        const runtime = self.runtime orelse return;
+        if (self.started and !self.awaited) {
+            if (!runtime.isClosed()) runtime.stop();
+            self.caller_group.await(self.io) catch {};
+            self.awaited = true;
+        }
+        runtime.deinit();
+        self.runtime = null;
+    }
+};
+
 fn runActorLoop(runtime: *runtime_mod.Runtime, result: *?anyerror) void {
     runtime_mod.Testing.actorLoop(runtime) catch |err| {
         result.* = err;
@@ -96,15 +156,39 @@ fn consumeCancellationInTransport(context: *TransportCancellationContext) void {
     };
 }
 
+const CancellationObserver = struct {
+    io: std.Io,
+    queue: std.Io.Queue(u8),
+    buffer: [1]u8 = undefined,
+    observed: std.atomic.Value(bool) = .init(false),
+
+    fn init(self: *CancellationObserver, io: std.Io) void {
+        self.* = .{
+            .io = io,
+            .queue = undefined,
+        };
+        self.queue = .init(&self.buffer);
+    }
+
+    fn wait(self: *CancellationObserver) void {
+        _ = self.queue.getOne(self.io) catch |err| switch (err) {
+            error.Canceled => self.observed.store(true, .release),
+            error.Closed => unreachable,
+        };
+    }
+};
+
 const CancelTransportContext = struct {
     io: std.Io,
     group: *std.Io.Group,
     entered: std.atomic.Value(bool) = .init(false),
+    completed: std.atomic.Value(bool) = .init(false),
 };
 
 fn cancelTransportTask(context: *CancelTransportContext) void {
     context.entered.store(true, .release);
     context.group.cancel(context.io);
+    context.completed.store(true, .release);
 }
 
 test "Transport send re-arms consumed runtime cancellation" {
@@ -120,11 +204,14 @@ test "Transport send re-arms consumed runtime cancellation" {
     var context = TransportCancellationContext{ .io = io, .transport = &transport };
     var group: std.Io.Group = .init;
     try group.concurrent(io, consumeCancellationInTransport, .{&context});
+    var observer: CancellationObserver = undefined;
+    observer.init(io);
+    try group.concurrent(io, CancellationObserver.wait, .{&observer});
     var cancel_context = CancelTransportContext{ .io = io, .group = &group };
     const cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
-    while (!cancel_context.entered.load(.acquire)) try std.Thread.yield();
-    try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
     context.allow_send.store(true, .release);
+    try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
     cancel_thread.join();
 
     try std.testing.expectEqual(error.Canceled, context.send_error.?);
@@ -168,7 +255,13 @@ test "Runtime send cancellation closes drains joins and releases command state" 
     var run_error: ?anyerror = null;
     var runtime_group: std.Io.Group = .init;
     try runtime_group.concurrent(io, runRuntime, .{ runtime, &run_error });
-    while (!runtime.isRunning()) try std.Thread.yield();
+    var observer: CancellationObserver = undefined;
+    observer.init(io);
+    try runtime_group.concurrent(io, CancellationObserver.wait, .{&observer});
+    for (0..10_000) |_| {
+        if (runtime.isRunning()) break;
+        try std.Thread.yield();
+    } else return error.RuntimeDidNotStart;
 
     var ping_context = RuntimePingContext{
         .runtime = runtime,
@@ -178,13 +271,13 @@ test "Runtime send cancellation closes drains joins and releases command state" 
     };
     var api_group: std.Io.Group = .init;
     try api_group.concurrent(io, sendRuntimePing, .{&ping_context});
-    while (!gate.entered.load(.acquire)) try std.Thread.yield();
+    try awaitFlag(&gate.entered, error.RuntimeDidNotEnter);
 
     var cancel_context = CancelTransportContext{ .io = io, .group = &runtime_group };
     const cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
-    while (!cancel_context.entered.load(.acquire)) try std.Thread.yield();
-    try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
     gate.proceed.store(true, .release);
+    try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
     cancel_thread.join();
     try api_group.await(io);
 
@@ -205,12 +298,24 @@ test "actor cancellation closes command intake before draining" {
     const io = threaded.io();
     const runtime = try initTestRuntime(io, alloc, 0x73, .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 }, .{});
     defer runtime.deinit();
+    var gate = runtime_mod.Testing.CommandGate{};
+    runtime_mod.Testing.setCommandGate(runtime, &gate);
+    try runtime_mod.Testing.putMaintenance(runtime);
     var loop_error: ?anyerror = null;
     var group: std.Io.Group = .init;
     try group.concurrent(io, runActorLoop, .{ runtime, &loop_error });
+    var observer: CancellationObserver = undefined;
+    observer.init(io);
+    try group.concurrent(io, CancellationObserver.wait, .{&observer});
     try std.testing.expect(!runtime.isClosed());
-    try std.Io.sleep(io, .fromMilliseconds(10), .awake);
-    group.cancel(io);
+    try awaitFlag(&gate.entered, error.RuntimeDidNotEnter);
+    var cancel_context = CancelTransportContext{ .io = io, .group = &group };
+    const cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
+    try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
+    gate.proceed.store(true, .release);
+    try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
+    cancel_thread.join();
+    try group.await(io);
     try std.testing.expectEqual(error.Canceled, loop_error.?);
     try std.testing.expect(runtime.isClosed());
     try std.testing.expectError(error.Closed, runtime_mod.Testing.putMaintenance(runtime));
@@ -245,7 +350,7 @@ test "Runtime cancellation drains accepted owned commands and replies" {
     } else return error.RuntimeDidNotEnter;
     var cancel_context = CancelTransportContext{ .io = io, .group = &caller_group };
     const cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
-    while (!cancel_context.entered.load(.acquire)) try std.Thread.yield();
+    try awaitFlag(&cancel_context.entered, error.CancellationDidNotStart);
     gate.proceed.store(true, .release);
     cancel_thread.join();
     try std.testing.expectEqual(error.Canceled, run_error.?);
@@ -340,18 +445,10 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
             .command_capacity = 2,
         },
     }, .{ .maintenance_interval_ms = 60_000 });
-    var run_error: ?anyerror = null;
-    var runtime_group: std.Io.Group = .init;
-    try runtime_group.concurrent(io, runRuntime, .{ runtime, &run_error });
-    defer {
-        if (!runtime.isClosed()) runtime.stop();
-        if (runtime.isRunning()) runtime_group.await(io) catch {};
-        runtime.deinit();
-    }
-    for (0..10_000) |_| {
-        if (runtime.isRunning()) break;
-        try std.Thread.yield();
-    } else return error.RuntimeDidNotStart;
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
 
     const first_key = try secp.keyPairFromSecret(&([_]u8{0x7a} ** 32));
     const first_pubkey = secp.compressedPubkey(&first_key);
@@ -421,9 +518,9 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
     try std.testing.expect(!(try stale_barrier_result));
     try std.testing.expect(runtime.popEvent() == null);
 
-    runtime.stop();
-    try runtime_group.await(io);
-    try std.testing.expect(run_error == null);
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
 }
 
 test "failed maintenance enqueue rolls back pending state for retry" {
@@ -587,22 +684,18 @@ test "Runtime exposes named request cancellation" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 },
     }, .{});
-    var run_error: ?anyerror = null;
-    var caller_group: std.Io.Group = .init;
-    try caller_group.concurrent(io, runRuntime, .{ runtime, &run_error });
-    for (0..10_000) |_| {
-        if (runtime.isRunning()) break;
-        try std.Thread.yield();
-    } else return error.RuntimeDidNotStart;
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
 
     const address = @import("types.zig").Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 19075 } };
     const req_id = try runtime.sendPing(remote_id, &remote_pubkey, address, 0);
     try std.testing.expect(try runtime.cancelRequest(remote_id, address, req_id));
     try std.testing.expect(!try runtime.cancelRequest(remote_id, address, req_id));
-    runtime.stop();
-    try caller_group.await(io);
-    try std.testing.expect(run_error == null);
-    runtime.deinit();
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
 }
 
 test "Runtime actor queries return authoritative local and peer ENR snapshots" {
@@ -625,13 +718,10 @@ test "Runtime actor queries return authoritative local and peer ENR snapshots" {
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 4 },
     }, .{ .maintenance_interval_ms = 60_000 });
-    var run_error: ?anyerror = null;
-    var runtime_group: std.Io.Group = .init;
-    try runtime_group.concurrent(io, runRuntime, .{ runtime, &run_error });
-    for (0..10_000) |_| {
-        if (runtime.isRunning()) break;
-        try std.Thread.yield();
-    } else return error.RuntimeDidNotStart;
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
 
     const initial_snapshot = (try runtime.localEnr()) orelse return error.MissingLocalEnr;
     try std.testing.expectEqualSlices(u8, initial_enr, initial_snapshot.slice());
@@ -659,10 +749,9 @@ test "Runtime actor queries return authoritative local and peer ENR snapshots" {
     try std.testing.expectEqualSlices(u8, remote_enr, peer_snapshot.slice());
     try std.testing.expect((try runtime.peerEnr([_]u8{0xee} ** 32)) == null);
 
-    runtime.stop();
-    try runtime_group.await(io);
-    try std.testing.expect(run_error == null);
-    runtime.deinit();
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
 }
 
 test "Runtime follows run stop caller-await deinit lifecycle" {
@@ -739,7 +828,9 @@ test "two live Runtime sockets complete strict handshake and PING lifecycle" {
         .rate_limiter = null,
         .limits = limits,
     }, .{ .maintenance_interval_ms = 10 });
-    errdefer runtime_a.deinit();
+    var running_a = RunningRuntime.init(io);
+    defer running_a.deinit();
+    try running_a.start(runtime_a);
     const runtime_b = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_b,
@@ -747,27 +838,13 @@ test "two live Runtime sockets complete strict handshake and PING lifecycle" {
         .rate_limiter = null,
         .limits = limits,
     }, .{ .maintenance_interval_ms = 10 });
-    errdefer runtime_b.deinit();
+    var running_b = RunningRuntime.init(io);
+    defer running_b.deinit();
+    try running_b.start(runtime_b);
     const address_a = runtime_a.boundAddress(.ip4) orelse return error.MissingBoundAddress;
     const address_b = runtime_b.boundAddress(.ip4) orelse return error.MissingBoundAddress;
-
-    var error_a: ?anyerror = null;
-    var error_b: ?anyerror = null;
-    var caller_group: std.Io.Group = .init;
-    try caller_group.concurrent(io, runRuntime, .{ runtime_a, &error_a });
-    try caller_group.concurrent(io, runRuntime, .{ runtime_b, &error_b });
-    var cleanup_needed = true;
-    defer if (cleanup_needed) {
-        runtime_a.stop();
-        runtime_b.stop();
-        caller_group.await(io) catch {};
-        runtime_b.deinit();
-        runtime_a.deinit();
-    };
-    for (0..10_000) |_| {
-        if (runtime_a.isRunning() and runtime_b.isRunning()) break;
-        try std.Thread.yield();
-    } else return error.RuntimesDidNotStart;
+    try running_a.awaitStarted();
+    try running_b.awaitStarted();
 
     try std.testing.expect(try runtime_a.addNode(id_b, &pubkey_b, address_b, null));
     try std.testing.expect(try runtime_b.addNode(id_a, &pubkey_a, address_a, null));
@@ -784,15 +861,13 @@ test "two live Runtime sockets complete strict handshake and PING lifecycle" {
     }
     try std.testing.expect(observed_pong);
 
-    runtime_a.stop();
-    runtime_b.stop();
-    try caller_group.await(io);
+    running_a.stop();
+    running_b.stop();
+    try running_a.await();
+    try running_b.await();
     const stopped_a = runtime_a.isClosed() and !runtime_a.isRunning();
     const stopped_b = runtime_b.isClosed() and !runtime_b.isRunning();
-    runtime_b.deinit();
-    runtime_a.deinit();
-    cleanup_needed = false;
-    try std.testing.expect(error_a == null);
-    try std.testing.expect(error_b == null);
+    try std.testing.expect(running_a.run_result == null);
+    try std.testing.expect(running_b.run_result == null);
     try std.testing.expect(stopped_a and stopped_b);
 }
