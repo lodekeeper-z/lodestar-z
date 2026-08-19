@@ -524,6 +524,7 @@ test "maintenance automatically redrains a queued lane after one transient send 
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(u64, 2), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
     const retried = try decodeSentPing(&harness.recording.datagrams.items[1].bytes, &remote_id, &stable.initiator_key);
     try std.testing.expectEqualSlices(u8, second.slice(), retried.req_id.slice());
 }

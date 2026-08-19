@@ -101,7 +101,7 @@ fn dispatch(
     } else {
         actor.requests.commitPrepared(prepared);
     }
-    noteSent(actor, plaintext);
+    noteSentRequest(actor, kind);
 }
 
 pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) !void {

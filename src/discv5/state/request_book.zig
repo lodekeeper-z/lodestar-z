@@ -338,16 +338,17 @@ pub const RequestBook = struct {
         return false;
     }
 
-    pub fn firstQueued(self: *const RequestBook, endpoint: types.Endpoint) ?QueuedRequest {
+    pub fn firstQueued(self: *const RequestBook, endpoint: types.Endpoint) ?*const QueuedRequest {
         const lane = self.lanes.getPtr(endpoint) orelse return null;
         if (lane.establishing != null) return null;
-        return (lane.queued.first() orelse return null).*;
+        return lane.queued.first();
     }
 
     pub fn commitQueued(self: *RequestBook, prepared: PreparedRequest) void {
         const lane = self.lanes.getPtr(prepared.key.endpoint) orelse unreachable;
-        const queued = lane.queued.pop();
+        const queued = lane.queued.first() orelse unreachable;
         std.debug.assert(std.meta.eql(types.RequestKey.init(queued.endpoint, queued.req_id), prepared.key));
+        lane.queued.discardFirst();
         std.debug.assert(self.queued_total > 0);
         self.queued_total -= 1;
         self.commitPrepared(prepared);

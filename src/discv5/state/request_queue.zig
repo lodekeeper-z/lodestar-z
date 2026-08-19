@@ -75,12 +75,10 @@ pub const RequestFifo = struct {
         try self.items.append(alloc, request);
     }
 
-    pub fn pop(self: *RequestFifo) QueuedRequest {
+    pub fn discardFirst(self: *RequestFifo) void {
         std.debug.assert(self.len() > 0);
-        const request = self.items.items[self.head];
         self.head += 1;
         if (self.len() == 0) self.compact();
-        return request;
     }
 
     pub fn compact(self: *RequestFifo) void {
