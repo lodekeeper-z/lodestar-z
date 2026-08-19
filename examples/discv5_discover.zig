@@ -1,7 +1,7 @@
 //! End-to-end discv5 discovery smoke test.
 //!
 //! Run with:
-//!   zig build run:discv5_discover -- --timeout-ms 30000 --max-results 16
+//!   zig build run:discv5_discover -- --timeout-ms 30000 --max-results 64
 
 const std = @import("std");
 const discv5 = @import("discv5");
@@ -11,6 +11,53 @@ pub const std_options: std.Options = .{ .log_level = .info };
 const Allocator = std.mem.Allocator;
 const Address = discv5.Address;
 const NodeId = discv5.NodeId;
+const event_poll_interval_ms: i64 = 10;
+const request_timeout_ms: u64 = 2_000;
+const request_retries: u32 = 1;
+const maintenance_interval_ms: u64 = 100;
+// A detached lookup request may first wait for its queue deadline, then each
+// active attempt may wait once for WHOAREYOU and once for the authenticated
+// response. Include one maintenance tick for queue pruning and another for
+// active-request pruning.
+const lookup_finish_grace_ms: i64 = request_timeout_ms +
+    2 * request_timeout_ms * (request_retries + 1) +
+    2 * maintenance_interval_ms;
+const max_streamed_results: usize = 1_024;
+const max_deadline_drain_events: usize = 1_024;
+
+const LookupStatus = enum {
+    active,
+    finished,
+    timed_out,
+    event_deadline,
+    runtime_stopped,
+
+    fn label(self: LookupStatus) []const u8 {
+        return switch (self) {
+            .active => "active",
+            .finished => "finished",
+            .timed_out => "timed out",
+            .event_deadline => "event deadline reached",
+            .runtime_stopped => "runtime stopped",
+        };
+    }
+};
+
+const StopReason = enum {
+    lookup_settled,
+    output_limit,
+    event_deadline,
+    runtime_stopped,
+
+    fn label(self: StopReason) []const u8 {
+        return switch (self) {
+            .lookup_settled => "lookup settled",
+            .output_limit => "output limit reached",
+            .event_deadline => "event deadline reached",
+            .runtime_stopped => "runtime stopped",
+        };
+    }
+};
 
 // Source, fetched 2026-05-15:
 // https://github.com/eth-clients/eth2-networks/blob/master/shared/mainnet/bootstrap_nodes.txt
@@ -27,7 +74,7 @@ const default_bootnodes = [_][]const u8{
 
 const Options = struct {
     timeout_ms: u64 = 30_000,
-    max_results: usize = 16,
+    max_results: usize = 64,
     use_default_bootnodes: bool = true,
     target: ?NodeId = null,
     extra_bootnodes: std.ArrayListUnmanaged([]u8) = .empty,
@@ -83,19 +130,22 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     const pubkey = discv5.secp256k1.compressedPubkey(&key_pair);
     const local_node_id = try discv5.enr.nodeIdFromCompressedPubkey(&pubkey);
 
+    const setup_started_at = std.Io.Timestamp.now(io, .awake);
     const runtime_config = discv5.Config{
         .bind_addresses = .{
             .ip4 = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
         },
         .local_key_pair = key_pair,
         .local_node_id = local_node_id,
-        .request_timeout_ms = 2_000,
-        .request_retries = 1,
-        .lookup_num_results = options.max_results,
+        .request_timeout_ms = request_timeout_ms,
+        .request_retries = request_retries,
+        // Keep the protocol's final K-closest result independent from the
+        // executable's larger streamed-output budget.
+        .lookup_num_results = discv5.MAX_LOOKUP_RESULTS,
         .lookup_timeout_ms = options.timeout_ms,
     };
     const runtime_options = discv5.Options{
-        .maintenance_interval_ms = 100,
+        .maintenance_interval_ms = maintenance_interval_ms,
     };
 
     const discovery_runtime = try discv5.Runtime.init(io, alloc, runtime_config, runtime_options);
@@ -124,6 +174,11 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     }
     if (added_bootnodes == 0) return error.NoBootnodes;
 
+    const lookup_started_at = std.Io.Timestamp.now(io, .awake);
+    const setup_elapsed_ms = setup_started_at.durationTo(lookup_started_at).toMilliseconds();
+    const event_deadline = lookup_started_at.addDuration(.fromMilliseconds(
+        @intCast(options.timeout_ms + @as(u64, @intCast(lookup_finish_grace_ms))),
+    ));
     const lookup_id = try discovery_runtime.startLookup(target);
     try stdout.print("discv5 discovery lookup {d}\n", .{lookup_id});
     try stdout.print("bound: ", .{});
@@ -141,49 +196,106 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     defer seen.deinit();
 
     var found: usize = 0;
-    var finished = false;
-    var lookup_timed_out = false;
+    var discovered_events: usize = 0;
+    var final_results: usize = 0;
+    var lookup_status: LookupStatus = .active;
+    var stop_reason: StopReason = .event_deadline;
+    var finish_drain_deadline: ?std.Io.Timestamp = null;
+    var deadline_drain_remaining = max_deadline_drain_events;
 
-    while (!finished) {
-        const event_value = discovery_runtime.nextEvent() catch |err| switch (err) {
-            error.Closed => break,
-            error.Canceled => return err,
+    while (true) {
+        if (found >= options.max_results) {
+            stop_reason = .output_limit;
+            break;
+        }
+
+        const now = std.Io.Timestamp.now(io, .awake);
+        const expired: ?StopReason = if (finish_drain_deadline) |deadline|
+            if (deadline.durationTo(now).toNanoseconds() >= 0) .lookup_settled else null
+        else if (lookup_status == .active and event_deadline.durationTo(now).toNanoseconds() >= 0)
+            .event_deadline
+        else
+            null;
+        if (expired != null and deadline_drain_remaining == 0) {
+            if (expired.? == .event_deadline) lookup_status = .event_deadline;
+            stop_reason = expired.?;
+            break;
+        }
+
+        const event_value = discovery_runtime.popEvent() orelse {
+            if (expired) |reason| {
+                if (reason == .event_deadline) lookup_status = .event_deadline;
+                stop_reason = reason;
+                break;
+            }
+            if (discovery_runtime.isClosed()) {
+                if (lookup_status == .active) lookup_status = .runtime_stopped;
+                stop_reason = .runtime_stopped;
+                break;
+            }
+            try std.Io.sleep(io, .fromMilliseconds(event_poll_interval_ms), .awake);
+            continue;
         };
+        if (expired != null) {
+            deadline_drain_remaining -= 1;
+        } else {
+            deadline_drain_remaining = max_deadline_drain_events;
+        }
         var event = event_value;
         defer event.deinit(alloc);
 
         switch (event) {
             .discovered_enr => |discovered| {
-                if (found >= options.max_results) {
-                    finished = true;
-                    continue;
-                }
+                discovered_events += 1;
                 if (try printFoundParsedEnr(alloc, stdout, &seen, discovered.raw.slice(), &discovered.enr)) {
                     found += 1;
                     try stdout.flush();
                 }
-                if (found >= options.max_results) finished = true;
             },
             .lookup_finished => |lookup_finished| {
                 if (lookup_finished.lookup_id != lookup_id) continue;
-                lookup_timed_out = lookup_finished.timed_out;
+                lookup_status = if (lookup_finished.timed_out) .timed_out else .finished;
+                final_results = lookup_finished.enrs.items.len;
                 for (lookup_finished.enrs.items) |raw_enr| {
                     if (found >= options.max_results) break;
                     if (try printFoundEnr(alloc, stdout, &seen, raw_enr)) found += 1;
                 }
-                finished = true;
+                finish_drain_deadline = std.Io.Timestamp.now(io, .awake).addDuration(
+                    .fromMilliseconds(lookup_finish_grace_ms),
+                );
+                deadline_drain_remaining = max_deadline_drain_events;
                 try stdout.flush();
             },
             else => {},
         }
     }
 
-    if (!finished and found < options.max_results) lookup_timed_out = true;
-
-    try stdout.print("\nsummary: {d} ENRs printed; lookup {s}\n", .{
+    const lookup_elapsed_ms = lookup_started_at.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+    try stdout.print("\nsummary: {d} unique ENRs printed from {d} discovery events and {d} final results\n", .{
         found,
-        if (lookup_timed_out) "timed out" else "finished",
+        discovered_events,
+        final_results,
     });
+    try stdout.print("lookup_status: {s}\nobservation_stop: {s}\n", .{ lookup_status.label(), stop_reason.label() });
+    try stdout.print("setup_ms: {d}\nlookup_elapsed_ms: {d}\n", .{ setup_elapsed_ms, lookup_elapsed_ms });
+    const snapshot = discovery_runtime.metricsSnapshot() catch |err| {
+        try stdout.print("metrics: unavailable ({})\n", .{err});
+        return;
+    };
+    try stdout.print(
+        "routing: {d} peers, {d} connected, {d} sessions\npackets: {d} received, {d} processed, {d} filtered\nmessages: {d} FINDNODE sent, {d} NODES received\nevents_dropped: {d}\n",
+        .{
+            snapshot.kad_table_size,
+            snapshot.connected_peer_count,
+            snapshot.active_session_count,
+            snapshot.received_packet_count,
+            snapshot.processed_packet_count,
+            snapshot.filtered_packet_count,
+            snapshot.sentMessageCount(.findnode),
+            snapshot.rcvdMessageCount(.nodes),
+            snapshot.dropped_event_count,
+        },
+    );
 }
 
 fn runRuntime(runtime: *discv5.Runtime) void {
@@ -230,10 +342,12 @@ fn parseOptions(alloc: Allocator, args_value: std.process.Args) !?Options {
         } else if (std.mem.eql(u8, arg, "--timeout-ms")) {
             const value = args.next() orelse return error.MissingTimeout;
             options.timeout_ms = try parsePositiveInt(u64, value);
+            if (options.timeout_ms > std.math.maxInt(i64) - lookup_finish_grace_ms)
+                return error.TimeoutTooLarge;
         } else if (std.mem.eql(u8, arg, "--max-results")) {
             const value = args.next() orelse return error.MissingMaxResults;
             options.max_results = try parsePositiveInt(usize, value);
-            if (options.max_results > discv5.MAX_LOOKUP_RESULTS) return error.TooManyResults;
+            if (options.max_results > max_streamed_results) return error.TooManyResults;
         } else if (std.mem.eql(u8, arg, "--target")) {
             const value = args.next() orelse return error.MissingTarget;
             options.target = try parseNodeId(value);
@@ -341,7 +455,7 @@ fn printUsage(stdout: *std.Io.Writer) !void {
         \\
         \\Options:
         \\  --timeout-ms N            Stop after N milliseconds (default: 30000)
-        \\  --max-results N           Stop after N printed ENRs, max 16 (default: 16)
+        \\  --max-results N           Stop after N unique ENRs, max 1024 (default: 64)
         \\  --target 0xHEX            Lookup a specific 32-byte node id; random by default
         \\  --bootnode enr:...        Add an extra bootnode ENR
         \\  --no-default-bootnodes    Use only bootnodes passed on the command line
