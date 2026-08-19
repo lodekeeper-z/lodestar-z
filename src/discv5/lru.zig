@@ -90,6 +90,17 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             return &self.nodes[index].value;
         }
 
+        pub fn getRefreshPtr(self: *Self, key: K, ttl_ms: u64, now_ns: i64) ?*V {
+            const index = self.map.get(key) orelse return null;
+            if (self.isExpired(index, now_ns)) {
+                self.removeIndex(index);
+                return null;
+            }
+            self.nodes[index].expires_at_ns = util.deadlineNs(now_ns, ttl_ms);
+            self.moveToFront(index);
+            return &self.nodes[index].value;
+        }
+
         pub fn put(self: *Self, key: K, value: V, ttl_ms: u64, now_ns: i64) void {
             _ = self.putMove(key, value, ttl_ms, now_ns);
         }

@@ -62,23 +62,21 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
     const endpoint = types.Endpoint{ .node_id = parsed.authdata_raw[0..32].*, .addr = from };
     const now_ns = outbound.nowNs(env.io);
 
-    // Non-mutating peek: unauthenticated ciphertext must not refresh
-    // LRU/TTL recency. Recency is refreshed by the authenticated put below.
-    const stable = actor.sessions.peek(endpoint, now_ns);
+    // Non-mutating pointer: unauthenticated ciphertext must not refresh
+    // LRU/TTL recency. Recency is refreshed only after authentication.
+    const stable = actor.sessions.peekPtr(endpoint, now_ns);
     if (stable) |stable_value| if (stable_value.seen_nonces.contains(&parsed.static_header.nonce)) return;
 
     var plaintext_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     var ad_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     if (stable) |stable_value| {
         if (decryptParsedMessage(parsed, &stable_value.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
-            var accepted = stable_value;
-            if (!accepted.seen_nonces.insert(&parsed.static_header.nonce)) {
-                if (sendWhoareyou(actor, env, endpoint, &parsed.static_header.nonce))
-                    std.debug.assert(actor.sessions.remove(endpoint));
-                return;
+            switch (actor.sessions.acceptAuthenticated(endpoint, &parsed.static_header.nonce, now_ns)) {
+                .accepted => authenticated(actor, env, endpoint, plaintext),
+                .exhausted => if (sendWhoareyou(actor, env, endpoint, &parsed.static_header.nonce))
+                    std.debug.assert(actor.sessions.remove(endpoint)),
+                .replay, .missing => {},
             }
-            actor.sessions.put(endpoint, accepted, now_ns);
-            authenticated(actor, env, endpoint, plaintext);
             return;
         }
     }

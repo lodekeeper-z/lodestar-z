@@ -37,6 +37,13 @@ pub const StableSession = struct {
     seen_nonces: SeenNonces = .{},
 };
 
+pub const AcceptAuthenticatedResult = enum {
+    accepted,
+    replay,
+    exhausted,
+    missing,
+};
+
 pub const ActiveChallenge = struct {
     challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8,
     triggering_nonce: [packet.NONCE_SIZE]u8,
@@ -102,8 +109,23 @@ pub const SessionBook = struct {
     /// Read a live session without changing LRU/TTL recency. Unauthenticated
     /// ciphertext must use this for tentative decryption so spoofed traffic
     /// cannot bias which honest session gets evicted at capacity.
-    pub fn peek(self: *const SessionBook, endpoint: types.Endpoint, now_ns: i64) ?StableSession {
-        return self.sessions.peek(endpoint, now_ns);
+    pub fn peekPtr(self: *const SessionBook, endpoint: types.Endpoint, now_ns: i64) ?*const StableSession {
+        return self.sessions.peekPtr(endpoint, now_ns);
+    }
+
+    pub fn acceptAuthenticated(
+        self: *SessionBook,
+        endpoint: types.Endpoint,
+        nonce: *const [packet.NONCE_SIZE]u8,
+        now_ns: i64,
+    ) AcceptAuthenticatedResult {
+        const current = self.sessions.peekPtr(endpoint, now_ns) orelse return .missing;
+        if (current.seen_nonces.contains(nonce)) return .replay;
+        if (current.seen_nonces.len == SEEN_NONCES_CAP) return .exhausted;
+
+        const accepted = self.sessions.getRefreshPtr(endpoint, self.session_timeout_ms, now_ns) orelse unreachable;
+        std.debug.assert(accepted.seen_nonces.insert(nonce));
+        return .accepted;
     }
 
     pub fn put(self: *SessionBook, endpoint: types.Endpoint, value: StableSession, now_ns: i64) void {
@@ -241,6 +263,50 @@ test "session book enforces TTL LRU and non-evicting nonce epochs" {
     }
     try std.testing.expect(!seen.insert(&([_]u8{0xff} ** packet.NONCE_SIZE)));
     try std.testing.expect(seen.contains(&replay));
+}
+
+test "session book accepts authenticated nonces in place without refreshing rejected state" {
+    const secp = @import("../secp256k1.zig");
+    const key_pair = secp.KeyPair.generate(std.Options.debug_io);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+        .session_timeout_ms = 10,
+        .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
+    });
+    defer book.deinit(std.testing.allocator, &admission);
+
+    const first = testEndpoint(1);
+    const second = testEndpoint(2);
+    const third = testEndpoint(3);
+    const stable = StableSession{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 };
+    book.put(first, stable, 0);
+    book.put(second, stable, 0);
+
+    const accepted = [_]u8{3} ** packet.NONCE_SIZE;
+    try std.testing.expectEqual(AcceptAuthenticatedResult.accepted, book.acceptAuthenticated(first, &accepted, 5 * std.time.ns_per_ms));
+    try std.testing.expect(book.peekPtr(first, 5 * std.time.ns_per_ms).?.seen_nonces.contains(&accepted));
+    book.put(third, stable, 6 * std.time.ns_per_ms);
+    try std.testing.expect(book.peekPtr(second, 6 * std.time.ns_per_ms) == null);
+    try std.testing.expect(book.peekPtr(first, 10 * std.time.ns_per_ms) != null);
+
+    try std.testing.expectEqual(AcceptAuthenticatedResult.replay, book.acceptAuthenticated(first, &accepted, 10 * std.time.ns_per_ms));
+    try std.testing.expect(book.peekPtr(first, 15 * std.time.ns_per_ms) == null);
+    try std.testing.expectEqual(AcceptAuthenticatedResult.missing, book.acceptAuthenticated(first, &accepted, 15 * std.time.ns_per_ms));
+
+    var full = stable;
+    for (0..SEEN_NONCES_CAP) |i| {
+        const nonce = [_]u8{@intCast(i)} ** packet.NONCE_SIZE;
+        try std.testing.expect(full.seen_nonces.insert(&nonce));
+    }
+    book.put(first, full, 20 * std.time.ns_per_ms);
+    const overflow = [_]u8{0xff} ** packet.NONCE_SIZE;
+    try std.testing.expectEqual(AcceptAuthenticatedResult.exhausted, book.acceptAuthenticated(first, &overflow, 25 * std.time.ns_per_ms));
+    try std.testing.expect(book.peekPtr(first, 30 * std.time.ns_per_ms) == null);
 }
 
 test "session challenge cache moves permit ownership through TTL and LRU cleanup" {

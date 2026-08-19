@@ -757,12 +757,12 @@ test "failed ciphertext does not refresh stable session LRU recency" {
     // session. Tentative decrypt must peek and leave eviction order unchanged.
     var garbage = try encodeEncryptedPacket(actor, lru_endpoint.node_id, &([_]u8{0xff} ** 16), &.{message.MSG_PING}, 21);
     actor.handlePacket(harness.env(), garbage.bytes[0..garbage.len], lru_endpoint.addr);
-    try std.testing.expect(actor.sessions.peek(lru_endpoint, 2) != null);
+    try std.testing.expect(actor.sessions.peekPtr(lru_endpoint, 2) != null);
 
     actor.sessions.put(third_endpoint, stable, 3);
-    try std.testing.expect(actor.sessions.peek(lru_endpoint, 4) == null);
-    try std.testing.expect(actor.sessions.peek(fresh_endpoint, 4) != null);
-    try std.testing.expect(actor.sessions.peek(third_endpoint, 4) != null);
+    try std.testing.expect(actor.sessions.peekPtr(lru_endpoint, 4) == null);
+    try std.testing.expect(actor.sessions.peekPtr(fresh_endpoint, 4) != null);
+    try std.testing.expect(actor.sessions.peekPtr(third_endpoint, 4) != null);
 }
 
 test "authenticated packets reject stale nonce and wrong source address" {
@@ -881,7 +881,7 @@ test "session nonce epoch retires at capacity and never redispatches its first r
             endpoint.addr,
         );
     }
-    try std.testing.expect(actor.sessions.peek(endpoint, outbound.nowNs(io)) == null);
+    try std.testing.expect(actor.sessions.peekPtr(endpoint, outbound.nowNs(io)) == null);
     try std.testing.expectEqual(@as(usize, 1), actor.sessions.challengeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
