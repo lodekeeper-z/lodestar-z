@@ -466,6 +466,7 @@ pub const Actor = struct {
         while (attempts < lookup_mod.MAX_CANDIDATES) : (attempts += 1) {
             const attempt: LookupAttempt = blk: {
                 const lookup = self.lookups.getPtr(id) orelse return;
+                lookup.deferred = false;
                 const peer_id = lookup.nextPeer(self.lookup_config) orelse break;
                 break :blk .{ .peer_id = peer_id, .target = lookup.target };
             };
@@ -476,13 +477,33 @@ pub const Actor = struct {
             };
             var distances: [127]u16 = undefined;
             const count = lookup_mod.findNodeLogDistances(&attempt.target, &peer_id, @min(self.lookup_config.request_limit, distances.len), &distances);
-            _ = self.sendFindNode(env, .{ .node_id = peer_id, .addr = known.addr }, &known.pubkey, distances[0..count], .{ .lookup = id }) catch {
+            _ = self.sendFindNode(env, .{ .node_id = peer_id, .addr = known.addr }, &known.pubkey, distances[0..count], .{ .lookup = id }) catch |err| {
+                if (isLookupBackpressure(err)) {
+                    if (self.lookups.getPtr(id)) |lookup| lookup.onDeferred(&peer_id);
+                    break;
+                }
                 if (self.lookups.getPtr(id)) |lookup| lookup.onFailure(&peer_id, self.lookup_config);
                 continue;
             };
         }
         const finished = if (self.lookups.get(id)) |lookup| lookup.state == .finished else false;
         if (finished) self.finishLookup(env.outbox, id, false);
+    }
+
+    pub fn repumpLookups(self: *Actor, env: Env) void {
+        var lookup_ids: [MAX_LOOKUPS]u32 = undefined;
+        const count = blk: {
+            var count: usize = 0;
+            var iterator = self.lookups.iterator();
+            while (iterator.next()) |entry| {
+                if (!entry.value_ptr.deferred) continue;
+                std.debug.assert(count < lookup_ids.len);
+                lookup_ids[count] = entry.key_ptr.*;
+                count += 1;
+            }
+            break :blk count;
+        };
+        for (lookup_ids[0..count]) |lookup_id| self.pumpLookup(env, lookup_id);
     }
 
     fn allocateLookupId(self: *Actor) ?u32 {
@@ -620,6 +641,17 @@ fn validObservedAddress(actor: *const Actor, address: types.Address) bool {
     };
 }
 
+fn isLookupBackpressure(err: anyerror) bool {
+    return switch (err) {
+        error.TooManyActiveRequests,
+        error.TooManyQueuedRequests,
+        error.TooManyQueuedRequestsForEndpoint,
+        error.TooManyAdmissionPermits,
+        => true,
+        else => false,
+    };
+}
+
 test "discv5 actor: lookup pump exhausts bounded synchronous candidate failures" {
     const test_secp = @import("secp256k1.zig");
     const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
@@ -661,6 +693,140 @@ test "discv5 actor: lookup pump exhausts bounded synchronous candidate failures"
     actor.pumpLookup(env, 1);
 
     try std.testing.expect(!actor.lookups.contains(1));
+    var event = outbox.pop() orelse return error.MissingLookupCompletion;
+    defer event.deinit(alloc);
+    try std.testing.expect(event == .lookup_finished);
+    try std.testing.expectEqual(@as(u32, 1), event.lookup_finished.lookup_id);
+}
+
+test "discv5 actor: lookup local backpressure defers until bounded maintenance repump" {
+    const test_secp = @import("secp256k1.zig");
+    const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try test_secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&test_secp.compressedPubkey(&local_key));
+    const blocker_key = try test_secp.keyPairFromSecret(&([_]u8{0x93} ** 32));
+    const blocker_pubkey = test_secp.compressedPubkey(&blocker_key);
+    const blocker_id = try enr.nodeIdFromCompressedPubkey(&blocker_pubkey);
+    const lookup_key = try test_secp.keyPairFromSecret(&([_]u8{0x94} ** 32));
+    const lookup_pubkey = test_secp.compressedPubkey(&lookup_key);
+    const lookup_peer_id = try enr.nodeIdFromCompressedPubkey(&lookup_pubkey);
+    const blocker_endpoint = types.Endpoint{
+        .node_id = blocker_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 92 }, .port = 9092 } },
+    };
+    const lookup_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 94 }, .port = 9094 } };
+    const cfg = config_mod.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .request_retries = 0,
+        .lookup_num_results = 1,
+        .lookup_parallelism = 1,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 1,
+            .max_queued_requests = 1,
+            .event_capacity = 4,
+            .command_capacity = 4,
+        },
+    };
+    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
+    defer ingress.deinit();
+    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
+    defer outbox.deinit();
+    var actor = try Actor.init(alloc, cfg);
+    defer actor.deinit(&ingress);
+    var recording = RecordingSender.init(alloc);
+    defer recording.deinit();
+    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    try std.testing.expect(actor.addNode(lookup_peer_id, &lookup_pubkey, lookup_address, null, 0));
+
+    const blocker_req_id = try actor.sendPing(env, blocker_endpoint, &blocker_pubkey, 0, .api);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+
+    const lookup_id: u32 = 1;
+    const target = [_]u8{0x95} ** 32;
+    const lookup = try lookup_mod.Lookup.init(alloc, target, &.{lookup_peer_id}, outbound.nowNs(io), actor.lookup_config);
+    actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
+    actor.pumpLookup(env, lookup_id);
+
+    const deferred = actor.lookups.getPtr(lookup_id) orelse return error.LookupFinishedUnderBackpressure;
+    try std.testing.expectEqual(lookup_mod.State.iterating, deferred.state);
+    try std.testing.expectEqual(@as(usize, 0), deferred.num_waiting);
+    try std.testing.expect(deferred.deferred);
+    try std.testing.expectEqual(lookup_mod.PeerState.not_contacted, deferred.peers.items[0].state);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
+    try std.testing.expect(outbox.pop() == null);
+
+    try std.testing.expect(actor.cancelRequest(env, .init(blocker_endpoint, blocker_req_id)));
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+
+    actor.maintenance(env);
+    const dispatched = actor.lookups.getPtr(lookup_id) orelse return error.LookupFinishedBeforeDispatch;
+    try std.testing.expectEqual(@as(usize, 1), dispatched.num_waiting);
+    try std.testing.expect(!dispatched.deferred);
+    try std.testing.expectEqual(lookup_mod.PeerState.waiting, dispatched.peers.items[0].state);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
+
+    actor.maintenance(env);
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
+
+    actor.maintenanceAt(env, std.math.maxInt(i64));
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+}
+
+test "discv5 actor: lookup transport send failure remains terminal" {
+    const test_secp = @import("secp256k1.zig");
+    const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try test_secp.keyPairFromSecret(&([_]u8{0x96} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&test_secp.compressedPubkey(&local_key));
+    const remote_key = try test_secp.keyPairFromSecret(&([_]u8{0x97} ** 32));
+    const remote_pubkey = test_secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 97 }, .port = 9097 } };
+    const cfg = config_mod.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .lookup_num_results = 1,
+        .lookup_parallelism = 1,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 2, .command_capacity = 2 },
+    };
+    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
+    defer ingress.deinit();
+    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
+    defer outbox.deinit();
+    var actor = try Actor.init(alloc, cfg);
+    defer actor.deinit(&ingress);
+    var recording = RecordingSender.init(alloc);
+    defer recording.deinit();
+    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, remote_address, null, 0));
+    const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0x98} ** 32, &.{remote_id}, outbound.nowNs(io), actor.lookup_config);
+    actor.lookups.putAssumeCapacityNoClobber(1, lookup);
+    recording.fail_next = true;
+
+    actor.pumpLookup(env, 1);
+
+    try std.testing.expect(!actor.lookups.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), recording.datagrams.items.len);
     var event = outbox.pop() orelse return error.MissingLookupCompletion;
     defer event.deinit(alloc);
     try std.testing.expect(event == .lookup_finished);

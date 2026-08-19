@@ -27,6 +27,7 @@ pub fn run(actor: *Actor, env: Env, now_ns: i64) void {
     pruneQueued(actor, env, now_ns);
     redrainQueued(actor, env);
     pruneLookups(actor, env.outbox, now_ns);
+    actor.repumpLookups(env);
     var transitions: [kbucket.NUM_BUCKETS]peer_book.ConnectionEvent = undefined;
     const transition_count = actor.peers.prune(now_ns, actor.bucket_pending_timeout_ms, &transitions);
     for (transitions[0..transition_count]) |event| actor.publishConnection(env.outbox, event.node_id, event.transition);

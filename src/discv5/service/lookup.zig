@@ -41,6 +41,7 @@ pub const Lookup = struct {
     state: State = .iterating,
     no_progress: usize = 0,
     num_waiting: usize = 0,
+    deferred: bool = false,
     peers: std.ArrayListUnmanaged(Peer) = .empty,
 
     pub fn init(alloc: Allocator, target: NodeId, seeds: []const NodeId, started_at_ns: i64, config: Config) !Lookup {
@@ -178,6 +179,19 @@ pub const Lookup = struct {
         }
 
         self.maybeFinish(config);
+    }
+
+    pub fn onDeferred(self: *Lookup, node_id: *const NodeId) void {
+        if (self.state == .finished) return;
+
+        if (self.findPeerIndex(node_id)) |index| {
+            if (self.peers.items[index].state == .waiting) {
+                std.debug.assert(self.num_waiting > 0);
+                self.num_waiting -= 1;
+                self.peers.items[index].state = .not_contacted;
+                self.deferred = true;
+            }
+        }
     }
 
     pub fn nextPeer(self: *Lookup, config: Config) ?NodeId {
