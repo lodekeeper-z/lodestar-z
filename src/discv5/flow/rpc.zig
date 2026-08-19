@@ -201,6 +201,15 @@ fn closerCandidates(actor: *const Actor, validated_enrs: []const enr.ValidatedEn
     var closer_len: usize = 0;
     for (validated_enrs) |*validated| {
         if (std.mem.eql(u8, &validated.node_id, &actor.local_node_id)) continue;
+        if (actor.peers.routing.getEntryWithPending(&validated.node_id)) |entry| {
+            if (entry.enr_seq >= validated.parsed.seq) {
+                if (lookup.Candidate.fromRoutingEntry(entry)) |candidate| {
+                    closer[closer_len] = candidate;
+                    closer_len += 1;
+                    continue;
+                }
+            }
+        }
         const address = actor.peers.addressForEnr(&validated.parsed) orelse continue;
         closer[closer_len] = .fromValidated(validated, address);
         closer_len += 1;

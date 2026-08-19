@@ -193,6 +193,101 @@ test "validated NODES multipart values survive as lookup closer IDs" {
     try std.testing.expectEqual(@as(usize, 2), completed_lookup.peers.items[responder_index].peers_returned);
 }
 
+test "discv5 lookup duplicate uses newer routed ENR for dispatch and result" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xc1} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const responder_key = try secp.keyPairFromSecret(&([_]u8{0xc2} ** 32));
+    const responder_pubkey = secp.compressedPubkey(&responder_key);
+    const responder_id = try enr.nodeIdFromCompressedPubkey(&responder_pubkey);
+    const responder_endpoint = types.Endpoint{
+        .node_id = responder_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 194 }, .port = 9194 } },
+    };
+    const older = try makeEnr(alloc, 0xc3, 1, .{ 127, 0, 0, 195 }, 9195);
+    defer alloc.free(older.raw);
+    const newer = try makeEnr(alloc, 0xc3, 2, .{ 127, 0, 0, 196 }, 9196);
+    defer alloc.free(newer.raw);
+    try std.testing.expectEqual(older.node_id, newer.node_id);
+    const newer_validated = try enr.ValidatedEnr.init(newer.raw);
+    var cfg = testConfig(local_key, local_id, 8);
+    cfg.lookup_num_results = 2;
+    cfg.lookup_parallelism = 1;
+    cfg.limits.lookup_result_capacity = 1;
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    try std.testing.expectEqual(newer.node_id, actor.peers.learnValidatedEnr(&newer_validated, 1).?);
+
+    const responder_session = session_book.StableSession{
+        .initiator_key = [_]u8{0xc4} ** 16,
+        .recipient_key = [_]u8{0xc5} ** 16,
+    };
+    const newer_endpoint = types.Endpoint{ .node_id = newer.node_id, .addr = newer.address };
+    const newer_session = session_book.StableSession{
+        .initiator_key = [_]u8{0xc6} ** 16,
+        .recipient_key = [_]u8{0xc7} ** 16,
+    };
+    actor.sessions.put(responder_endpoint, responder_session, outbound.nowNs(io));
+    actor.sessions.put(newer_endpoint, newer_session, outbound.nowNs(io));
+
+    var results = try lookup_results.LookupResultOutbox.init(io, alloc, 1);
+    defer results.deinit();
+    try std.testing.expect(results.reserve());
+    try std.testing.expect(results.claim());
+    var result_pending = true;
+    errdefer if (result_pending) results.release();
+    var env = harness.env();
+    env.lookup_results = &results;
+
+    const lookup_id: u32 = 103;
+    var lookup = try lookup_mod.Lookup.init(alloc, responder_id, &.{ responder_id, newer.node_id }, 0, actor.lookup_config);
+    try std.testing.expectEqual(responder_id, lookup.nextPeer(actor.lookup_config).?);
+    lookup.reliable_result = true;
+    actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
+    const responder_req_id = try actor.sendFindNode(
+        env,
+        responder_endpoint,
+        &responder_pubkey,
+        &.{wireDistance(&older.node_id, &responder_id)},
+        .{ .lookup = lookup_id },
+    );
+
+    var stale_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const stale_nodes = message.Nodes{ .req_id = responder_req_id, .total = 1, .enrs = &.{older.raw} };
+    try deliverEncrypted(actor, env, responder_endpoint, &responder_session.recipient_key, try stale_nodes.encodeInto(&stale_buffer), 0xc8);
+
+    const routed = actor.peers.routing.getEntry(&newer.node_id) orelse return error.MissingRoutedCandidate;
+    try std.testing.expectEqual(@as(u64, 2), routed.enr_seq);
+    try std.testing.expect(routed.addr.eql(&newer.address));
+    try std.testing.expectEqualSlices(u8, newer.raw, routed.enrBytes());
+    const active_lookup = actor.lookups.getPtr(lookup_id) orelse return error.LookupFinishedBeforeCanonicalDispatch;
+    const retained = active_lookup.localCandidate(&newer.node_id) orelse return error.MissingLookupLocalContact;
+    try std.testing.expectEqual(@as(u64, 2), retained.seq);
+    try std.testing.expect(retained.addr.eql(&newer.address));
+    try std.testing.expectEqualSlices(u8, newer.raw, retained.raw.slice());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expect(harness.recording.datagrams.items[1].address.eql(&newer.address));
+
+    var candidate_key: ?types.RequestKey = null;
+    var active_requests = actor.requests.active.iterator();
+    while (active_requests.next()) |entry| {
+        if (!types.EndpointContext.eql(.{}, entry.key_ptr.endpoint, newer_endpoint)) continue;
+        candidate_key = entry.key_ptr.*;
+        break;
+    }
+    const key = candidate_key orelse return error.MissingCanonicalCandidateRequest;
+    var final_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const final_nodes = message.Nodes{ .req_id = key.req_id, .total = 1, .enrs = &.{} };
+    try deliverEncrypted(actor, env, newer_endpoint, &newer_session.recipient_key, try final_nodes.encodeInto(&final_buffer), 0xc9);
+
+    const result = results.pop() orelse return error.MissingLookupResult;
+    result_pending = false;
+    try std.testing.expectEqual(@as(usize, 1), result.enrs.slice().len);
+    try std.testing.expectEqualSlices(u8, newer.raw, result.enrs.slice()[0].slice());
+}
+
 test "discv5 lookup-local contact dispatch survives full global retention" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -262,6 +357,7 @@ test "discv5 lookup-local contact dispatch survives full global retention" {
     try std.testing.expectEqual(@as(usize, 1), active_lookup.num_waiting);
     const retained = active_lookup.localCandidate(&returned.node_id) orelse return error.MissingLookupLocalContact;
     try std.testing.expectEqual(returned.node_id, retained.node_id);
+    try std.testing.expectEqual(@as(u64, 3), retained.seq);
     try std.testing.expectEqual(validated.parsed.pubkey.?, retained.pubkey);
     try std.testing.expect(retained.addr.eql(&returned.address));
     try std.testing.expectEqualSlices(u8, returned.raw, retained.raw.slice());
@@ -312,40 +408,118 @@ test "discv5 lookup-local successful result retains raw ENR without PeerBook" {
     try std.testing.expectEqualSlices(u8, returned.raw, event.lookup_finished.enrs.items[0]);
 }
 
-test "discv5 lookup-local duplicate enrichment preserves candidate state" {
+test "discv5 lookup-local duplicate enrichment does not downgrade newer metadata" {
     const alloc = std.testing.allocator;
-    const returned = try makeEnr(alloc, 0xaa, 10, .{ 127, 0, 0, 170 }, 9170);
-    defer alloc.free(returned.raw);
-    const validated = try enr.ValidatedEnr.init(returned.raw);
-    const candidate = lookup_mod.Candidate.fromValidated(&validated, returned.address);
+    const older = try makeEnr(alloc, 0xaa, 1, .{ 127, 0, 0, 170 }, 9170);
+    defer alloc.free(older.raw);
+    const newer = try makeEnr(alloc, 0xaa, 2, .{ 127, 0, 0, 171 }, 9171);
+    defer alloc.free(newer.raw);
+    const same_seq = try makeEnr(alloc, 0xaa, 2, .{ 127, 0, 0, 172 }, 9172);
+    defer alloc.free(same_seq.raw);
+    try std.testing.expectEqual(older.node_id, newer.node_id);
+    try std.testing.expectEqual(newer.node_id, same_seq.node_id);
+    const older_validated = try enr.ValidatedEnr.init(older.raw);
+    const newer_validated = try enr.ValidatedEnr.init(newer.raw);
+    const same_seq_validated = try enr.ValidatedEnr.init(same_seq.raw);
+    const older_candidate = lookup_mod.Candidate.fromValidated(&older_validated, older.address);
+    const newer_candidate = lookup_mod.Candidate.fromValidated(&newer_validated, newer.address);
+    const same_seq_candidate = lookup_mod.Candidate.fromValidated(&same_seq_validated, same_seq.address);
     var responder_id = [_]u8{0xbb} ** 32;
-    if (std.mem.eql(u8, &responder_id, &returned.node_id)) responder_id[31] ^= 1;
+    if (std.mem.eql(u8, &responder_id, &newer.node_id)) responder_id[31] ^= 1;
     const lookup_config = lookup_mod.Config{
         .num_results = 2,
         .parallelism = 2,
         .request_limit = 3,
         .timeout_ms = 60_000,
     };
-    var lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{ returned.node_id, responder_id }, 0, lookup_config);
+    var lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{ newer.node_id, responder_id }, 0, lookup_config);
     defer lookup.deinit(alloc);
     _ = lookup.nextPeer(lookup_config) orelse return error.MissingFirstCandidate;
     _ = lookup.nextPeer(lookup_config) orelse return error.MissingSecondCandidate;
 
-    lookup.onSuccess(&responder_id, &.{candidate}, lookup_config);
+    lookup.onSuccess(&responder_id, &.{newer_candidate}, lookup_config);
 
     try std.testing.expectEqual(@as(usize, 2), lookup.peers.items.len);
-    const returned_index = lookup.findPeerIndex(&returned.node_id) orelse return error.MissingReturnedCandidate;
+    const returned_index = lookup.findPeerIndex(&newer.node_id) orelse return error.MissingReturnedCandidate;
     try std.testing.expectEqual(lookup_mod.PeerState.waiting, lookup.peers.items[returned_index].state);
     try std.testing.expectEqual(@as(usize, 1), lookup.num_waiting);
-    const retained = lookup.localCandidate(&returned.node_id) orelse return error.MissingLookupLocalContact;
-    try std.testing.expectEqualSlices(u8, returned.raw, retained.raw.slice());
+    const retained = lookup.localCandidate(&newer.node_id) orelse return error.MissingLookupLocalContact;
+    try std.testing.expectEqual(@as(u64, 2), retained.seq);
+    try std.testing.expect(retained.addr.eql(&newer.address));
+    try std.testing.expectEqualSlices(u8, newer.raw, retained.raw.slice());
 
-    lookup.onFailure(&returned.node_id, lookup_config);
-    try std.testing.expectEqual(lookup_mod.PeerState.failed, lookup.peers.items[returned_index].state);
-    lookup.onSuccess(&responder_id, &.{candidate}, lookup_config);
+    const responder_index = lookup.findPeerIndex(&responder_id) orelse return error.MissingResponder;
+    const responder_state = lookup.peers.items[responder_index].state;
+    const responder_peers_returned = lookup.peers.items[responder_index].peers_returned;
+    lookup.onSuccess(&responder_id, &.{older_candidate}, lookup_config);
     try std.testing.expectEqual(@as(usize, 2), lookup.peers.items.len);
-    try std.testing.expectEqual(lookup_mod.PeerState.failed, lookup.peers.items[returned_index].state);
-    try std.testing.expectEqual(@as(usize, 0), lookup.num_waiting);
+    try std.testing.expectEqual(returned_index, lookup.findPeerIndex(&newer.node_id).?);
+    try std.testing.expectEqual(lookup_mod.PeerState.waiting, lookup.peers.items[returned_index].state);
+    try std.testing.expectEqual(@as(usize, 1), lookup.num_waiting);
+    try std.testing.expectEqual(responder_state, lookup.peers.items[responder_index].state);
+    try std.testing.expectEqual(responder_peers_returned, lookup.peers.items[responder_index].peers_returned);
+    const after_stale = lookup.localCandidate(&newer.node_id) orelse return error.MissingLookupLocalContact;
+    try std.testing.expectEqual(@as(u64, 2), after_stale.seq);
+    try std.testing.expect(after_stale.addr.eql(&newer.address));
+    try std.testing.expectEqualSlices(u8, newer.raw, after_stale.raw.slice());
+
+    lookup.onSuccess(&responder_id, &.{same_seq_candidate}, lookup_config);
+    try std.testing.expectEqual(@as(usize, 2), lookup.peers.items.len);
+    try std.testing.expectEqual(returned_index, lookup.findPeerIndex(&newer.node_id).?);
+    try std.testing.expectEqual(lookup_mod.PeerState.waiting, lookup.peers.items[returned_index].state);
+    try std.testing.expectEqual(@as(usize, 1), lookup.num_waiting);
+    try std.testing.expectEqual(responder_state, lookup.peers.items[responder_index].state);
+    try std.testing.expectEqual(responder_peers_returned, lookup.peers.items[responder_index].peers_returned);
+    const after_same_seq = lookup.localCandidate(&newer.node_id) orelse return error.MissingLookupLocalContact;
+    try std.testing.expectEqual(@as(u64, 2), after_same_seq.seq);
+    try std.testing.expect(after_same_seq.addr.eql(&newer.address));
+    try std.testing.expectEqualSlices(u8, newer.raw, after_same_seq.raw.slice());
+}
+
+test "discv5 lookup-local duplicate enrichment upgrades older metadata in place" {
+    const alloc = std.testing.allocator;
+    const older = try makeEnr(alloc, 0xac, 1, .{ 127, 0, 0, 172 }, 9172);
+    defer alloc.free(older.raw);
+    const newer = try makeEnr(alloc, 0xac, 2, .{ 127, 0, 0, 173 }, 9173);
+    defer alloc.free(newer.raw);
+    try std.testing.expectEqual(older.node_id, newer.node_id);
+    const older_validated = try enr.ValidatedEnr.init(older.raw);
+    const newer_validated = try enr.ValidatedEnr.init(newer.raw);
+    const older_candidate = lookup_mod.Candidate.fromValidated(&older_validated, older.address);
+    const newer_candidate = lookup_mod.Candidate.fromValidated(&newer_validated, newer.address);
+    var responder_id = [_]u8{0xbd} ** 32;
+    if (std.mem.eql(u8, &responder_id, &older.node_id)) responder_id[31] ^= 1;
+    const lookup_config = lookup_mod.Config{
+        .num_results = 2,
+        .parallelism = 2,
+        .request_limit = 3,
+        .timeout_ms = 60_000,
+    };
+    var lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{ older.node_id, responder_id }, 0, lookup_config);
+    defer lookup.deinit(alloc);
+    _ = lookup.nextPeer(lookup_config) orelse return error.MissingFirstCandidate;
+    _ = lookup.nextPeer(lookup_config) orelse return error.MissingSecondCandidate;
+
+    lookup.onSuccess(&responder_id, &.{older_candidate}, lookup_config);
+    const returned_index = lookup.findPeerIndex(&older.node_id) orelse return error.MissingReturnedCandidate;
+    const responder_index = lookup.findPeerIndex(&responder_id) orelse return error.MissingResponder;
+    const responder_state = lookup.peers.items[responder_index].state;
+    const responder_peers_returned = lookup.peers.items[responder_index].peers_returned;
+    try std.testing.expectEqual(lookup_mod.PeerState.waiting, lookup.peers.items[returned_index].state);
+    try std.testing.expectEqual(@as(usize, 1), lookup.num_waiting);
+
+    lookup.onSuccess(&responder_id, &.{newer_candidate}, lookup_config);
+
+    try std.testing.expectEqual(@as(usize, 2), lookup.peers.items.len);
+    try std.testing.expectEqual(returned_index, lookup.findPeerIndex(&older.node_id).?);
+    try std.testing.expectEqual(lookup_mod.PeerState.waiting, lookup.peers.items[returned_index].state);
+    try std.testing.expectEqual(@as(usize, 1), lookup.num_waiting);
+    try std.testing.expectEqual(responder_state, lookup.peers.items[responder_index].state);
+    try std.testing.expectEqual(responder_peers_returned, lookup.peers.items[responder_index].peers_returned);
+    const retained = lookup.localCandidate(&older.node_id) orelse return error.MissingLookupLocalContact;
+    try std.testing.expectEqual(@as(u64, 2), retained.seq);
+    try std.testing.expect(retained.addr.eql(&newer.address));
+    try std.testing.expectEqualSlices(u8, newer.raw, retained.raw.slice());
 }
 
 test "discv5 lookup-local protocol bounds remain unchanged" {

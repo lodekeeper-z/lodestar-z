@@ -34,6 +34,7 @@ pub const Candidate = struct {
     pubkey: [33]u8,
     addr: types.Address,
     raw: enr.RawEnr,
+    seq: u64,
 
     pub fn fromValidated(validated: *const enr.ValidatedEnr, address: types.Address) Candidate {
         const advertised = switch (address) {
@@ -46,6 +47,23 @@ pub const Candidate = struct {
             .pubkey = validated.parsed.pubkey orelse unreachable,
             .addr = address,
             .raw = validated.raw,
+            .seq = validated.parsed.seq,
+        };
+    }
+
+    /// Construct lookup-local metadata from an authoritative routing entry.
+    /// Nonempty routing ENRs were already authenticated at ingestion, so this
+    /// preserves the validated representation without repeating verification.
+    /// The runtime address may intentionally differ from the ENR-advertised
+    /// address until traffic proves a newly advertised endpoint.
+    pub fn fromRoutingEntry(entry: *const kbucket.Entry) ?Candidate {
+        if (entry.enrBytes().len == 0) return null;
+        return .{
+            .node_id = entry.node_id,
+            .pubkey = entry.pubkey,
+            .addr = entry.addr,
+            .raw = entry.enr,
+            .seq = entry.enr_seq,
         };
     }
 };
@@ -121,7 +139,13 @@ pub const Lookup = struct {
 
         for (self.peers.items) |*peer| {
             if (!std.mem.eql(u8, &peer.node_id, node_id)) continue;
-            if (peer.local_candidate == null) peer.local_candidate = if (candidate) |value| value.* else null;
+            if (candidate) |value| {
+                // Retain the first same-sequence record deterministically. An
+                // equal or older duplicate must not replace its endpoint/raw.
+                if (peer.local_candidate == null or value.seq > peer.local_candidate.?.seq) {
+                    peer.local_candidate = value.*;
+                }
+            }
             return null;
         }
 
@@ -323,6 +347,7 @@ fn testCandidate(last_byte: u8) Candidate {
         .pubkey = [_]u8{0} ** 33,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, last_byte }, .port = 9000 } },
         .raw = .{},
+        .seq = 0,
     };
 }
 
@@ -333,6 +358,17 @@ fn testConfig(num_results: usize, parallelism: usize) Config {
         .request_limit = 3,
         .timeout_ms = 60_000,
     };
+}
+
+test "discv5 lookup: routing candidate requires stored raw ENR" {
+    const entry = kbucket.Entry{
+        .node_id = testNodeId(1),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } },
+        .last_seen = 0,
+        .status = .disconnected,
+    };
+
+    try std.testing.expect(Candidate.fromRoutingEntry(&entry) == null);
 }
 
 test "discv5 lookup: initial peers are bounded to requested result count" {
