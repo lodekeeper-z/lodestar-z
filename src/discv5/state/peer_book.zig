@@ -87,26 +87,42 @@ pub const PeerBook = struct {
     pub fn addTrusted(self: *PeerBook, node_id: types.NodeId, pubkey: ?*const [33]u8, address: types.Address, raw: ?[]const u8, now_ns: i64) bool {
         if (std.mem.eql(u8, &node_id, &self.local_node_id)) return false;
         if (raw) |bytes| {
-            const parsed = enr.decode(bytes) catch return false;
-            const advertised = self.addressForEnr(&parsed) orelse return false;
-            if (!advertised.eql(&address)) return false;
-            var entry = self.entryFromEnr(bytes, advertised, .disconnected, now_ns) orelse return false;
-            if (!std.mem.eql(u8, &entry.node_id, &node_id)) return false;
-            if (pubkey) |key| if (!std.mem.eql(u8, &entry.pubkey, key)) return false;
-            entry.runtime_contact_trusted = true;
-            entry.advertised_endpoint_trusted = true;
-            entry.raw_enr_relay_eligible = true;
-            _ = self.insert(entry);
-            return self.trustedRepresentationRetained(node_id, &entry.pubkey, address);
+            const validated = enr.ValidatedEnr.init(bytes) catch return false;
+            return self.addValidatedTrustedEnr(node_id, pubkey, address, &validated, now_ns);
         }
         self.rememberContact(node_id, pubkey, address, true);
         return self.contacts.get(node_id) != null;
     }
 
+    pub fn addValidatedTrustedEnr(
+        self: *PeerBook,
+        node_id: types.NodeId,
+        pubkey: ?*const [33]u8,
+        address: types.Address,
+        validated: *const enr.ValidatedEnr,
+        now_ns: i64,
+    ) bool {
+        if (std.mem.eql(u8, &node_id, &self.local_node_id)) return false;
+        const advertised = self.addressForEnr(&validated.parsed) orelse return false;
+        if (!advertised.eql(&address)) return false;
+        var entry = self.entryFromValidatedEnr(validated, advertised, .disconnected, now_ns) orelse return false;
+        if (!std.mem.eql(u8, &entry.node_id, &node_id)) return false;
+        if (pubkey) |key| if (!std.mem.eql(u8, &entry.pubkey, key)) return false;
+        entry.runtime_contact_trusted = true;
+        entry.advertised_endpoint_trusted = true;
+        entry.raw_enr_relay_eligible = true;
+        _ = self.insert(entry);
+        return self.trustedRepresentationRetained(node_id, &entry.pubkey, address);
+    }
+
     pub fn learnEnr(self: *PeerBook, bytes: []const u8, now_ns: i64) ?types.NodeId {
-        const parsed = enr.decode(bytes) catch return null;
-        const address = self.addressForEnr(&parsed) orelse return null;
-        const entry = self.entryFromEnr(bytes, address, .disconnected, now_ns) orelse return null;
+        const validated = enr.ValidatedEnr.init(bytes) catch return null;
+        return self.learnValidatedEnr(&validated, now_ns);
+    }
+
+    pub fn learnValidatedEnr(self: *PeerBook, validated: *const enr.ValidatedEnr, now_ns: i64) ?types.NodeId {
+        const address = self.addressForEnr(&validated.parsed) orelse return null;
+        const entry = self.entryFromValidatedEnr(validated, address, .disconnected, now_ns) orelse return null;
         const node_id = entry.node_id;
         _ = self.insert(entry);
         return if (self.routing.getEntryWithPending(&node_id) != null or self.contacts.get(node_id) != null) node_id else null;
@@ -170,12 +186,7 @@ pub const PeerBook = struct {
         if (completed_key) |key| if (entry.health_request) |health_key| {
             if (types.RequestKeyContext.eql(.{}, health_key, key)) entry.health_request = null;
         };
-        const parsed = enr.decode(entry.enrBytes()) catch return .{ .transition = .none, .eviction_candidate = null };
-        const advertised = switch (address) {
-            .ip4 => parsed.udpAddress4(),
-            .ip6 => parsed.udpAddress6(),
-        };
-        const endpoint_proves_raw = if (advertised) |value| value.eql(&address) else false;
+        const endpoint_proves_raw = entry.advertisesAddress(address);
         entry.raw_enr_relay_eligible = entry.advertised_endpoint_trusted or
             entry.raw_enr_relay_eligible or endpoint_proves_raw;
         const result = self.routing.insertDetailed(entry);
@@ -289,15 +300,26 @@ pub const PeerBook = struct {
     }
 
     fn entryFromEnr(self: *PeerBook, bytes: []const u8, address: types.Address, status: kbucket.EntryStatus, now_ns: i64) ?kbucket.Entry {
-        const parsed = enr.decode(bytes) catch return null;
-        const node_id = (parsed.nodeId() catch return null) orelse return null;
-        if (std.mem.eql(u8, &node_id, &self.local_node_id)) return null;
+        const validated = enr.ValidatedEnr.init(bytes) catch return null;
+        return self.entryFromValidatedEnr(&validated, address, status, now_ns);
+    }
+
+    fn entryFromValidatedEnr(
+        self: *PeerBook,
+        validated: *const enr.ValidatedEnr,
+        address: types.Address,
+        status: kbucket.EntryStatus,
+        now_ns: i64,
+    ) ?kbucket.Entry {
+        if (std.mem.eql(u8, &validated.node_id, &self.local_node_id)) return null;
         return .{
-            .node_id = node_id,
-            .pubkey = parsed.pubkey orelse return null,
+            .node_id = validated.node_id,
+            .pubkey = validated.parsed.pubkey orelse return null,
             .addr = address,
-            .enr = enr.RawEnr.init(bytes) catch return null,
-            .enr_seq = parsed.seq,
+            .enr = validated.raw,
+            .enr_seq = validated.parsed.seq,
+            .advertised_addr4 = validated.parsed.udpAddress4(),
+            .advertised_addr6 = validated.parsed.udpAddress6(),
             .last_seen = now_ns,
             .status = status,
         };
@@ -383,12 +405,7 @@ pub const PeerBook = struct {
     }
 
     fn entryAdvertisesAddress(entry: *const kbucket.Entry, address: types.Address) bool {
-        const parsed = enr.decode(entry.enrBytes()) catch return false;
-        const advertised = switch (address) {
-            .ip4 => parsed.udpAddress4(),
-            .ip6 => parsed.udpAddress6(),
-        };
-        return if (advertised) |value| value.eql(&address) else false;
+        return entry.advertisesAddress(address);
     }
 
     fn trustedRepresentationRetained(self: *const PeerBook, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address) bool {

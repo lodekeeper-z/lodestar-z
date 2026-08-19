@@ -62,6 +62,7 @@ test {
     _ = @import("actor_tests/session_handshake_recovery.zig");
     _ = @import("actor_tests/event_lookup_allocator_failures.zig");
     _ = @import("actor_tests/interoperability_handshake_policy.zig");
+    _ = @import("actor_tests/validated_nodes_contract_test.zig");
     _ = @import("address_vote_test.zig");
     _ = @import("runtime_test.zig");
     _ = @import("service/addr_votes.zig");

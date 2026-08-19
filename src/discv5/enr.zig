@@ -102,6 +102,29 @@ pub const Enr = struct {
     }
 };
 
+/// An owned ENR whose signature, identity key, and node ID have been checked.
+/// Construct this only at an untrusted-byte boundary, then move or borrow the
+/// value so downstream users cannot accidentally repeat signature validation.
+pub const ValidatedEnr = struct {
+    raw: RawEnr,
+    parsed: Enr,
+    node_id: NodeId,
+
+    pub fn init(data: []const u8) Error!ValidatedEnr {
+        const parsed = try decode(data);
+        const node_id = (try parsed.nodeId()) orelse return Error.InvalidPublicKey;
+        return .{
+            .raw = try RawEnr.init(data),
+            .parsed = parsed,
+            .node_id = node_id,
+        };
+    }
+};
+
+comptime {
+    std.debug.assert(@sizeOf(ValidatedEnr) <= 512);
+}
+
 /// Compute NodeId = keccak256(uncompressed pubkey[1..]) from a validated
 /// compressed public key. Returns `error.InvalidPublicKey` for malformed input.
 pub fn nodeIdFromCompressedPubkey(compressed: *const [33]u8) NodeIdError!NodeId {

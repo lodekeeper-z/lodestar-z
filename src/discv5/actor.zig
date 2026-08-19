@@ -214,12 +214,12 @@ pub const Actor = struct {
     }
 
     pub fn addEnr(self: *Actor, outbox: *events.EventOutbox, raw: []const u8, now_ns: i64) bool {
-        const parsed = enr.decode(raw) catch return false;
-        const node_id = (parsed.nodeId() catch return false) orelse return false;
-        const pubkey = parsed.pubkey orelse return false;
-        const address = self.peers.addressForEnr(&parsed) orelse return false;
+        const validated = enr.ValidatedEnr.init(raw) catch return false;
+        const node_id = validated.node_id;
+        const pubkey = validated.parsed.pubkey orelse return false;
+        const address = self.peers.addressForEnr(&validated.parsed) orelse return false;
         const previous = if (self.peers.findEnr(&node_id)) |bytes| enr.RawEnr.init(bytes) catch null else null;
-        if (!self.peers.addTrusted(node_id, &pubkey, address, raw, now_ns)) return false;
+        if (!self.peers.addValidatedTrustedEnr(node_id, &pubkey, address, &validated, now_ns)) return false;
         const stored = self.peers.findEnr(&node_id) orelse return false;
         if (!std.mem.eql(u8, stored, raw)) {
             // The routing table already held a same/newer-seq ENR and the
@@ -256,23 +256,35 @@ pub const Actor = struct {
     }
 
     pub fn learnDiscovered(self: *Actor, raw: []const u8, now_ns: i64) ?types.NodeId {
-        const node_id = self.discoveredNodeId(raw) orelse return null;
-        if (self.peers.learnEnr(raw, now_ns) == null) return null;
+        const validated = enr.ValidatedEnr.init(raw) catch return null;
+        return self.learnValidatedDiscovered(&validated, now_ns);
+    }
+
+    pub fn learnValidatedDiscovered(self: *Actor, validated: *const enr.ValidatedEnr, now_ns: i64) ?types.NodeId {
+        const node_id = self.validatedDiscoveredNodeId(validated) orelse return null;
+        if (self.peers.learnValidatedEnr(validated, now_ns) == null) return null;
         return node_id;
     }
 
     pub fn discoveredNodeId(self: *const Actor, raw: []const u8) ?types.NodeId {
-        const parsed = enr.decode(raw) catch return null;
-        const node_id = (parsed.nodeId() catch return null) orelse return null;
-        if (std.mem.eql(u8, &node_id, &self.local_node_id)) return null;
-        if (self.peers.addressForEnr(&parsed) == null) return null;
-        return node_id;
+        const validated = enr.ValidatedEnr.init(raw) catch return null;
+        return self.validatedDiscoveredNodeId(&validated);
+    }
+
+    pub fn validatedDiscoveredNodeId(self: *const Actor, validated: *const enr.ValidatedEnr) ?types.NodeId {
+        if (std.mem.eql(u8, &validated.node_id, &self.local_node_id)) return null;
+        if (self.peers.addressForEnr(&validated.parsed) == null) return null;
+        return validated.node_id;
     }
 
     pub fn publishDiscovered(self: *Actor, outbox: *events.EventOutbox, raw: enr.RawEnr) void {
+        const validated = enr.ValidatedEnr.init(raw.slice()) catch return;
+        self.publishValidatedDiscovered(outbox, &validated);
+    }
+
+    pub fn publishValidatedDiscovered(self: *Actor, outbox: *events.EventOutbox, validated: *const enr.ValidatedEnr) void {
         _ = self;
-        const parsed = enr.decode(raw.slice()) catch return;
-        outbox.publish(.{ .discovered_enr = .{ .raw = raw, .enr = parsed } });
+        outbox.publish(.{ .discovered_enr = .{ .raw = validated.raw, .enr = validated.parsed } });
     }
 
     pub fn startLookup(self: *Actor, env: Env, target: types.NodeId) !u32 {

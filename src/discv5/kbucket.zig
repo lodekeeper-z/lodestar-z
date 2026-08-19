@@ -23,6 +23,8 @@ pub const Entry = struct {
     addr: Address,
     enr: enr_mod.RawEnr = .{},
     enr_seq: u64 = 0,
+    advertised_addr4: ?Address = null,
+    advertised_addr6: ?Address = null,
     last_seen: i64,
     status: EntryStatus,
     /// Whether the current raw ENR may be relayed in FINDNODE responses.
@@ -45,6 +47,14 @@ pub const Entry = struct {
     pub fn relayableEnr(self: *const Entry) ?[]const u8 {
         if (!self.raw_enr_relay_eligible) return null;
         return self.enrBytes();
+    }
+
+    pub fn advertisesAddress(self: *const Entry, address: Address) bool {
+        const advertised = switch (address) {
+            .ip4 => self.advertised_addr4,
+            .ip6 => self.advertised_addr6,
+        };
+        return if (advertised) |value| value.eql(&address) else false;
     }
 };
 

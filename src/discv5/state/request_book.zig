@@ -1,7 +1,7 @@
 const std = @import("std");
 const admission_mod = @import("../admission.zig");
 const config_mod = @import("../config.zig");
-const request_results = @import("../request_results.zig");
+const enr = @import("../enr.zig");
 const request_queue = @import("request_queue.zig");
 const types = @import("../types.zig");
 
@@ -83,7 +83,7 @@ pub const FreshRetryTransition = union(enum) {
 
 pub const NodesAccumulator = struct {
     enrs: std.ArrayListUnmanaged([]u8) = .empty,
-    terminal_enrs: request_results.RawEnrList = .{},
+    validated_enrs: ValidatedEnrList = .{},
     total_responses: ?u64 = null,
     responses_received: u64 = 0,
     requested_distances: RequestDistances,
@@ -103,11 +103,34 @@ pub const NodesAccumulator = struct {
     pub fn resetGeneration(self: *NodesAccumulator, alloc: Allocator) void {
         for (self.enrs.items) |bytes| alloc.free(bytes);
         self.enrs.clearRetainingCapacity();
-        self.terminal_enrs.clear();
+        self.validated_enrs.clear();
         self.total_responses = null;
         self.responses_received = 0;
     }
 };
+
+pub const ValidatedEnrList = struct {
+    buffer: [MAX_NODES_RESPONSE]enr.ValidatedEnr = undefined,
+    len: u8 = 0,
+
+    pub fn slice(self: *const ValidatedEnrList) []const enr.ValidatedEnr {
+        return self.buffer[0..self.len];
+    }
+
+    pub fn append(self: *ValidatedEnrList, validated: enr.ValidatedEnr) void {
+        if (self.len >= self.buffer.len) unreachable;
+        self.buffer[self.len] = validated;
+        self.len += 1;
+    }
+
+    pub fn clear(self: *ValidatedEnrList) void {
+        self.len = 0;
+    }
+};
+
+comptime {
+    std.debug.assert(@sizeOf(ValidatedEnrList) <= 9 * 1024);
+}
 
 pub const Response = union(enum) {
     pong,

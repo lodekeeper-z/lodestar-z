@@ -45,8 +45,11 @@ pub fn finish(actor: *Actor, env: Env, key: types.RequestKey, outcome: Outcome, 
     };
     if (active.response == .nodes) {
         result.nodes = active.response.nodes.enrs;
-        result.raw_nodes = active.response.nodes.terminal_enrs;
         active.response.nodes.enrs = .empty;
+        switch (terminal) {
+            .nodes => |raw_nodes| result.raw_nodes = raw_nodes,
+            else => {},
+        }
     }
     actor.publishRequestTerminal(env, key, result.kind, active.origin, terminal);
     active.admission.release(env.ingress);

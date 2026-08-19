@@ -30,6 +30,13 @@ pub const RawEnrList = struct {
     pub fn clear(self: *RawEnrList) void {
         self.len = 0;
     }
+
+    pub fn fromValidated(validated_enrs: []const enr.ValidatedEnr) RawEnrList {
+        if (validated_enrs.len > config.MAX_NODES_RESPONSE) unreachable;
+        var result = RawEnrList{};
+        for (validated_enrs) |validated| result.append(validated.raw);
+        return result;
+    }
 };
 
 pub const RequestTerminal = union(enum) {

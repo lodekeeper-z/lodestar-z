@@ -6,6 +6,7 @@ const message = @import("../protocol/message.zig");
 const metrics = @import("../metrics.zig");
 const outbound = @import("outbound.zig");
 const completion = @import("completion.zig");
+const request_results = @import("../request_results.zig");
 const request_book = @import("../state/request_book.zig");
 const types = @import("../types.zig");
 
@@ -119,43 +120,23 @@ fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.E
     } else {
         accumulator.total_responses = total;
     }
-    var discovered: [MAX_NODES_RESPONSE]enr.RawEnr = undefined;
-    var discovered_len: usize = 0;
-    for (nodes.enrs) |raw| {
-        if (accumulator.terminal_enrs.slice().len >= MAX_NODES_RESPONSE) break;
-        if (!matchesDistances(raw, &endpoint.node_id, accumulator)) continue;
-        if (actor.learnDiscovered(raw, outbound.nowNs(env.io)) != null and discovered_len < discovered.len) {
-            discovered[discovered_len] = enr.RawEnr.init(raw) catch continue;
-            discovered_len += 1;
-        }
-        accumulator.terminal_enrs.append(enr.RawEnr.init(raw) catch unreachable);
-        if (active.origin != .reliable_api) {
-            const copy = actor.alloc.dupe(u8, raw) catch {
-                env.outbox.notePayloadDrop();
-                continue;
-            };
-            accumulator.enrs.appendAssumeCapacity(copy);
-        }
-    }
+    var discovered: [MAX_NODES_RESPONSE]enr.ValidatedEnr = undefined;
+    const discovered_len = retainNodes(actor, env, active, nodes.enrs, &endpoint.node_id, &discovered);
     accumulator.responses_received += 1;
     if (accumulator.responses_received < accumulator.total_responses.?) {
-        for (discovered[0..discovered_len]) |raw| actor.publishDiscovered(env.outbox, raw);
+        for (discovered[0..discovered_len]) |*validated| actor.publishValidatedDiscovered(env.outbox, validated);
         return;
     }
 
     var closer: [MAX_NODES_RESPONSE]types.NodeId = undefined;
-    var closer_len: usize = 0;
-    for (accumulator.terminal_enrs.slice()) |*raw| {
-        const node_id = actor.discoveredNodeId(raw.slice()) orelse continue;
-        closer[closer_len] = node_id;
-        closer_len += 1;
-    }
+    const closer_len = closerNodeIds(actor, accumulator.validated_enrs.slice(), &closer);
+    const terminal_nodes = request_results.RawEnrList.fromValidated(accumulator.validated_enrs.slice());
     var finished = completion.finish(
         actor,
         env,
         key,
         .{ .success = closer[0..closer_len] },
-        .{ .nodes = accumulator.terminal_enrs },
+        .{ .nodes = terminal_nodes },
     ) orelse return;
     defer finished.deinit(actor.alloc);
     var event_enrs = finished.takeNodes() orelse unreachable;
@@ -174,13 +155,55 @@ fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.E
             event_enrs.appendAssumeCapacity(copy);
         }
     }
-    for (discovered[0..discovered_len]) |raw| actor.publishDiscovered(env.outbox, raw);
+    for (discovered[0..discovered_len]) |*validated| actor.publishValidatedDiscovered(env.outbox, validated);
     env.outbox.publish(.{ .nodes = .{
         .peer_id = endpoint.node_id,
         .peer_addr = endpoint.addr,
         .req_id = nodes.req_id,
         .enrs = event_enrs,
     } });
+}
+
+fn retainNodes(
+    actor: *Actor,
+    env: Env,
+    active: *request_book.ActiveRequest,
+    returned_enrs: []const []const u8,
+    responder: *const types.NodeId,
+    discovered: *[MAX_NODES_RESPONSE]enr.ValidatedEnr,
+) usize {
+    std.debug.assert(active.response == .nodes);
+    std.debug.assert(returned_enrs.len <= MAX_NODES_RESPONSE);
+    const accumulator = &active.response.nodes;
+    var discovered_len: usize = 0;
+    for (returned_enrs) |raw| {
+        if (accumulator.validated_enrs.slice().len >= MAX_NODES_RESPONSE) break;
+        const validated = enr.ValidatedEnr.init(raw) catch continue;
+        if (!matchesDistances(&validated.node_id, responder, accumulator)) continue;
+        if (actor.learnValidatedDiscovered(&validated, outbound.nowNs(env.io)) != null and discovered_len < discovered.len) {
+            discovered[discovered_len] = validated;
+            discovered_len += 1;
+        }
+        accumulator.validated_enrs.append(validated);
+        if (active.origin == .reliable_api) continue;
+        const copy = actor.alloc.dupe(u8, validated.raw.slice()) catch {
+            env.outbox.notePayloadDrop();
+            continue;
+        };
+        accumulator.enrs.appendAssumeCapacity(copy);
+    }
+    return discovered_len;
+}
+
+fn closerNodeIds(actor: *const Actor, validated_enrs: []const enr.ValidatedEnr, closer: *[MAX_NODES_RESPONSE]types.NodeId) usize {
+    std.debug.assert(validated_enrs.len <= MAX_NODES_RESPONSE);
+    var closer_len: usize = 0;
+    for (validated_enrs) |*validated| {
+        const node_id = actor.validatedDiscoveredNodeId(validated) orelse continue;
+        closer[closer_len] = node_id;
+        closer_len += 1;
+    }
+    return closer_len;
 }
 
 fn handleTalkReq(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
@@ -230,10 +253,8 @@ fn handleTalkResp(actor: *Actor, env: Env, plaintext: []const u8, endpoint: type
     } });
 }
 
-fn matchesDistances(raw: []const u8, responder: *const types.NodeId, accumulator: *const request_book.NodesAccumulator) bool {
-    const parsed = enr.decode(raw) catch return false;
-    const node_id = (parsed.nodeId() catch return false) orelse return false;
-    const distance: u16 = if (kbucket.logDistance(&node_id, responder)) |value| @as(u16, value) + 1 else 0;
+fn matchesDistances(node_id: *const types.NodeId, responder: *const types.NodeId, accumulator: *const request_book.NodesAccumulator) bool {
+    const distance: u16 = if (kbucket.logDistance(node_id, responder)) |value| @as(u16, value) + 1 else 0;
     return accumulator.requested_distances.contains(distance);
 }
 
