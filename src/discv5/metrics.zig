@@ -71,6 +71,10 @@ pub const MetricsSnapshot = struct {
     connected_peer_count: usize = 0,
     /// TS: discv5_lookup_count
     lookup_count: u64 = 0,
+    /// Point-in-time actor work queues for stress and saturation diagnostics.
+    active_lookup_count: usize = 0,
+    active_request_count: usize = 0,
+    queued_request_count: usize = 0,
     /// TS: discv5_rate_limit_hit_ip
     rate_limit_hit_ip: u64 = 0,
     /// TS: discv5_rate_limit_hit_total

@@ -1,7 +1,7 @@
 //! End-to-end discv5 discovery smoke test.
 //!
 //! Run with:
-//!   zig build run:discv5_discover -- --timeout-ms 30000 --max-results 64
+//!   zig build run:discv5_discover -- --timeout-ms 30000 --duration-ms 60000 --max-results 65536 --lookups 64 --quiet
 
 const std = @import("std");
 const discv5 = @import("discv5");
@@ -22,7 +22,11 @@ const maintenance_interval_ms: u64 = 100;
 const lookup_finish_grace_ms: i64 = request_timeout_ms +
     2 * request_timeout_ms * (request_retries + 1) +
     2 * maintenance_interval_ms;
-const max_streamed_results: usize = 1_024;
+const max_streamed_results: usize = 65_536;
+const max_concurrent_lookups: usize = 1_024;
+const max_total_lookups: usize = 65_536;
+const max_duration_ms: u64 = 3_600_000;
+const reconcile_interval_ms: i64 = 100;
 const max_deadline_drain_events: usize = 1_024;
 
 const LookupStatus = enum {
@@ -46,6 +50,7 @@ const LookupStatus = enum {
 const StopReason = enum {
     lookup_settled,
     output_limit,
+    duration,
     event_deadline,
     runtime_stopped,
 
@@ -53,6 +58,7 @@ const StopReason = enum {
         return switch (self) {
             .lookup_settled => "lookup settled",
             .output_limit => "output limit reached",
+            .duration => "duration reached",
             .event_deadline => "event deadline reached",
             .runtime_stopped => "runtime stopped",
         };
@@ -74,7 +80,12 @@ const default_bootnodes = [_][]const u8{
 
 const Options = struct {
     timeout_ms: u64 = 30_000,
-    max_results: usize = 64,
+    max_results: usize = 4_096,
+    lookup_count: usize = 1,
+    sample_ms: u64 = 1_000,
+    duration_ms: ?u64 = null,
+    session_capacity: u32 = (discv5.Limits{}).session_capacity,
+    print_enrs: bool = true,
     use_default_bootnodes: bool = true,
     target: ?NodeId = null,
     extra_bootnodes: std.ArrayListUnmanaged([]u8) = .empty,
@@ -143,6 +154,7 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
         // executable's larger streamed-output budget.
         .lookup_num_results = discv5.MAX_LOOKUP_RESULTS,
         .lookup_timeout_ms = options.timeout_ms,
+        .limits = .{ .session_capacity = options.session_capacity },
     };
     const runtime_options = discv5.Options{
         .maintenance_interval_ms = maintenance_interval_ms,
@@ -174,21 +186,41 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     }
     if (added_bootnodes == 0) return error.NoBootnodes;
 
-    const lookup_started_at = std.Io.Timestamp.now(io, .awake);
-    const setup_elapsed_ms = setup_started_at.durationTo(lookup_started_at).toMilliseconds();
-    const event_deadline = lookup_started_at.addDuration(.fromMilliseconds(
+    var pending_lookups = std.AutoHashMap(u32, void).init(alloc);
+    defer pending_lookups.deinit();
+    try pending_lookups.ensureTotalCapacity(@intCast(options.lookup_count));
+    var lookups_launched: usize = 0;
+    for (0..options.lookup_count) |index| {
+        const lookup_target = deriveLookupTarget(target, index);
+        const lookup_id = try discovery_runtime.startLookup(lookup_target);
+        try pending_lookups.put(lookup_id, {});
+        lookups_launched += 1;
+    }
+
+    const workload_started_at = std.Io.Timestamp.now(io, .awake);
+    const setup_elapsed_ms = setup_started_at.durationTo(workload_started_at).toMilliseconds();
+    const event_deadline = workload_started_at.addDuration(.fromMilliseconds(
         @intCast(options.timeout_ms + @as(u64, @intCast(lookup_finish_grace_ms))),
     ));
-    const lookup_id = try discovery_runtime.startLookup(target);
-    try stdout.print("discv5 discovery lookup {d}\n", .{lookup_id});
+    const duration_deadline: ?std.Io.Timestamp = if (options.duration_ms) |duration_ms|
+        workload_started_at.addDuration(.fromMilliseconds(@intCast(duration_ms)))
+    else
+        null;
+
+    try stdout.print("discv5 discovery stress run\n", .{});
     try stdout.print("bound: ", .{});
     if (discovery_runtime.boundAddress(.ip4)) |addr| {
         try addr.format(stdout);
     } else {
         try stdout.print("<none>", .{});
     }
-    try stdout.print("\nbootnodes: {d}\ntarget: ", .{added_bootnodes});
+    try stdout.print("\nbootnodes: {d}\nlookups: {d}\nsession_capacity: {d}\nbase_target: ", .{
+        added_bootnodes,
+        options.lookup_count,
+        options.session_capacity,
+    });
     try printNodeId(stdout, &target);
+    if (options.duration_ms) |duration_ms| try stdout.print("\nduration_ms: {d}", .{duration_ms});
     try stdout.print("\n\n", .{});
     try stdout.flush();
 
@@ -198,10 +230,17 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     var found: usize = 0;
     var discovered_events: usize = 0;
     var final_results: usize = 0;
+    var lookups_finished: usize = 0;
+    var lookups_timed_out: usize = 0;
     var lookup_status: LookupStatus = .active;
     var stop_reason: StopReason = .event_deadline;
     var finish_drain_deadline: ?std.Io.Timestamp = null;
     var deadline_drain_remaining = max_deadline_drain_events;
+    var next_sample_at = workload_started_at.addDuration(.fromMilliseconds(@intCast(options.sample_ms)));
+    var next_reconcile_at = workload_started_at.addDuration(.fromMilliseconds(reconcile_interval_ms));
+    var peak_sessions: usize = 0;
+    var peak_routing: usize = 0;
+    var peak_connected: usize = 0;
 
     while (true) {
         if (found >= options.max_results) {
@@ -210,9 +249,57 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
         }
 
         const now = std.Io.Timestamp.now(io, .awake);
+        if (duration_deadline) |deadline| {
+            if (deadline.durationTo(now).toNanoseconds() >= 0) {
+                stop_reason = .duration;
+                break;
+            }
+        }
+        if (duration_deadline != null and next_reconcile_at.durationTo(now).toNanoseconds() >= 0) {
+            const snapshot = try discovery_runtime.metricsSnapshot();
+            var deficit = options.lookup_count -| snapshot.active_lookup_count;
+            while (deficit > 0 and lookups_launched < max_total_lookups) : (deficit -= 1) {
+                const replacement_target = deriveLookupTarget(target, lookups_launched);
+                const replacement_id = discovery_runtime.startLookup(replacement_target) catch |err| switch (err) {
+                    error.TooManyLookups => break,
+                    else => return err,
+                };
+                try pending_lookups.put(replacement_id, {});
+                lookups_launched += 1;
+            }
+            next_reconcile_at = now.addDuration(.fromMilliseconds(reconcile_interval_ms));
+        }
+        if (next_sample_at.durationTo(now).toNanoseconds() >= 0) {
+            if (discovery_runtime.metricsSnapshot()) |sample| {
+                peak_sessions = @max(peak_sessions, sample.active_session_count);
+                peak_routing = @max(peak_routing, sample.kad_table_size);
+                peak_connected = @max(peak_connected, sample.connected_peer_count);
+                const elapsed_ms = workload_started_at.durationTo(now).toMilliseconds();
+                try stdout.print(
+                    "sample: elapsed_ms={d} unobserved_lookup_ids={d} active_lookups={d} active_requests={d} queued_requests={d} unique_enrs={d} routing={d} connected={d} sessions={d} packets={d} findnode={d} nodes={d} dropped={d}\n",
+                    .{
+                        elapsed_ms,
+                        pending_lookups.count(),
+                        sample.active_lookup_count,
+                        sample.active_request_count,
+                        sample.queued_request_count,
+                        found,
+                        sample.kad_table_size,
+                        sample.connected_peer_count,
+                        sample.active_session_count,
+                        sample.received_packet_count,
+                        sample.sentMessageCount(.findnode),
+                        sample.rcvdMessageCount(.nodes),
+                        sample.dropped_event_count,
+                    },
+                );
+                try stdout.flush();
+            } else |_| {}
+            next_sample_at = now.addDuration(.fromMilliseconds(@intCast(options.sample_ms)));
+        }
         const expired: ?StopReason = if (finish_drain_deadline) |deadline|
             if (deadline.durationTo(now).toNanoseconds() >= 0) .lookup_settled else null
-        else if (lookup_status == .active and event_deadline.durationTo(now).toNanoseconds() >= 0)
+        else if (duration_deadline == null and lookup_status == .active and event_deadline.durationTo(now).toNanoseconds() >= 0)
             .event_deadline
         else
             null;
@@ -247,47 +334,72 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
         switch (event) {
             .discovered_enr => |discovered| {
                 discovered_events += 1;
-                if (try printFoundParsedEnr(alloc, stdout, &seen, discovered.raw.slice(), &discovered.enr)) {
+                if (try recordFoundParsedEnr(
+                    alloc,
+                    stdout,
+                    &seen,
+                    discovered.raw.slice(),
+                    &discovered.enr,
+                    options.print_enrs,
+                )) {
                     found += 1;
-                    try stdout.flush();
+                    if (options.print_enrs) try stdout.flush();
                 }
             },
             .lookup_finished => |lookup_finished| {
-                if (lookup_finished.lookup_id != lookup_id) continue;
-                lookup_status = if (lookup_finished.timed_out) .timed_out else .finished;
-                final_results = lookup_finished.enrs.items.len;
+                if (!pending_lookups.remove(lookup_finished.lookup_id)) continue;
+                lookups_finished += 1;
+                if (lookup_finished.timed_out) lookups_timed_out += 1;
+                final_results += lookup_finished.enrs.items.len;
                 for (lookup_finished.enrs.items) |raw_enr| {
                     if (found >= options.max_results) break;
-                    if (try printFoundEnr(alloc, stdout, &seen, raw_enr)) found += 1;
+                    if (try recordFoundEnr(alloc, stdout, &seen, raw_enr, options.print_enrs)) found += 1;
                 }
-                finish_drain_deadline = std.Io.Timestamp.now(io, .awake).addDuration(
-                    .fromMilliseconds(lookup_finish_grace_ms),
-                );
-                deadline_drain_remaining = max_deadline_drain_events;
+                if (duration_deadline == null and pending_lookups.count() == 0) {
+                    lookup_status = if (lookups_timed_out == 0) .finished else .timed_out;
+                    finish_drain_deadline = std.Io.Timestamp.now(io, .awake).addDuration(
+                        .fromMilliseconds(lookup_finish_grace_ms),
+                    );
+                    deadline_drain_remaining = max_deadline_drain_events;
+                }
                 try stdout.flush();
             },
             else => {},
         }
     }
 
-    const lookup_elapsed_ms = lookup_started_at.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
-    try stdout.print("\nsummary: {d} unique ENRs printed from {d} discovery events and {d} final results\n", .{
+    const lookup_elapsed_ms = workload_started_at.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+    try stdout.print("\nsummary: {d} unique ENRs observed from {d} discovery events and {d} final results\n", .{
         found,
         discovered_events,
         final_results,
     });
-    try stdout.print("lookup_status: {s}\nobservation_stop: {s}\n", .{ lookup_status.label(), stop_reason.label() });
+    try stdout.print(
+        "lookup_status: {s}\nobservation_stop: {s}\nlookups: {d} launched, {d} completion events, {d} timed out, {d} unobserved IDs\n",
+        .{ lookup_status.label(), stop_reason.label(), lookups_launched, lookups_finished, lookups_timed_out, pending_lookups.count() },
+    );
     try stdout.print("setup_ms: {d}\nlookup_elapsed_ms: {d}\n", .{ setup_elapsed_ms, lookup_elapsed_ms });
     const snapshot = discovery_runtime.metricsSnapshot() catch |err| {
         try stdout.print("metrics: unavailable ({})\n", .{err});
         return;
     };
+    peak_sessions = @max(peak_sessions, snapshot.active_session_count);
+    peak_routing = @max(peak_routing, snapshot.kad_table_size);
+    peak_connected = @max(peak_connected, snapshot.connected_peer_count);
+    const actor_completed = lookups_launched -| snapshot.active_lookup_count;
     try stdout.print(
-        "routing: {d} peers, {d} connected, {d} sessions\npackets: {d} received, {d} processed, {d} filtered\nmessages: {d} FINDNODE sent, {d} NODES received\nevents_dropped: {d}\n",
+        "routing: {d} peers, {d} connected, {d} sessions\nwork: {d} active lookups, {d} actor-completed lookups, {d} active requests, {d} queued requests\nsampled_peaks: {d} routing, {d} connected, {d} sessions\npackets: {d} received, {d} processed, {d} filtered\nmessages: {d} FINDNODE sent, {d} NODES received\nevents_dropped: {d}\n",
         .{
             snapshot.kad_table_size,
             snapshot.connected_peer_count,
             snapshot.active_session_count,
+            snapshot.active_lookup_count,
+            actor_completed,
+            snapshot.active_request_count,
+            snapshot.queued_request_count,
+            peak_routing,
+            peak_connected,
+            peak_sessions,
             snapshot.received_packet_count,
             snapshot.processed_packet_count,
             snapshot.filtered_packet_count,
@@ -348,6 +460,25 @@ fn parseOptions(alloc: Allocator, args_value: std.process.Args) !?Options {
             const value = args.next() orelse return error.MissingMaxResults;
             options.max_results = try parsePositiveInt(usize, value);
             if (options.max_results > max_streamed_results) return error.TooManyResults;
+        } else if (std.mem.eql(u8, arg, "--lookups")) {
+            const value = args.next() orelse return error.MissingLookupCount;
+            options.lookup_count = try parsePositiveInt(usize, value);
+            if (options.lookup_count > max_concurrent_lookups) return error.TooManyLookups;
+        } else if (std.mem.eql(u8, arg, "--sample-ms")) {
+            const value = args.next() orelse return error.MissingSampleInterval;
+            options.sample_ms = try parsePositiveInt(u64, value);
+            if (options.sample_ms > std.math.maxInt(i64)) return error.SampleIntervalTooLarge;
+        } else if (std.mem.eql(u8, arg, "--duration-ms")) {
+            const value = args.next() orelse return error.MissingDuration;
+            options.duration_ms = try parsePositiveInt(u64, value);
+            if (options.duration_ms.? > max_duration_ms) return error.DurationTooLarge;
+        } else if (std.mem.eql(u8, arg, "--session-capacity")) {
+            const value = args.next() orelse return error.MissingSessionCapacity;
+            options.session_capacity = try parsePositiveInt(u32, value);
+            if (options.session_capacity > (discv5.Limits{}).session_capacity)
+                return error.TooManySessions;
+        } else if (std.mem.eql(u8, arg, "--quiet")) {
+            options.print_enrs = false;
         } else if (std.mem.eql(u8, arg, "--target")) {
             const value = args.next() orelse return error.MissingTarget;
             options.target = try parseNodeId(value);
@@ -396,26 +527,41 @@ fn addBootnode(alloc: Allocator, runtime: *discv5.Runtime, bootnode: []const u8)
     return true;
 }
 
-fn printFoundEnr(
+fn deriveLookupTarget(base: NodeId, index: usize) NodeId {
+    if (index == 0) return base;
+    var index_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &index_bytes, @intCast(index), .big);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(&base);
+    hasher.update(&index_bytes);
+    var target: NodeId = undefined;
+    hasher.final(&target);
+    return target;
+}
+
+fn recordFoundEnr(
     alloc: Allocator,
     stdout: *std.Io.Writer,
     seen: *std.AutoHashMap(NodeId, void),
     raw_enr: []const u8,
+    print_enr: bool,
 ) !bool {
     const parsed = discv5.enr.decode(raw_enr) catch return false;
-    return try printFoundParsedEnr(alloc, stdout, seen, raw_enr, &parsed);
+    return try recordFoundParsedEnr(alloc, stdout, seen, raw_enr, &parsed, print_enr);
 }
 
-fn printFoundParsedEnr(
+fn recordFoundParsedEnr(
     alloc: Allocator,
     stdout: *std.Io.Writer,
     seen: *std.AutoHashMap(NodeId, void),
     raw_enr: []const u8,
     parsed: *const discv5.Enr,
+    print_enr: bool,
 ) !bool {
     const node_id = (try parsed.nodeId()) orelse return false;
     const seen_entry = try seen.getOrPut(node_id);
     if (seen_entry.found_existing) return false;
+    if (!print_enr) return true;
 
     const text = try discv5.enr.encodeText(alloc, raw_enr);
     defer alloc.free(text);
@@ -455,8 +601,13 @@ fn printUsage(stdout: *std.Io.Writer) !void {
         \\
         \\Options:
         \\  --timeout-ms N            Stop after N milliseconds (default: 30000)
-        \\  --max-results N           Stop after N unique ENRs, max 1024 (default: 64)
-        \\  --target 0xHEX            Lookup a specific 32-byte node id; random by default
+        \\  --max-results N           Stop after N unique ENRs, max 65536 (default: 4096)
+        \\  --lookups N               Start N concurrent lookups, max 1024 (default: 1)
+        \\  --sample-ms N             Print state every N milliseconds (default: 1000)
+        \\  --duration-ms N           Replenish lookups for N ms, max 3600000
+        \\  --session-capacity N      Session LRU capacity, max 2000 (default: 2000)
+        \\  --quiet                   Suppress individual ENR output
+        \\  --target 0xHEX            Base target; concurrent lookups derive spread targets
         \\  --bootnode enr:...        Add an extra bootnode ENR
         \\  --no-default-bootnodes    Use only bootnodes passed on the command line
         \\  -h, --help                Show this help

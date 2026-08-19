@@ -793,6 +793,8 @@ test "running Runtime rejects oversized TALK before queued ownership admission" 
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
     try std.testing.expectEqual(@as(usize, 1), counts.permits);
     const snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.active_request_count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.queued_request_count);
     try std.testing.expectEqual(@as(u64, 1), snapshot.sentMessageCount(metrics.MessageType.ping));
     try std.testing.expectEqual(@as(u64, 0), snapshot.sentMessageCount(metrics.MessageType.talkreq));
 
@@ -801,6 +803,9 @@ test "running Runtime rejects oversized TALK before queued ownership admission" 
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
     try std.testing.expectEqual(@as(usize, 0), counts.permits);
+    const cancelled_snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), cancelled_snapshot.active_request_count);
+    try std.testing.expectEqual(@as(usize, 0), cancelled_snapshot.queued_request_count);
 
     running.stop();
     try running.await();

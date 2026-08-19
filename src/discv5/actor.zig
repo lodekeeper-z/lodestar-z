@@ -357,6 +357,9 @@ pub const Actor = struct {
             .active_session_count = self.sessions.count(now_ns),
             .connected_peer_count = self.peers.connectedCount(),
             .lookup_count = self.lookup_count,
+            .active_lookup_count = self.lookups.count(),
+            .active_request_count = self.requests.activeCount(),
+            .queued_request_count = self.requests.queuedCount(),
             .sent_message_count = self.metrics.sent_message_count,
             .rcvd_message_count = self.metrics.rcvd_message_count,
         };
