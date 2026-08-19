@@ -4,14 +4,29 @@ const types = @import("../types.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const RequestDistances = struct {
+    bits: std.StaticBitSet(257) = .initEmpty(),
+
+    pub fn fromSlice(distances: []const u16) RequestDistances {
+        var result = RequestDistances{};
+        for (distances) |distance| {
+            if (distance <= 256) result.bits.set(distance);
+        }
+        return result;
+    }
+
+    pub fn contains(self: *const RequestDistances, distance: u16) bool {
+        return distance <= 256 and self.bits.isSet(distance);
+    }
+};
+
 pub const QueuedRequest = struct {
     origin: types.RequestOrigin,
     endpoint: types.Endpoint,
     dest_pubkey: [33]u8,
     req_id: message.ReqId,
     kind: types.RequestKind,
-    distances: [127]u16 = undefined,
-    distances_len: u8 = 0,
+    requested_distances: RequestDistances,
     plaintext: types.PacketBytes,
     deadline_ns: i64,
 
@@ -26,18 +41,16 @@ pub const QueuedRequest = struct {
         deadline_ns: i64,
     ) !QueuedRequest {
         if (distances.len > 127) return error.TooManyDistances;
-        var result = QueuedRequest{
+        return .{
             .origin = origin,
             .endpoint = endpoint,
             .dest_pubkey = dest_pubkey.*,
             .req_id = req_id,
             .kind = kind,
+            .requested_distances = .fromSlice(distances),
             .plaintext = try .init(plaintext),
             .deadline_ns = deadline_ns,
         };
-        @memcpy(result.distances[0..distances.len], distances);
-        result.distances_len = @intCast(distances.len);
-        return result;
     }
 };
 

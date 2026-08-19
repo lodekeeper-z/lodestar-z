@@ -18,6 +18,10 @@ fn endpoint(last: u8) types.Endpoint {
     };
 }
 
+fn requestedDistances(distances: []const u16) book_mod.RequestDistances {
+    return .fromSlice(distances);
+}
+
 fn probe(nonce_byte: u8) !book_mod.AwaitingWhoareyou {
     return .{
         .retry_packet = try .init(&.{ 3, 4 }),
@@ -27,6 +31,15 @@ fn probe(nonce_byte: u8) !book_mod.AwaitingWhoareyou {
             .plaintext = try .init(&.{ 1, 2 }),
         },
     };
+}
+
+test "FINDNODE correlation stores bounded distance membership" {
+    const distances = book_mod.RequestDistances.fromSlice(&.{ 256, 0, 256, 257, 1 });
+    try std.testing.expect(distances.contains(0));
+    try std.testing.expect(distances.contains(1));
+    try std.testing.expect(distances.contains(256));
+    try std.testing.expect(!distances.contains(2));
+    try std.testing.expect(!distances.contains(257));
 }
 
 test "response waits preserve challenge and pending-key behavior across retries and promotion" {
@@ -160,9 +173,12 @@ test "RequestBook keeps every request queued xor active in FIFO order" {
     const pubkey = [_]u8{3} ** 33;
     const first = try message.ReqId.fromSlice(&.{1});
     const second = try message.ReqId.fromSlice(&.{2});
-    try book.queue(try .init(.api, peer, &pubkey, first, .ping, &.{}, &.{1}, 0));
+    try book.queue(try .init(.api, peer, &pubkey, first, .ping, &.{ 0, 256, 256 }, &.{1}, 0));
     try book.queue(try .init(.api, peer, &pubkey, second, .ping, &.{}, &.{1}, 0));
     try std.testing.expectEqualSlices(u8, first.slice(), book.firstQueued(peer).?.req_id.slice());
+    try std.testing.expect(book.firstQueued(peer).?.requested_distances.contains(0));
+    try std.testing.expect(book.firstQueued(peer).?.requested_distances.contains(256));
+    try std.testing.expect(!book.firstQueued(peer).?.requested_distances.contains(1));
     const prepared = try book.prepareActive(&ingress, .init(peer, first), .api, .pong, .{
         .awaiting_whoareyou = try probe(8),
     }, 0, true);
@@ -310,7 +326,8 @@ fn allocationLifecycle(alloc: std.mem.Allocator) !void {
     var book = try book_mod.RequestBook.init(alloc, limits);
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(3), try message.ReqId.fromSlice(&.{1}));
-    const prepared = try book.prepareActive(&ingress, key, .api, try book.makeResponse(.findnode, &.{1}), .{
+    const requested = requestedDistances(&.{1});
+    const prepared = try book.prepareActive(&ingress, key, .api, try book.makeResponse(.findnode, &requested), .{
         .awaiting_whoareyou = try probe(9),
     }, 0, true);
     book.commitPrepared(prepared);
@@ -345,7 +362,8 @@ test "RequestBook queue initialization unwinds every allocator failure" {
 }
 
 fn firstNodesAllocationLifecycle(alloc: std.mem.Allocator) !void {
-    var response = book_mod.Response{ .nodes = try .init(alloc, &.{1}) };
+    const requested = requestedDistances(&.{1});
+    var response = book_mod.Response{ .nodes = try .init(alloc, &requested) };
     defer response.deinit(alloc);
     const copy = try alloc.dupe(u8, "enr");
     response.nodes.enrs.appendAssumeCapacity(copy);
@@ -356,7 +374,8 @@ test "first NODES storage allocation has complete failure cleanup" {
 }
 
 test "NODES accumulator reserves the canonical response bound" {
-    var accumulator = try book_mod.NodesAccumulator.init(std.testing.allocator, &.{1});
+    const requested = requestedDistances(&.{1});
+    var accumulator = try book_mod.NodesAccumulator.init(std.testing.allocator, &requested);
     defer accumulator.deinit(std.testing.allocator);
     try std.testing.expectEqual(book_mod.MAX_NODES_RESPONSE, accumulator.enrs.capacity);
 }
@@ -367,7 +386,11 @@ test "final NODES completion moves list ownership without allocation" {
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(5), try message.ReqId.fromSlice(&.{1}));
-    var response = try book.makeResponse(.findnode, &.{1});
+    const requested = requestedDistances(&.{ 0, 256, 256 });
+    var response = try book.makeResponse(.findnode, &requested);
+    try std.testing.expect(response.nodes.requested_distances.contains(0));
+    try std.testing.expect(response.nodes.requested_distances.contains(256));
+    try std.testing.expect(!response.nodes.requested_distances.contains(1));
     response.nodes.enrs.appendAssumeCapacity(try std.testing.allocator.dupe(u8, "enr"));
     const prepared = try book.prepareActive(&ingress, key, .api, response, .{
         .awaiting_whoareyou = try probe(10),

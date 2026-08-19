@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const AdmissionPermit = admission_mod.AdmissionPermit;
 
 pub const MAX_NODES_RESPONSE: usize = config_mod.MAX_NODES_RESPONSE;
+pub const RequestDistances = request_queue.RequestDistances;
 
 pub const PendingSessionKeys = struct {
     initiator_key: [16]u8,
@@ -83,16 +84,12 @@ pub const NodesAccumulator = struct {
     enrs: std.ArrayListUnmanaged([]u8) = .empty,
     total_responses: ?u64 = null,
     responses_received: u64 = 0,
-    distances: [127]u16 = undefined,
-    distances_len: u8 = 0,
+    requested_distances: RequestDistances,
 
-    pub fn init(alloc: Allocator, distances: []const u16) !NodesAccumulator {
-        var result = NodesAccumulator{};
+    pub fn init(alloc: Allocator, requested_distances: *const RequestDistances) !NodesAccumulator {
+        var result = NodesAccumulator{ .requested_distances = requested_distances.* };
         errdefer result.deinit(alloc);
         try result.enrs.ensureTotalCapacityPrecise(alloc, MAX_NODES_RESPONSE);
-        const count = @min(distances.len, result.distances.len);
-        @memcpy(result.distances[0..count], distances[0..count]);
-        result.distances_len = @intCast(count);
         return result;
     }
 
@@ -218,11 +215,11 @@ pub const RequestBook = struct {
         self.challenge_by_nonce.deinit();
     }
 
-    pub fn makeResponse(self: *RequestBook, kind: types.RequestKind, distances: []const u16) !Response {
+    pub fn makeResponse(self: *RequestBook, kind: types.RequestKind, requested_distances: *const RequestDistances) !Response {
         return switch (kind) {
             .ping => .pong,
             .talkreq => .talkresp,
-            .findnode => .{ .nodes = try .init(self.alloc, distances) },
+            .findnode => .{ .nodes = try .init(self.alloc, requested_distances) },
         };
     }
 

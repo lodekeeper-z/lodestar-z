@@ -28,7 +28,8 @@ pub fn sendTracked(
         try actor.requests.queue(try .init(origin, endpoint, dest_pubkey, req_id, kind, distances, plaintext, deadlineNs(now_ns, actor.request_timeout_ms)));
         return;
     }
-    try dispatch(actor, env, endpoint, dest_pubkey, req_id, kind, distances, plaintext, origin, false);
+    const requested_distances = request_book.RequestDistances.fromSlice(distances);
+    try dispatch(actor, env, endpoint, dest_pubkey, req_id, kind, &requested_distances, plaintext, origin, false);
 }
 
 pub fn drainEndpoint(actor: *Actor, env: Env, endpoint: types.Endpoint) void {
@@ -42,7 +43,7 @@ pub fn drainEndpoint(actor: *Actor, env: Env, endpoint: types.Endpoint) void {
             &queued.dest_pubkey,
             queued.req_id,
             queued.kind,
-            queued.distances[0..queued.distances_len],
+            &queued.requested_distances,
             queued.plaintext.slice(),
             queued.origin,
             true,
@@ -58,7 +59,7 @@ fn dispatch(
     dest_pubkey: *const [33]u8,
     req_id: message.ReqId,
     kind: types.RequestKind,
-    distances: []const u16,
+    requested_distances: *const request_book.RequestDistances,
     plaintext: []const u8,
     origin: types.RequestOrigin,
     from_queue: bool,
@@ -82,7 +83,7 @@ fn dispatch(
         .{ .awaiting_whoareyou = .{ .retry_packet = try .init(encoded.bytes), .recovery = recovery } }
     else
         .{ .awaiting_response = .{ .recovery = recovery, .wait = .session_request } };
-    const response = try actor.requests.makeResponse(kind, distances);
+    const response = try actor.requests.makeResponse(kind, requested_distances);
     var prepared = try actor.requests.prepareActive(
         env.ingress,
         .init(endpoint, req_id),
