@@ -1,7 +1,6 @@
 const std = @import("std");
 const actor_mod = @import("../actor.zig");
 const config = @import("../config.zig");
-const events = @import("../events.zig");
 const outbound = @import("outbound.zig");
 const completion = @import("completion.zig");
 const kbucket = @import("../kbucket.zig");
@@ -26,7 +25,7 @@ pub fn run(actor: *Actor, env: Env, now_ns: i64) void {
     pruneActive(actor, env, now_ns);
     pruneQueued(actor, env, now_ns);
     redrainQueued(actor, env);
-    pruneLookups(actor, env.outbox, now_ns);
+    pruneLookups(actor, env, now_ns);
     actor.repumpLookups(env);
     var transitions: [kbucket.NUM_BUCKETS]peer_book.ConnectionEvent = undefined;
     const transition_count = actor.peers.prune(now_ns, actor.bucket_pending_timeout_ms, &transitions);
@@ -156,7 +155,7 @@ fn pruneQueued(actor: *Actor, env: Env, now_ns: i64) void {
     }
 }
 
-fn pruneLookups(actor: *Actor, outbox: *events.EventOutbox, now_ns: i64) void {
+fn pruneLookups(actor: *Actor, env: Env, now_ns: i64) void {
     var timed_out: [actor_mod.MAX_LOOKUPS]u32 = undefined;
     const count = blk: {
         var count: usize = 0;
@@ -169,7 +168,7 @@ fn pruneLookups(actor: *Actor, outbox: *events.EventOutbox, now_ns: i64) void {
         }
         break :blk count;
     };
-    for (timed_out[0..count]) |lookup_id| actor.finishLookup(outbox, lookup_id, true);
+    for (timed_out[0..count]) |lookup_id| actor.finishLookup(env, lookup_id, .timed_out);
 }
 
 fn pingDue(actor: *Actor, env: Env, now_ns: i64) void {

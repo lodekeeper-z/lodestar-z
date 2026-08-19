@@ -32,6 +32,11 @@ pub const EventError = error{
     Closed,
 };
 
+pub const LookupResultError = error{
+    Canceled,
+    Closed,
+};
+
 pub const CommandError = error{
     Canceled,
     Closed,
@@ -83,11 +88,12 @@ pub const TalkResponseError = CommandError || error{
 };
 
 pub const LookupError = CommandError || error{
+    LookupResultCapacityExceeded,
     OutOfMemory,
     TooManyLookups,
 };
 
 /// Compatibility umbrella for callers that want one Runtime-wide error type.
-pub const Error = InitError || RunError || EventError || EnrAdmissionError ||
+pub const Error = InitError || RunError || EventError || LookupResultError || EnrAdmissionError ||
     SetLocalEnrError || RequestError || FindNodeError || TalkRequestError ||
     TalkResponseError || LookupError;

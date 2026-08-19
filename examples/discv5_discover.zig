@@ -243,6 +243,27 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     var peak_connected: usize = 0;
 
     while (true) {
+        while (discovery_runtime.popLookupResult()) |lookup_result| {
+            if (!pending_lookups.remove(lookup_result.lookup_id)) continue;
+            lookups_finished += 1;
+            if (lookup_result.reason == .timed_out) lookups_timed_out += 1;
+            final_results += lookup_result.enrs.slice().len;
+            for (lookup_result.enrs.slice()) |*raw_enr| {
+                if (found >= options.max_results) break;
+                if (try recordFoundEnr(alloc, stdout, &seen, raw_enr.slice(), options.print_enrs)) found += 1;
+            }
+            if (lookup_result.reason == .runtime_stopped) lookup_status = .runtime_stopped;
+            if (duration_deadline == null and pending_lookups.count() == 0) {
+                if (lookup_status != .runtime_stopped)
+                    lookup_status = if (lookups_timed_out == 0) .finished else .timed_out;
+                finish_drain_deadline = std.Io.Timestamp.now(io, .awake).addDuration(
+                    .fromMilliseconds(lookup_finish_grace_ms),
+                );
+                deadline_drain_remaining = max_deadline_drain_events;
+            }
+            try stdout.flush();
+        }
+
         if (found >= options.max_results) {
             stop_reason = .output_limit;
             break;
@@ -256,8 +277,9 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
             }
         }
         if (duration_deadline != null and next_reconcile_at.durationTo(now).toNanoseconds() >= 0) {
-            const snapshot = try discovery_runtime.metricsSnapshot();
-            var deficit = options.lookup_count -| snapshot.active_lookup_count;
+            // Pending IDs include both actor-active lookups and terminal results
+            // whose reserved slots have not been consumed yet.
+            var deficit = options.lookup_count -| pending_lookups.count();
             while (deficit > 0 and lookups_launched < max_total_lookups) : (deficit -= 1) {
                 const replacement_target = deriveLookupTarget(target, lookups_launched);
                 const replacement_id = discovery_runtime.startLookup(replacement_target) catch |err| switch (err) {
@@ -346,24 +368,9 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
                     if (options.print_enrs) try stdout.flush();
                 }
             },
-            .lookup_finished => |lookup_finished| {
-                if (!pending_lookups.remove(lookup_finished.lookup_id)) continue;
-                lookups_finished += 1;
-                if (lookup_finished.timed_out) lookups_timed_out += 1;
-                final_results += lookup_finished.enrs.items.len;
-                for (lookup_finished.enrs.items) |raw_enr| {
-                    if (found >= options.max_results) break;
-                    if (try recordFoundEnr(alloc, stdout, &seen, raw_enr, options.print_enrs)) found += 1;
-                }
-                if (duration_deadline == null and pending_lookups.count() == 0) {
-                    lookup_status = if (lookups_timed_out == 0) .finished else .timed_out;
-                    finish_drain_deadline = std.Io.Timestamp.now(io, .awake).addDuration(
-                        .fromMilliseconds(lookup_finish_grace_ms),
-                    );
-                    deadline_drain_remaining = max_deadline_drain_events;
-                }
-                try stdout.flush();
-            },
+            // Compatibility observation only. Terminal lookup state and payloads
+            // are consumed from the reserved reliable result plane above.
+            .lookup_finished => {},
             else => {},
         }
     }

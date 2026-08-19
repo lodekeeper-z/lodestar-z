@@ -42,6 +42,7 @@ pub const Lookup = struct {
     no_progress: usize = 0,
     num_waiting: usize = 0,
     deferred: bool = false,
+    reliable_result: bool = false,
     peers: std.ArrayListUnmanaged(Peer) = .empty,
 
     pub fn init(alloc: Allocator, target: NodeId, seeds: []const NodeId, started_at_ns: i64, config: Config) !Lookup {

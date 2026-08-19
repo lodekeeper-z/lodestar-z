@@ -719,6 +719,165 @@ test "normal stop drains accepted owned commands and replies" {
     try std.testing.expect(!(try result));
 }
 
+test "reliable lookup results survive a full event outbox and release capacity on take" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x81, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 1,
+        .command_capacity = 4,
+        .lookup_result_capacity = 1,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x81} ** 32));
+    var local_builder = enr.Builder.init(alloc, local_key, 1);
+    const local_enr = try local_builder.encode();
+    defer alloc.free(local_enr);
+    try runtime.setLocalEnr(local_enr);
+
+    const first_target = [_]u8{0x82} ** 32;
+    const first_id = try runtime.startLookup(first_target);
+    try std.testing.expectError(error.LookupResultCapacityExceeded, runtime.startLookup([_]u8{0x83} ** 32));
+
+    const snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.lookup_count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.active_lookup_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.dropped_event_count);
+
+    var blocker = runtime.popEvent() orelse return error.MissingOutboxBlocker;
+    defer blocker.deinit(alloc);
+    try std.testing.expect(blocker == .local_enr_updated);
+    try std.testing.expect(runtime.popEvent() == null);
+
+    const first = runtime.popLookupResult() orelse return error.MissingLookupResult;
+    try std.testing.expectEqual(first_id, first.lookup_id);
+    try std.testing.expectEqualSlices(u8, &first_target, &first.target);
+    try std.testing.expectEqual(runtime_mod.LookupTerminalReason.completed, first.reason);
+    try std.testing.expectEqual(@as(usize, 0), first.enrs.slice().len);
+    try std.testing.expect(runtime.popLookupResult() == null);
+
+    const second_id = try runtime.startLookup([_]u8{0x84} ** 32);
+    try std.testing.expectError(error.LookupResultCapacityExceeded, runtime.startLookup([_]u8{0x85} ** 32));
+    const second = try runtime.nextLookupResult();
+    try std.testing.expectEqual(second_id, second.lookup_id);
+    try std.testing.expectEqual(runtime_mod.LookupTerminalReason.completed, second.reason);
+
+    const third_id = try runtime.startLookup([_]u8{0x86} ** 32);
+    const third = runtime.popLookupResult() orelse return error.MissingLookupResult;
+    try std.testing.expectEqual(third_id, third.lookup_id);
+
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
+    try std.testing.expectError(error.Closed, runtime.nextLookupResult());
+}
+
+test "lookup result capacity rejects before actor insertion or network work and shutdown is terminal" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x87, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 4,
+        .command_capacity = 4,
+        .lookup_result_capacity = 1,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const first_id = try runtime.startLookup([_]u8{0x88} ** 32);
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x89} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 89 }, .port = 9089 } };
+    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
+    remote_builder.ip = .{ 127, 0, 0, 89 };
+    remote_builder.udp = 9089;
+    const remote_enr = try remote_builder.encode();
+    defer alloc.free(remote_enr);
+    try std.testing.expect(try runtime.addNode(remote_id, &remote_pubkey, remote_address, remote_enr));
+
+    const network_target = [_]u8{0x8a} ** 32;
+    try std.testing.expectError(error.LookupResultCapacityExceeded, runtime.startLookup(network_target));
+    var snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.lookup_count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.active_lookup_count);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.sentMessageCount(metrics.MessageType.findnode));
+
+    const first = runtime.popLookupResult() orelse return error.MissingLookupResult;
+    try std.testing.expectEqual(first_id, first.lookup_id);
+    const active_id = try runtime.startLookup(network_target);
+    snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 2), snapshot.lookup_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.active_lookup_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.sentMessageCount(metrics.MessageType.findnode));
+
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
+    const stopped = runtime.popLookupResult() orelse return error.MissingShutdownLookupResult;
+    try std.testing.expectEqual(active_id, stopped.lookup_id);
+    try std.testing.expectEqualSlices(u8, &network_target, &stopped.target);
+    try std.testing.expectEqual(runtime_mod.LookupTerminalReason.runtime_stopped, stopped.reason);
+    try std.testing.expect(runtime.popLookupResult() == null);
+}
+
+test "lookup timeout publishes a reliable timed out terminal result" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x8b} ** 32));
+    const runtime = try runtime_mod.Runtime.init(io, alloc, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key)),
+        .lookup_timeout_ms = 0,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 2,
+            .max_queued_requests = 2,
+            .event_capacity = 2,
+            .command_capacity = 4,
+            .lookup_result_capacity = 1,
+        },
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x8c} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 140 }, .port = 9140 } };
+    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
+    remote_builder.ip = .{ 127, 0, 0, 140 };
+    remote_builder.udp = 9140;
+    const remote_enr = try remote_builder.encode();
+    defer alloc.free(remote_enr);
+    try std.testing.expect(try runtime.addNode(remote_id, &remote_pubkey, remote_address, remote_enr));
+    const lookup_id = try runtime.startLookup([_]u8{0x8d} ** 32);
+    try runtime_mod.Testing.putMaintenance(runtime);
+    const snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.active_lookup_count);
+
+    const result = runtime.popLookupResult() orelse return error.MissingTimedOutLookupResult;
+    try std.testing.expectEqual(lookup_id, result.lookup_id);
+    try std.testing.expectEqual(runtime_mod.LookupTerminalReason.timed_out, result.reason);
+}
+
 fn errorSetOf(comptime function: anytype) type {
     const return_type = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
     return @typeInfo(return_type).error_union.error_set;
@@ -735,6 +894,7 @@ test "public Runtime APIs expose exact operation error contracts" {
         expectErrorSet(runtime_mod.Runtime.init, runtime_mod.Runtime.InitError);
         expectErrorSet(runtime_mod.Runtime.run, runtime_mod.Runtime.RunError);
         expectErrorSet(runtime_mod.Runtime.nextEvent, runtime_mod.Runtime.EventError);
+        expectErrorSet(runtime_mod.Runtime.nextLookupResult, runtime_mod.Runtime.LookupResultError);
         expectErrorSet(runtime_mod.Runtime.addNode, runtime_mod.Runtime.EnrAdmissionError);
         expectErrorSet(runtime_mod.Runtime.addEnr, runtime_mod.Runtime.EnrAdmissionError);
         expectErrorSet(runtime_mod.Runtime.setLocalEnr, runtime_mod.Runtime.SetLocalEnrError);

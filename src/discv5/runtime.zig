@@ -4,6 +4,7 @@ const admission_mod = @import("admission.zig");
 const config_mod = @import("config.zig");
 const enr = @import("enr.zig");
 const events = @import("events.zig");
+const lookup_results = @import("lookup_results.zig");
 const message = @import("protocol/message.zig");
 const metrics = @import("metrics.zig");
 const packet = @import("protocol/packet.zig");
@@ -27,6 +28,8 @@ const TalkRequestError = runtime_error.TalkRequestError;
 const TalkResponseError = runtime_error.TalkResponseError;
 const LookupError = runtime_error.LookupError;
 pub const Error = runtime_error.Error;
+pub const LookupResult = lookup_results.LookupResult;
+pub const LookupTerminalReason = lookup_results.LookupTerminalReason;
 
 const RuntimeImpl = struct {
     io: Io,
@@ -34,6 +37,7 @@ const RuntimeImpl = struct {
     transport: transport_mod.Transport,
     admission: admission_mod.IngressAdmission,
     outbox: events.EventOutbox,
+    lookup_result_outbox: lookup_results.LookupResultOutbox,
     actor: actor_mod.Actor,
     options: config_mod.Options,
     command_queue: Io.Queue(Command),
@@ -51,7 +55,7 @@ const RuntimeImpl = struct {
     const FindNodeResult = FindNodeError!message.ReqId;
     const TalkRequestResult = TalkRequestError!message.ReqId;
     const TalkResponseResult = TalkResponseError!void;
-    const LookupResult = LookupError!u32;
+    const LookupStartResult = LookupError!u32;
     const CommandBoolResult = CommandError!bool;
     const MetricsResult = CommandError!metrics.MetricsSnapshot;
     const EnrResult = CommandError!?enr.RawEnr;
@@ -62,7 +66,7 @@ const RuntimeImpl = struct {
     const FindNodeReply = Io.Queue(FindNodeResult);
     const TalkRequestReply = Io.Queue(TalkRequestResult);
     const TalkResponseReply = Io.Queue(TalkResponseResult);
-    const LookupReply = Io.Queue(LookupResult);
+    const LookupReply = Io.Queue(LookupStartResult);
     const CommandBoolReply = Io.Queue(CommandBoolResult);
     const MetricsReply = Io.Queue(MetricsResult);
     const EnrReply = Io.Queue(EnrResult);
@@ -151,6 +155,7 @@ const RuntimeImpl = struct {
             error.InvalidAdmissionCapacity,
             error.InvalidContactCapacity,
             error.InvalidEventCapacity,
+            error.InvalidLookupResultCapacity,
             error.InvalidPublicKey,
             error.InvalidRequestCapacity,
             error.InvalidSignature,
@@ -169,6 +174,8 @@ const RuntimeImpl = struct {
         errdefer admission.deinit();
         var outbox = try events.EventOutbox.init(io, allocator, config.limits.event_capacity);
         errdefer outbox.deinit();
+        var lookup_result_outbox = try lookup_results.LookupResultOutbox.init(io, allocator, config.limits.lookup_result_capacity);
+        errdefer lookup_result_outbox.deinit();
         var actor = try actor_mod.Actor.init(allocator, config);
         errdefer actor.deinit(&admission);
         const commands = try allocator.alloc(Command, config.limits.command_capacity);
@@ -178,6 +185,7 @@ const RuntimeImpl = struct {
             .transport = transport,
             .admission = admission,
             .outbox = outbox,
+            .lookup_result_outbox = lookup_result_outbox,
             .actor = actor,
             .options = options,
             .command_queue = .init(commands),
@@ -189,6 +197,7 @@ const RuntimeImpl = struct {
         std.debug.assert(!self.running.load(.acquire));
         self.stop();
         self.outbox.deinit();
+        self.lookup_result_outbox.deinit();
         self.actor.deinit(&self.admission);
         self.admission.deinit();
         self.transport.deinit();
@@ -219,6 +228,8 @@ const RuntimeImpl = struct {
         self.stop();
         self.drainAcceptedCommands();
         self.group.cancel(self.io);
+        self.actor.finishAllLookups(self.actorEnv(), .runtime_stopped);
+        self.lookup_result_outbox.close();
         self.outbox.close();
     }
 
@@ -240,6 +251,14 @@ const RuntimeImpl = struct {
 
     fn popEvent(self: *RuntimeImpl) ?events.Event {
         return self.outbox.pop();
+    }
+
+    fn nextLookupResult(self: *RuntimeImpl) (Io.QueueClosedError || Io.Cancelable)!lookup_results.LookupResult {
+        return self.lookup_result_outbox.next();
+    }
+
+    fn popLookupResult(self: *RuntimeImpl) ?lookup_results.LookupResult {
+        return self.lookup_result_outbox.pop();
     }
 
     fn ensureRunning(self: *RuntimeImpl) !void {
@@ -285,6 +304,7 @@ const RuntimeImpl = struct {
             .sender = self.transport.sender(),
             .ingress = &self.admission,
             .outbox = &self.outbox,
+            .lookup_results = &self.lookup_result_outbox,
         };
     }
 
@@ -343,11 +363,11 @@ const RuntimeImpl = struct {
                 self.io,
                 self.actor.cancelRequest(env, value.key),
             ) catch {},
-            .start_lookup => |value| try replyResult(self.io, value.reply, startLookupResult(&self.actor, env, value.target)),
+            .start_lookup => |value| try self.handleStartLookup(env, value.target, value.reply),
             .start_random_lookup => |reply| {
                 var target: types.NodeId = undefined;
                 self.io.random(&target);
-                try replyResult(self.io, reply, startLookupResult(&self.actor, env, target));
+                try self.handleStartLookup(env, target, reply);
             },
             .metrics_snapshot => |reply| {
                 var snapshot = self.actor.metricsSnapshot(util.nowNs(self.io));
@@ -364,6 +384,12 @@ const RuntimeImpl = struct {
             .peer_enr => |value| value.reply.putOneUncancelable(self.io, self.actor.peerEnr(&value.node_id)) catch {},
             .local_enr_seq => |reply| reply.putOneUncancelable(self.io, self.actor.localEnrSeq()) catch {},
         }
+    }
+
+    fn handleStartLookup(self: *RuntimeImpl, env: actor_mod.Env, target: types.NodeId, reply: *LookupReply) Io.Cancelable!void {
+        const result = startLookupResult(&self.actor, env, target);
+        if (result) |_| {} else |_| self.lookup_result_outbox.release();
+        try replyResult(self.io, reply, result);
     }
 
     fn receiveLoop(self: *RuntimeImpl, family: types.Address.Family) Io.Cancelable!void {
@@ -575,6 +601,8 @@ fn startLookupResult(actor: *actor_mod.Actor, env: actor_mod.Env, target: types.
     return actor.startLookup(env, target) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.TooManyLookups => error.TooManyLookups,
+        error.LookupResultPlaneUnavailable,
+        error.LookupResultReservationMissing,
         error.InvalidNumResults,
         error.InvalidParallelism,
         error.TooManySeeds,
@@ -591,6 +619,7 @@ pub const Runtime = opaque {
     pub const InitError = runtime_error.InitError;
     pub const RunError = runtime_error.RunError;
     pub const EventError = runtime_error.EventError;
+    pub const LookupResultError = runtime_error.LookupResultError;
     pub const CommandError = runtime_error.CommandError;
     pub const EnrAdmissionError = runtime_error.EnrAdmissionError;
     pub const SetLocalEnrError = runtime_error.SetLocalEnrError;
@@ -599,6 +628,8 @@ pub const Runtime = opaque {
     pub const TalkRequestError = runtime_error.TalkRequestError;
     pub const TalkResponseError = runtime_error.TalkResponseError;
     pub const LookupError = runtime_error.LookupError;
+    pub const LookupResult = lookup_results.LookupResult;
+    pub const LookupTerminalReason = lookup_results.LookupTerminalReason;
     pub const Error = runtime_error.Error;
 
     pub fn init(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) runtime_error.InitError!*Runtime {
@@ -641,6 +672,14 @@ pub const Runtime = opaque {
 
     pub fn popEvent(self: *Runtime) ?events.Event {
         return impl(self).popEvent();
+    }
+
+    pub fn nextLookupResult(self: *Runtime) runtime_error.LookupResultError!lookup_results.LookupResult {
+        return impl(self).nextLookupResult();
+    }
+
+    pub fn popLookupResult(self: *Runtime) ?lookup_results.LookupResult {
+        return impl(self).popLookupResult();
     }
 
     pub fn addNode(self: *Runtime, node_id: types.NodeId, pubkey: ?*const [33]u8, address: types.Address, enr_bytes: ?[]const u8) runtime_error.EnrAdmissionError!bool {
@@ -764,9 +803,13 @@ pub const Runtime = opaque {
     pub fn startLookup(self: *Runtime, target: types.NodeId) runtime_error.LookupError!u32 {
         const storage = impl(self);
         try storage.ensureRunning();
-        var buffer: [1]RuntimeImpl.LookupResult = undefined;
+        if (!storage.lookup_result_outbox.reserve()) return error.LookupResultCapacityExceeded;
+        var reservation_transferred = false;
+        errdefer if (!reservation_transferred) storage.lookup_result_outbox.cancelUnclaimed();
+        var buffer: [1]RuntimeImpl.LookupStartResult = undefined;
         var reply = RuntimeImpl.LookupReply.init(&buffer);
         try storage.enqueueCommand(.{ .start_lookup = .{ .target = target, .reply = &reply } });
+        reservation_transferred = true;
         return try reply.getOneUncancelable(storage.io);
     }
 
@@ -785,9 +828,13 @@ pub const Runtime = opaque {
     pub fn startRandomLookup(self: *Runtime) runtime_error.LookupError!u32 {
         const storage = impl(self);
         try storage.ensureRunning();
-        var buffer: [1]RuntimeImpl.LookupResult = undefined;
+        if (!storage.lookup_result_outbox.reserve()) return error.LookupResultCapacityExceeded;
+        var reservation_transferred = false;
+        errdefer if (!reservation_transferred) storage.lookup_result_outbox.cancelUnclaimed();
+        var buffer: [1]RuntimeImpl.LookupStartResult = undefined;
         var reply = RuntimeImpl.LookupReply.init(&buffer);
         try storage.enqueueCommand(.{ .start_random_lookup = &reply });
+        reservation_transferred = true;
         return try reply.getOneUncancelable(storage.io);
     }
 

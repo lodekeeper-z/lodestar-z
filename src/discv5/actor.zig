@@ -7,6 +7,7 @@ const events = @import("events.zig");
 const completion = @import("flow/completion.zig");
 const kbucket = @import("kbucket.zig");
 const lookup_mod = @import("service/lookup.zig");
+const lookup_results = @import("lookup_results.zig");
 const message = @import("protocol/message.zig");
 const packet = @import("protocol/packet.zig");
 const metrics_mod = @import("metrics.zig");
@@ -21,7 +22,7 @@ const transport = @import("transport.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
-pub const MAX_LOOKUPS: usize = 1_024;
+pub const MAX_LOOKUPS: usize = config_mod.MAX_LOOKUPS;
 
 const LookupAttempt = struct {
     peer_id: types.NodeId,
@@ -38,6 +39,7 @@ pub const Env = struct {
     sender: transport.Sender,
     ingress: *admission.IngressAdmission,
     outbox: *events.EventOutbox,
+    lookup_results: ?*lookup_results.LookupResultOutbox = null,
 };
 
 pub const ProbeSnapshot = struct {
@@ -260,12 +262,15 @@ pub const Actor = struct {
     }
 
     pub fn startLookup(self: *Actor, env: Env, target: types.NodeId) !u32 {
+        const result_outbox = env.lookup_results orelse return error.LookupResultPlaneUnavailable;
+        if (!result_outbox.claim()) return error.LookupResultReservationMissing;
         if (self.lookups.count() >= MAX_LOOKUPS) return error.TooManyLookups;
         var seeds: [lookup_mod.MAX_RESULTS]types.NodeId = undefined;
         const found = self.peers.routing.findClosestNodeIds(&target, lookup_mod.MAX_RESULTS, &seeds);
         const id = self.allocateLookupId() orelse return error.TooManyLookups;
         var lookup = try lookup_mod.Lookup.init(self.alloc, target, seeds[0..found], outbound.nowNs(env.io), self.lookup_config);
         errdefer lookup.deinit(self.alloc);
+        lookup.reliable_result = true;
         self.lookups.putAssumeCapacityNoClobber(id, lookup);
         self.lookup_count +|= 1;
         self.pumpLookup(env, id);
@@ -487,7 +492,7 @@ pub const Actor = struct {
             };
         }
         const finished = if (self.lookups.get(id)) |lookup| lookup.state == .finished else false;
-        if (finished) self.finishLookup(env.outbox, id, false);
+        if (finished) self.finishLookup(env, id, .completed);
     }
 
     pub fn repumpLookups(self: *Actor, env: Env) void {
@@ -517,30 +522,61 @@ pub const Actor = struct {
         return null;
     }
 
-    pub fn finishLookup(self: *Actor, outbox: *events.EventOutbox, id: u32, timed_out: bool) void {
+    pub fn finishLookup(self: *Actor, env: Env, id: u32, reason: lookup_results.LookupTerminalReason) void {
         const lookup = self.lookups.getPtr(id) orelse return;
-        const target = lookup.target;
-        var result: std.ArrayListUnmanaged([]u8) = .empty;
-        result.ensureTotalCapacityPrecise(self.alloc, self.lookup_config.num_results) catch {
-            var removed = self.lookups.fetchRemove(id).?.value;
-            self.requests.detachLookup(id);
-            removed.deinit(self.alloc);
-            outbox.notePayloadDrop();
-            return;
+        var terminal = lookup_results.LookupResult{
+            .lookup_id = id,
+            .target = lookup.target,
+            .reason = reason,
         };
         for (lookup.peers.items) |peer| {
-            if (peer.state != .succeeded or result.items.len >= self.lookup_config.num_results) continue;
+            if (peer.state != .succeeded or terminal.enrs.slice().len >= self.lookup_config.num_results) continue;
             const raw = self.peers.findEnr(&peer.node_id) orelse continue;
-            const copy = self.alloc.dupe(u8, raw) catch {
-                outbox.notePayloadDrop();
-                continue;
-            };
-            result.appendAssumeCapacity(copy);
+            terminal.enrs.append(enr.RawEnr.init(raw) catch unreachable);
         }
+        const reliable_result = lookup.reliable_result;
         var removed = self.lookups.fetchRemove(id).?.value;
         self.requests.detachLookup(id);
         removed.deinit(self.alloc);
-        outbox.publish(.{ .lookup_finished = .{ .lookup_id = id, .target = target, .enrs = result, .timed_out = timed_out } });
+
+        if (reliable_result) {
+            const result_outbox = env.lookup_results orelse unreachable;
+            result_outbox.publishAssumeReserved(terminal);
+        }
+
+        var event_enrs: std.ArrayListUnmanaged([]u8) = .empty;
+        event_enrs.ensureTotalCapacityPrecise(self.alloc, self.lookup_config.num_results) catch {
+            env.outbox.notePayloadDrop();
+            return;
+        };
+        for (terminal.enrs.slice()) |*raw| {
+            const copy = self.alloc.dupe(u8, raw.slice()) catch {
+                env.outbox.notePayloadDrop();
+                continue;
+            };
+            event_enrs.appendAssumeCapacity(copy);
+        }
+        env.outbox.publish(.{ .lookup_finished = .{
+            .lookup_id = id,
+            .target = terminal.target,
+            .enrs = event_enrs,
+            .timed_out = reason == .timed_out,
+        } });
+    }
+
+    pub fn finishAllLookups(self: *Actor, env: Env, reason: lookup_results.LookupTerminalReason) void {
+        var lookup_ids: [MAX_LOOKUPS]u32 = undefined;
+        const count = blk: {
+            var count: usize = 0;
+            var iterator = self.lookups.iterator();
+            while (iterator.next()) |entry| {
+                std.debug.assert(count < lookup_ids.len);
+                lookup_ids[count] = entry.key_ptr.*;
+                count += 1;
+            }
+            break :blk count;
+        };
+        for (lookup_ids[0..count]) |lookup_id| self.finishLookup(env, lookup_id, reason);
     }
 
     fn updateLocalAddress(self: *Actor, address: types.Address) bool {
