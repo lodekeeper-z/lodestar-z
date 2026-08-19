@@ -404,6 +404,7 @@ const RuntimeImpl = struct {
                 snapshot.filtered_packet_count = admission.filtered_total;
                 snapshot.processed_packet_count = admission.processed_total;
                 snapshot.dropped_event_count = self.outbox.droppedCount();
+                snapshot.dropped_event_count_by_kind = self.outbox.droppedEventCounts();
                 reply.putOneUncancelable(self.io, snapshot) catch {};
             },
             .local_enr => |reply| reply.putOneUncancelable(self.io, self.actor.localEnr()) catch {},

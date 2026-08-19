@@ -229,12 +229,12 @@ pub const Actor = struct {
         }
         if (previous) |value| if (std.mem.eql(u8, value.slice(), raw)) return true;
         const event_raw = self.alloc.dupe(u8, raw) catch {
-            outbox.notePayloadDrop();
+            outbox.notePayloadDrop(.enr_added);
             return true;
         };
         const previous_raw = if (previous) |value| self.alloc.dupe(u8, value.slice()) catch {
             self.alloc.free(event_raw);
-            outbox.notePayloadDrop();
+            outbox.notePayloadDrop(.enr_added);
             return true;
         } else null;
         outbox.publish(.{ .enr_added = .{ .node_id = node_id, .addr = address, .enr = event_raw, .replaced_enr = previous_raw } });
@@ -424,9 +424,11 @@ pub const Actor = struct {
     }
 
     pub fn metricsSnapshot(self: *const Actor) metrics_mod.MetricsSnapshot {
+        const contacts = self.peers.contactMetricsSnapshot();
+        const sessions = self.sessions.metricsSnapshot();
         return .{
             .kad_table_size = self.peers.routing.nodeCount(),
-            .active_session_count = self.sessions.count(),
+            .active_session_count = sessions.count,
             .connected_peer_count = self.peers.connectedCount(),
             .lookup_count = self.lookup_count,
             .active_lookup_count = self.lookups.count(),
@@ -434,6 +436,21 @@ pub const Actor = struct {
             .queued_request_count = self.requests.queuedCount(),
             .sent_message_count = self.metrics.sent_message_count,
             .rcvd_message_count = self.metrics.rcvd_message_count,
+            .contact_count = contacts.count,
+            .contact_capacity = contacts.capacity,
+            .contact_inserted_total = contacts.inserted_total,
+            .contact_updated_total = contacts.updated_total,
+            .contact_capacity_rejected_total = contacts.capacity_rejected_total,
+            .contact_policy_rejected_total = contacts.policy_rejected_total,
+            .contact_removed_total = contacts.removed_total,
+            .session_capacity = sessions.capacity,
+            .session_inserted_total = sessions.inserted_total,
+            .session_rekeyed_total = sessions.rekeyed_total,
+            .session_capacity_reused_total = sessions.capacity_reused_total,
+            .session_maintenance_expired_total = sessions.maintenance_expired_total,
+            .session_authenticated_refreshed_total = sessions.authenticated_refreshed_total,
+            .session_replay_rejected_total = sessions.replay_rejected_total,
+            .session_nonce_exhaustion_rejected_total = sessions.nonce_exhaustion_rejected_total,
         };
     }
 
@@ -636,12 +653,12 @@ pub const Actor = struct {
 
         var event_enrs: std.ArrayListUnmanaged([]u8) = .empty;
         event_enrs.ensureTotalCapacityPrecise(self.alloc, self.lookup_config.num_results) catch {
-            env.outbox.notePayloadDrop();
+            env.outbox.notePayloadDrop(.lookup_finished);
             return;
         };
         for (terminal.enrs.slice()) |*raw| {
             const copy = self.alloc.dupe(u8, raw.slice()) catch {
-                env.outbox.notePayloadDrop();
+                env.outbox.notePayloadDrop(.lookup_finished);
                 continue;
             };
             event_enrs.appendAssumeCapacity(copy);
@@ -706,7 +723,7 @@ pub const Actor = struct {
     fn publishLocalEnr(self: *Actor, outbox: *events.EventOutbox) void {
         const raw = self.local.raw orelse return;
         const copy = self.alloc.dupe(u8, raw.slice()) catch {
-            outbox.notePayloadDrop();
+            outbox.notePayloadDrop(.multiaddr_updated);
             return;
         };
         outbox.publish(.{ .local_enr_updated = .{ .seq = self.local.seq, .enr = copy } });

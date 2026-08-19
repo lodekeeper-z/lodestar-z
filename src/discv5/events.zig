@@ -94,7 +94,40 @@ pub const EventKind = enum {
     response_received,
     lookup_finished,
     peer_disconnected,
+
+    pub fn index(self: EventKind) usize {
+        return switch (self) {
+            .discovered => 0,
+            .enr_added => 1,
+            .multiaddr_updated => 2,
+            .talk_req_received => 3,
+            .talk_resp_received => 4,
+            .session_established => 5,
+            .request_failed => 6,
+            .response_received => 7,
+            .lookup_finished => 8,
+            .peer_disconnected => 9,
+        };
+    }
+
+    /// ChainSafe TypeScript discv5-aligned event label.
+    pub fn label(self: EventKind) []const u8 {
+        return switch (self) {
+            .discovered => "discovered",
+            .enr_added => "enrAdded",
+            .multiaddr_updated => "multiaddrUpdated",
+            .talk_req_received => "talkReqReceived",
+            .talk_resp_received => "talkRespReceived",
+            .session_established => "established",
+            .request_failed => "requestFailed",
+            .response_received => "response",
+            .lookup_finished => "lookupFinished",
+            .peer_disconnected => "disconnected",
+        };
+    }
 };
+
+pub const event_kind_count = @typeInfo(EventKind).@"enum".fields.len;
 
 pub const Event = union(enum) {
     pong: PongEvent,
@@ -126,18 +159,7 @@ pub const Event = union(enum) {
 
     /// ChainSafe TypeScript discv5-aligned event labels.
     pub fn tsEventName(self: *const Event) []const u8 {
-        return switch (self.kind()) {
-            .discovered => "discovered",
-            .enr_added => "enrAdded",
-            .multiaddr_updated => "multiaddrUpdated",
-            .talk_req_received => "talkReqReceived",
-            .talk_resp_received => "talkRespReceived",
-            .session_established => "established",
-            .request_failed => "requestFailed",
-            .response_received => "response",
-            .lookup_finished => "lookupFinished",
-            .peer_disconnected => "disconnected",
-        };
+        return self.kind().label();
     }
 
     pub fn deinit(self: *Event, alloc: Allocator) void {
@@ -159,6 +181,7 @@ pub const EventOutbox = struct {
     queue: Io.Queue(Event),
     buffer: []Event,
     dropped: std.atomic.Value(u64) = .init(0),
+    dropped_by_kind: [event_kind_count]std.atomic.Value(u64) = [_]std.atomic.Value(u64){.init(0)} ** event_kind_count,
 
     pub fn init(io: Io, allocator: Allocator, capacity: usize) !EventOutbox {
         if (capacity == 0 or capacity > config.MAX_EVENTS) return error.InvalidEventCapacity;
@@ -187,21 +210,27 @@ pub const EventOutbox = struct {
     }
 
     pub fn publish(self: *EventOutbox, event: Event) void {
+        const kind = event.kind();
         const count = self.queue.putUncancelable(self.io, &.{event}, 0) catch {
             var dropped = event;
             dropped.deinit(self.allocator);
-            _ = self.dropped.fetchAdd(1, .acq_rel);
+            self.noteDrop(kind);
             return;
         };
         if (count == 0) {
             var dropped = event;
             dropped.deinit(self.allocator);
-            _ = self.dropped.fetchAdd(1, .acq_rel);
+            self.noteDrop(kind);
         }
     }
 
-    pub fn notePayloadDrop(self: *EventOutbox) void {
+    pub fn notePayloadDrop(self: *EventOutbox, kind: EventKind) void {
+        self.noteDrop(kind);
+    }
+
+    fn noteDrop(self: *EventOutbox, kind: EventKind) void {
         _ = self.dropped.fetchAdd(1, .acq_rel);
+        _ = self.dropped_by_kind[kind.index()].fetchAdd(1, .acq_rel);
     }
 
     pub fn next(self: *EventOutbox) (Io.QueueClosedError || Io.Cancelable)!Event {
@@ -216,6 +245,16 @@ pub const EventOutbox = struct {
 
     pub fn droppedCount(self: *const EventOutbox) u64 {
         return self.dropped.load(.acquire);
+    }
+
+    pub fn droppedEventCount(self: *const EventOutbox, kind: EventKind) u64 {
+        return self.dropped_by_kind[kind.index()].load(.acquire);
+    }
+
+    pub fn droppedEventCounts(self: *const EventOutbox) [event_kind_count]u64 {
+        var snapshot = [_]u64{0} ** event_kind_count;
+        for (&snapshot, &self.dropped_by_kind) |*count, *stored| count.* = stored.load(.acquire);
+        return snapshot;
     }
 };
 
@@ -232,6 +271,25 @@ test "event outbox drops and deinitializes owned payloads when full" {
         .enr = try std.testing.allocator.dupe(u8, "second"),
     } });
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 1), outbox.droppedEventCount(.multiaddr_updated));
+    try std.testing.expectEqual(@as(u64, 0), outbox.droppedEventCount(.lookup_finished));
+    const counts = outbox.droppedEventCounts();
+    try std.testing.expectEqual(@as(u64, 1), counts[EventKind.multiaddr_updated.index()]);
+}
+
+test "payload drops are classified by intended event kind" {
+    const io = std.Options.debug_io;
+    var outbox = try EventOutbox.init(io, std.testing.allocator, 1);
+    defer outbox.deinit();
+
+    outbox.notePayloadDrop(.talk_req_received);
+    outbox.notePayloadDrop(.talk_req_received);
+    outbox.notePayloadDrop(.enr_added);
+
+    try std.testing.expectEqual(@as(u64, 3), outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 2), outbox.droppedEventCount(.talk_req_received));
+    try std.testing.expectEqual(@as(u64, 1), outbox.droppedEventCount(.enr_added));
+    try std.testing.expectEqual(@as(u64, 0), outbox.droppedEventCount(.response_received));
 }
 
 test "every event maps to a stable kind and TS-aligned event name" {
@@ -312,4 +370,7 @@ test "every event maps to a stable kind and TS-aligned event name" {
 test "EventKind is root exported for stable classification" {
     try std.testing.expect(@import("root.zig").EventKind == EventKind);
     try std.testing.expect(@import("root.zig").Event == Event);
+    try std.testing.expectEqual(event_kind_count, @typeInfo(EventKind).@"enum".fields.len);
+    try std.testing.expectEqualStrings("talkReqReceived", EventKind.talk_req_received.label());
+    try std.testing.expectEqual(@as(usize, 3), EventKind.talk_req_received.index());
 }

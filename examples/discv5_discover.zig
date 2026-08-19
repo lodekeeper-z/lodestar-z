@@ -415,6 +415,31 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
             snapshot.dropped_event_count,
         },
     );
+    try stdout.print(
+        "contacts: {d}/{d} retained, inserted={d} updated={d} capacity_rejected={d} policy_rejected={d} removed={d}\nsession_churn: capacity={d} inserted={d} rekeyed={d} capacity_reused={d} maintenance_expired={d} authenticated_refreshed={d} replay_rejected={d} nonce_exhaustion_rejected={d}\n",
+        .{
+            snapshot.contact_count,
+            snapshot.contact_capacity,
+            snapshot.contact_inserted_total,
+            snapshot.contact_updated_total,
+            snapshot.contact_capacity_rejected_total,
+            snapshot.contact_policy_rejected_total,
+            snapshot.contact_removed_total,
+            snapshot.session_capacity,
+            snapshot.session_inserted_total,
+            snapshot.session_rekeyed_total,
+            snapshot.session_capacity_reused_total,
+            snapshot.session_maintenance_expired_total,
+            snapshot.session_authenticated_refreshed_total,
+            snapshot.session_replay_rejected_total,
+            snapshot.session_nonce_exhaustion_rejected_total,
+        },
+    );
+    for (std.enums.values(discv5.EventKind)) |kind| {
+        const count = snapshot.droppedEventCount(kind);
+        if (count == 0) continue;
+        try stdout.print("event_drop_kind: kind={s} count={d}\n", .{ kind.label(), count });
+    }
 }
 
 fn runRuntime(runtime: *discv5.Runtime) void {

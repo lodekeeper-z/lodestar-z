@@ -93,6 +93,8 @@ test "event payload allocation failure preserves Actor state and counts one drop
     try std.testing.expect(added);
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 1), outbox.droppedEventCount(.enr_added));
+    try std.testing.expectEqual(@as(u64, 0), outbox.droppedEventCount(.response_received));
     const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
     try std.testing.expect(actor.peers.findEnr(&remote_id) != null);
     try std.testing.expect(outbox.pop() == null);
@@ -135,6 +137,8 @@ test "response payload allocation failure still completes and releases permit" {
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedEventCount(.talk_resp_received));
+    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedEventCount(.talk_req_received));
     try std.testing.expect(harness.outbox.pop() == null);
 }
 

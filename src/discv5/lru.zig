@@ -67,6 +67,11 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             return self.nodes.len;
         }
 
+        /// Test whether storage contains a key without changing TTL or recency.
+        pub fn contains(self: *const Self, key: K) bool {
+            return self.map.contains(key);
+        }
+
         pub fn get(self: *Self, key: K, now_ns: i64) ?V {
             const index = self.map.get(key) orelse return null;
             if (self.isExpired(index, now_ns)) {

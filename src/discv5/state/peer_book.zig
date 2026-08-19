@@ -282,6 +282,10 @@ pub const PeerBook = struct {
         return count;
     }
 
+    pub fn contactMetricsSnapshot(self: *const PeerBook) contact_book.ContactMetricsSnapshot {
+        return self.contacts.metricsSnapshot();
+    }
+
     pub fn prune(self: *PeerBook, now_ns: i64, timeout_ms: u64, transitions: []ConnectionEvent) usize {
         var count: usize = 0;
         for (self.routing.buckets) |*bucket| {

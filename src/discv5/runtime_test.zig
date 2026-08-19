@@ -763,6 +763,12 @@ test "reliable lookup results survive a full event outbox and release capacity o
     try std.testing.expectEqual(@as(u64, 1), snapshot.lookup_count);
     try std.testing.expectEqual(@as(usize, 0), snapshot.active_lookup_count);
     try std.testing.expectEqual(@as(u64, 1), snapshot.dropped_event_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.droppedEventCount(.lookup_finished));
+    var classified_total: u64 = 0;
+    for (snapshot.dropped_event_count_by_kind) |count| classified_total += count;
+    try std.testing.expectEqual(snapshot.dropped_event_count, classified_total);
+    const repeated_snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(snapshot, repeated_snapshot);
 
     var blocker = runtime.popEvent() orelse return error.MissingOutboxBlocker;
     defer blocker.deinit(alloc);

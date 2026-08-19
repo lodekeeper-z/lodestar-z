@@ -871,6 +871,9 @@ test "metrics snapshots preserve session count and recency until maintenance" {
     const inspection: *const actor_mod.Actor = actor;
     var snapshot = inspection.metricsSnapshot();
     try std.testing.expectEqual(@as(usize, 2), snapshot.active_session_count);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.session_capacity);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.session_inserted_total);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.session_capacity_reused_total);
     actor.sessions.put(third, stable, 2 * std.time.ns_per_ms);
     try std.testing.expect(actor.sessions.peekPtr(first, 2 * std.time.ns_per_ms) == null);
     try std.testing.expect(actor.sessions.peekPtr(second, 2 * std.time.ns_per_ms) != null);
@@ -878,9 +881,11 @@ test "metrics snapshots preserve session count and recency until maintenance" {
 
     snapshot = inspection.metricsSnapshot();
     try std.testing.expectEqual(@as(usize, 2), snapshot.active_session_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.session_capacity_reused_total);
     actor.maintenanceAt(harness.env(), 11 * std.time.ns_per_ms);
     snapshot = inspection.metricsSnapshot();
     try std.testing.expectEqual(@as(usize, 1), snapshot.active_session_count);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.session_maintenance_expired_total);
     try std.testing.expect(actor.sessions.peekPtr(second, 11 * std.time.ns_per_ms) == null);
     try std.testing.expect(actor.sessions.peekPtr(third, 11 * std.time.ns_per_ms) != null);
 }

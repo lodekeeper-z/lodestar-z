@@ -64,8 +64,8 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
 
     // Non-mutating pointer: unauthenticated ciphertext must not refresh
     // LRU/TTL recency. Recency is refreshed only after authentication.
+    if (actor.sessions.rejectsReplay(endpoint, &parsed.static_header.nonce, now_ns)) return;
     const stable = actor.sessions.peekPtr(endpoint, now_ns);
-    if (stable) |stable_value| if (stable_value.seen_nonces.contains(&parsed.static_header.nonce)) return;
 
     var plaintext_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     var ad_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;

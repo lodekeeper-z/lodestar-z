@@ -44,6 +44,18 @@ pub const AcceptAuthenticatedResult = enum {
     missing,
 };
 
+pub const SessionMetricsSnapshot = struct {
+    count: usize,
+    capacity: usize,
+    inserted_total: u64,
+    rekeyed_total: u64,
+    capacity_reused_total: u64,
+    maintenance_expired_total: u64,
+    authenticated_refreshed_total: u64,
+    replay_rejected_total: u64,
+    nonce_exhaustion_rejected_total: u64,
+};
+
 pub const ActiveChallenge = struct {
     challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8,
     triggering_nonce: [packet.NONCE_SIZE]u8,
@@ -68,6 +80,13 @@ pub const SessionBook = struct {
     session_timeout_ms: u64,
     challenge_timeout_ms: u64,
     rate_ttl_ms: u64,
+    inserted_total: u64 = 0,
+    rekeyed_total: u64 = 0,
+    capacity_reused_total: u64 = 0,
+    maintenance_expired_total: u64 = 0,
+    authenticated_refreshed_total: u64 = 0,
+    replay_rejected_total: u64 = 0,
+    nonce_exhaustion_rejected_total: u64 = 0,
 
     pub fn init(alloc: Allocator, config: config_mod.Config) !SessionBook {
         var sessions = try SessionCache.init(alloc, config.limits.session_capacity);
@@ -120,19 +139,48 @@ pub const SessionBook = struct {
         now_ns: i64,
     ) AcceptAuthenticatedResult {
         const current = self.sessions.peekPtr(endpoint, now_ns) orelse return .missing;
-        if (current.seen_nonces.contains(nonce)) return .replay;
-        if (current.seen_nonces.len == SEEN_NONCES_CAP) return .exhausted;
+        if (current.seen_nonces.contains(nonce)) {
+            self.replay_rejected_total +|= 1;
+            return .replay;
+        }
+        if (current.seen_nonces.len == SEEN_NONCES_CAP) {
+            self.nonce_exhaustion_rejected_total +|= 1;
+            return .exhausted;
+        }
 
         const accepted = self.sessions.getRefreshPtr(endpoint, self.session_timeout_ms, now_ns) orelse unreachable;
         std.debug.assert(accepted.seen_nonces.insert(nonce));
+        self.authenticated_refreshed_total +|= 1;
         return .accepted;
+    }
+
+    /// Detect a replay before decryption without changing session recency.
+    pub fn rejectsReplay(
+        self: *SessionBook,
+        endpoint: types.Endpoint,
+        nonce: *const [packet.NONCE_SIZE]u8,
+        now_ns: i64,
+    ) bool {
+        const current = self.sessions.peekPtr(endpoint, now_ns) orelse return false;
+        if (!current.seen_nonces.contains(nonce)) return false;
+        self.replay_rejected_total +|= 1;
+        return true;
     }
 
     pub fn put(self: *SessionBook, endpoint: types.Endpoint, value: StableSession, now_ns: i64) void {
         // Capacity-safe replacement lets authenticated/new admission atomically
         // reuse expired storage. This is not observational pruning: reads leave
         // expired sessions in place for proactive maintenance.
+        const replaces_endpoint = self.sessions.contains(endpoint);
+        const reuses_capacity = !replaces_endpoint and self.sessions.count() == self.sessions.capacity();
         self.sessions.putReplacingExpired(endpoint, value, self.session_timeout_ms, now_ns);
+        if (replaces_endpoint) {
+            self.rekeyed_total +|= 1;
+        } else if (reuses_capacity) {
+            self.capacity_reused_total +|= 1;
+        } else {
+            self.inserted_total +|= 1;
+        }
     }
 
     pub fn remove(self: *SessionBook, endpoint: types.Endpoint) bool {
@@ -140,11 +188,28 @@ pub const SessionBook = struct {
     }
 
     pub fn pruneSessions(self: *SessionBook, now_ns: i64) void {
+        const count_before = self.sessions.count();
         self.sessions.pruneExpired(now_ns);
+        const removed = count_before - self.sessions.count();
+        self.maintenance_expired_total +|= @intCast(removed);
     }
 
     pub fn count(self: *const SessionBook) usize {
         return self.sessions.count();
+    }
+
+    pub fn metricsSnapshot(self: *const SessionBook) SessionMetricsSnapshot {
+        return .{
+            .count = self.sessions.count(),
+            .capacity = self.sessions.capacity(),
+            .inserted_total = self.inserted_total,
+            .rekeyed_total = self.rekeyed_total,
+            .capacity_reused_total = self.capacity_reused_total,
+            .maintenance_expired_total = self.maintenance_expired_total,
+            .authenticated_refreshed_total = self.authenticated_refreshed_total,
+            .replay_rejected_total = self.replay_rejected_total,
+            .nonce_exhaustion_rejected_total = self.nonce_exhaustion_rejected_total,
+        };
     }
 
     pub fn peekChallenge(self: *const SessionBook, endpoint: types.Endpoint, now_ns: i64) ?*const ActiveChallenge {
@@ -419,6 +484,61 @@ test "session book accepts authenticated nonces in place without refreshing reje
     const overflow = [_]u8{0xff} ** packet.NONCE_SIZE;
     try std.testing.expectEqual(AcceptAuthenticatedResult.exhausted, book.acceptAuthenticated(first, &overflow, 25 * std.time.ns_per_ms));
     try std.testing.expect(book.peekPtr(first, 30 * std.time.ns_per_ms) == null);
+}
+
+test "stable session metrics count churn and authentication decisions exactly" {
+    const secp = @import("../secp256k1.zig");
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x18} ** 32));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+        .session_timeout_ms = 10,
+        .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
+    });
+    defer book.deinit(std.testing.allocator, &admission);
+
+    const first = testEndpoint(31);
+    const second = testEndpoint(32);
+    const third = testEndpoint(33);
+    const stable = StableSession{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 };
+    const rekeyed = StableSession{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 };
+    book.put(first, stable, 0);
+    book.put(second, stable, 1);
+    book.put(first, rekeyed, 2);
+    book.put(third, stable, 3);
+
+    const accepted_nonce = [_]u8{5} ** packet.NONCE_SIZE;
+    try std.testing.expectEqual(AcceptAuthenticatedResult.accepted, book.acceptAuthenticated(first, &accepted_nonce, 4));
+    try std.testing.expectEqual(AcceptAuthenticatedResult.replay, book.acceptAuthenticated(first, &accepted_nonce, 5));
+
+    var exhausted = rekeyed;
+    for (0..SEEN_NONCES_CAP) |i| {
+        const nonce = [_]u8{@intCast(i)} ** packet.NONCE_SIZE;
+        try std.testing.expect(exhausted.seen_nonces.insert(&nonce));
+    }
+    book.put(first, exhausted, 6);
+    const overflow = [_]u8{0xff} ** packet.NONCE_SIZE;
+    try std.testing.expectEqual(AcceptAuthenticatedResult.exhausted, book.acceptAuthenticated(first, &overflow, 7));
+    book.pruneSessions(10 * std.time.ns_per_ms + 3);
+
+    const inspection: *const SessionBook = &book;
+    const first_snapshot = inspection.metricsSnapshot();
+    const second_snapshot = inspection.metricsSnapshot();
+    try std.testing.expectEqual(first_snapshot, second_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), first_snapshot.count);
+    try std.testing.expectEqual(@as(usize, 2), first_snapshot.capacity);
+    try std.testing.expectEqual(@as(u64, 2), first_snapshot.inserted_total);
+    try std.testing.expectEqual(@as(u64, 2), first_snapshot.rekeyed_total);
+    try std.testing.expectEqual(@as(u64, 1), first_snapshot.capacity_reused_total);
+    try std.testing.expectEqual(@as(u64, 1), first_snapshot.maintenance_expired_total);
+    try std.testing.expectEqual(@as(u64, 1), first_snapshot.authenticated_refreshed_total);
+    try std.testing.expectEqual(@as(u64, 1), first_snapshot.replay_rejected_total);
+    try std.testing.expectEqual(@as(u64, 1), first_snapshot.nonce_exhaustion_rejected_total);
+    try std.testing.expect(book.peekPtr(first, 10 * std.time.ns_per_ms + 3) != null);
 }
 
 test "replay and exhausted authentication do not promote stable sessions" {

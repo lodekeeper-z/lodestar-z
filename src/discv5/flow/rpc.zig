@@ -145,12 +145,12 @@ fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.E
         std.debug.assert(event_enrs.items.len == 0);
         const raw_nodes = finished.raw_nodes orelse unreachable;
         event_enrs.ensureTotalCapacityPrecise(actor.alloc, raw_nodes.slice().len) catch {
-            env.outbox.notePayloadDrop();
+            env.outbox.notePayloadDrop(.response_received);
             return;
         };
         for (raw_nodes.slice()) |*raw| {
             const copy = actor.alloc.dupe(u8, raw.slice()) catch {
-                env.outbox.notePayloadDrop();
+                env.outbox.notePayloadDrop(.response_received);
                 continue;
             };
             event_enrs.appendAssumeCapacity(copy);
@@ -188,7 +188,7 @@ fn retainNodes(
         accumulator.validated_enrs.append(validated);
         if (active.origin == .reliable_api) continue;
         const copy = actor.alloc.dupe(u8, validated.raw.slice()) catch {
-            env.outbox.notePayloadDrop();
+            env.outbox.notePayloadDrop(.response_received);
             continue;
         };
         accumulator.enrs.appendAssumeCapacity(copy);
@@ -212,12 +212,12 @@ fn handleTalkReq(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types
     const request = message.TalkReq.decode(plaintext) catch return;
     noteReceived(actor, plaintext);
     const protocol_copy = actor.alloc.dupe(u8, request.protocol) catch {
-        env.outbox.notePayloadDrop();
+        env.outbox.notePayloadDrop(.talk_req_received);
         return;
     };
     const request_copy = actor.alloc.dupe(u8, request.request) catch {
         actor.alloc.free(protocol_copy);
-        env.outbox.notePayloadDrop();
+        env.outbox.notePayloadDrop(.talk_req_received);
         return;
     };
     env.outbox.publish(.{ .talkreq = .{
@@ -244,7 +244,7 @@ fn handleTalkResp(actor: *Actor, env: Env, plaintext: []const u8, endpoint: type
     ) orelse return;
     defer finished.deinit(actor.alloc);
     const copy = actor.alloc.dupe(u8, response.response) catch {
-        env.outbox.notePayloadDrop();
+        env.outbox.notePayloadDrop(.talk_resp_received);
         return;
     };
     env.outbox.publish(.{ .talkresp = .{
