@@ -459,8 +459,11 @@ pub const Actor = struct {
     }
 
     fn pumpLookup(self: *Actor, env: Env, id: u32) void {
+        // A candidate can fail synchronously before any request is active. Walk
+        // the complete bounded frontier so such failures cannot leave a lookup
+        // with no request that could wake it again.
         var attempts: usize = 0;
-        while (attempts < lookup_mod.MAX_PARALLELISM) : (attempts += 1) {
+        while (attempts < lookup_mod.MAX_CANDIDATES) : (attempts += 1) {
             const attempt: LookupAttempt = blk: {
                 const lookup = self.lookups.getPtr(id) orelse return;
                 const peer_id = lookup.nextPeer(self.lookup_config) orelse break;
@@ -615,4 +618,51 @@ fn validObservedAddress(actor: *const Actor, address: types.Address) bool {
             !std.mem.allEqual(u8, &ip6.bytes, 0) and
             ip6.bytes[0] != 0xff,
     };
+}
+
+test "discv5 actor: lookup pump exhausts bounded synchronous candidate failures" {
+    const test_secp = @import("secp256k1.zig");
+    const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try test_secp.keyPairFromSecret(&([_]u8{0x91} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&test_secp.compressedPubkey(&local_key));
+    const cfg = config_mod.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .rate_limiter = null,
+        .limits = .{ .event_capacity = 4, .command_capacity = 4 },
+    };
+    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
+    defer ingress.deinit();
+    var outbox = try events.EventOutbox.init(io, alloc, cfg.limits.event_capacity);
+    defer outbox.deinit();
+    var actor = try Actor.init(alloc, cfg);
+    defer actor.deinit(&ingress);
+    var recording = RecordingSender.init(alloc);
+    defer recording.deinit();
+    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+
+    const target = [_]u8{0} ** 32;
+    var seeds: [lookup_mod.MAX_RESULTS]types.NodeId = undefined;
+    for (&seeds, 1..) |*seed, value| {
+        seed.* = [_]u8{0} ** 32;
+        seed.*[31] = @intCast(value);
+    }
+    var lookup = try lookup_mod.Lookup.init(alloc, target, &seeds, 0, actor.lookup_config);
+    for (lookup_mod.MAX_RESULTS + 1..lookup_mod.MAX_CANDIDATES + 1) |value| {
+        var node_id = [_]u8{0} ** 32;
+        node_id[31] = @intCast(value);
+        lookup.peers.appendAssumeCapacity(.{ .node_id = node_id });
+    }
+    actor.lookups.putAssumeCapacityNoClobber(1, lookup);
+
+    actor.pumpLookup(env, 1);
+
+    try std.testing.expect(!actor.lookups.contains(1));
+    var event = outbox.pop() orelse return error.MissingLookupCompletion;
+    defer event.deinit(alloc);
+    try std.testing.expect(event == .lookup_finished);
+    try std.testing.expectEqual(@as(u32, 1), event.lookup_finished.lookup_id);
 }
