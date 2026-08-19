@@ -48,12 +48,12 @@ test "kbucket: routing table insert/find" {
     try std.testing.expectEqual(@as(usize, 9), rt.nodeCount());
 
     const target: NodeId = [_]u8{0xbb} ** 32;
-    var out: [5]Entry = undefined;
-    const found = rt.findClosest(&target, 5, &out);
+    var out: [5]NodeId = undefined;
+    const found = rt.findClosestNodeIds(&target, 5, &out);
     try std.testing.expect(found <= 5);
 }
 
-test "kbucket: routing table findClosest uses bounded stack storage" {
+test "kbucket: routing table findClosestNodeIds uses bounded stack storage" {
     const alloc = std.testing.allocator;
     const local: NodeId = [_]u8{0xff} ** 32;
     var rt = try RoutingTable.init(alloc, local);
@@ -71,13 +71,13 @@ test "kbucket: routing table findClosest uses bounded stack storage" {
     }
 
     const target: NodeId = [_]u8{0} ** 32;
-    var out: [3]Entry = undefined;
-    const found = rt.findClosest(&target, 3, &out);
+    var out: [3]NodeId = undefined;
+    const found = rt.findClosestNodeIds(&target, 3, &out);
 
     try std.testing.expectEqual(@as(usize, 3), found);
-    try std.testing.expectEqual(@as(u8, 1), out[0].node_id[31]);
-    try std.testing.expectEqual(@as(u8, 2), out[1].node_id[31]);
-    try std.testing.expectEqual(@as(u8, 3), out[2].node_id[31]);
+    try std.testing.expectEqual(@as(u8, 1), out[0][31]);
+    try std.testing.expectEqual(@as(u8, 2), out[1][31]);
+    try std.testing.expectEqual(@as(u8, 3), out[2][31]);
 }
 
 test "kbucket: full bucket stores pending connected entry until timeout" {

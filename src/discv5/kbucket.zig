@@ -320,13 +320,13 @@ pub const RoutingTable = struct {
         return self.buckets[dist].getMutWithPending(node_id);
     }
 
-    pub fn findClosest(self: *const RoutingTable, target: *const NodeId, comptime n: usize, out: *[n]Entry) usize {
+    pub fn findClosestNodeIds(self: *const RoutingTable, target: *const NodeId, comptime n: usize, out: *[n]NodeId) usize {
         var count: usize = 0;
         if (n == 0) return 0;
 
         for (self.buckets) |*bucket| {
             for (bucket.entries[0..bucket.count]) |e| {
-                insertClosest(target, e, out[0..], &count);
+                insertClosestNodeId(target, e.node_id, out[0..], &count);
             }
         }
 
@@ -344,12 +344,12 @@ pub const RoutingTable = struct {
     }
 };
 
-fn insertClosest(target: *const NodeId, candidate: Entry, out: []Entry, count: *usize) void {
-    const candidate_distance = xorDistance(target, &candidate.node_id);
+fn insertClosestNodeId(target: *const NodeId, candidate: NodeId, out: []NodeId, count: *usize) void {
+    const candidate_distance = xorDistance(target, &candidate);
 
     var insert_at = count.*;
-    for (out[0..count.*], 0..) |entry, i| {
-        const entry_distance = xorDistance(target, &entry.node_id);
+    for (out[0..count.*], 0..) |node_id, i| {
+        const entry_distance = xorDistance(target, &node_id);
         if (std.mem.lessThan(u8, &candidate_distance, &entry_distance)) {
             insert_at = i;
             break;

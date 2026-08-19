@@ -261,10 +261,8 @@ pub const Actor = struct {
 
     pub fn startLookup(self: *Actor, env: Env, target: types.NodeId) !u32 {
         if (self.lookups.count() >= MAX_LOOKUPS) return error.TooManyLookups;
-        var closest: [lookup_mod.MAX_RESULTS]kbucket.Entry = undefined;
-        const found = self.peers.routing.findClosest(&target, lookup_mod.MAX_RESULTS, &closest);
         var seeds: [lookup_mod.MAX_RESULTS]types.NodeId = undefined;
-        for (closest[0..found], 0..) |entry, index| seeds[index] = entry.node_id;
+        const found = self.peers.routing.findClosestNodeIds(&target, lookup_mod.MAX_RESULTS, &seeds);
         const id = self.allocateLookupId() orelse return error.TooManyLookups;
         var lookup = try lookup_mod.Lookup.init(self.alloc, target, seeds[0..found], outbound.nowNs(env.io), self.lookup_config);
         errdefer lookup.deinit(self.alloc);
