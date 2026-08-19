@@ -341,7 +341,7 @@ pub const Actor = struct {
         key: types.RequestKey,
         origin: types.RequestOrigin,
         success: bool,
-        closer: []const types.NodeId,
+        closer: []const lookup_mod.Candidate,
     ) void {
         if (success) {
             const responsive = self.peers.markResponsive(key.endpoint.node_id, key.endpoint.addr, outbound.nowNs(env.io), key);
@@ -543,13 +543,32 @@ pub const Actor = struct {
                 break :blk .{ .peer_id = peer_id, .target = lookup.target };
             };
             const peer_id = attempt.peer_id;
-            const known = self.peers.known(&peer_id) orelse {
-                if (self.lookups.getPtr(id)) |lookup| lookup.onFailure(&peer_id, self.lookup_config);
-                continue;
-            };
             var distances: [127]u16 = undefined;
             const count = lookup_mod.findNodeLogDistances(&attempt.target, &peer_id, @min(self.lookup_config.request_limit, distances.len), &distances);
-            _ = self.sendFindNode(env, .{ .node_id = peer_id, .addr = known.addr }, &known.pubkey, distances[0..count], .{ .lookup = id }) catch |err| {
+            const send_result = blk: {
+                const lookup = self.lookups.getPtr(id) orelse return;
+                if (lookup.localCandidate(&peer_id)) |candidate| {
+                    break :blk self.sendFindNode(
+                        env,
+                        .{ .node_id = peer_id, .addr = candidate.addr },
+                        &candidate.pubkey,
+                        distances[0..count],
+                        .{ .lookup = id },
+                    );
+                }
+                const known = self.peers.known(&peer_id) orelse {
+                    lookup.onFailure(&peer_id, self.lookup_config);
+                    continue;
+                };
+                break :blk self.sendFindNode(
+                    env,
+                    .{ .node_id = peer_id, .addr = known.addr },
+                    &known.pubkey,
+                    distances[0..count],
+                    .{ .lookup = id },
+                );
+            };
+            _ = send_result catch |err| {
                 if (isLookupBackpressure(err)) {
                     if (self.lookups.getPtr(id)) |lookup| lookup.onDeferred(&peer_id);
                     break;
@@ -596,8 +615,12 @@ pub const Actor = struct {
             .target = lookup.target,
             .reason = reason,
         };
-        for (lookup.peers.items) |peer| {
+        for (lookup.peers.items) |*peer| {
             if (peer.state != .succeeded or terminal.enrs.slice().len >= self.lookup_config.num_results) continue;
+            if (peer.local_candidate) |*candidate| {
+                terminal.enrs.append(candidate.raw);
+                continue;
+            }
             const raw = self.peers.findEnr(&peer.node_id) orelse continue;
             terminal.enrs.append(enr.RawEnr.init(raw) catch unreachable);
         }

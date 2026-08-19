@@ -1,7 +1,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const NodeId = @import("../enr.zig").NodeId;
+const enr = @import("../enr.zig");
 const kbucket = @import("../kbucket.zig");
+const types = @import("../types.zig");
+
+const NodeId = enr.NodeId;
 
 pub const MAX_RESULTS: usize = kbucket.K;
 pub const MAX_PARALLELISM: usize = kbucket.K;
@@ -23,11 +26,41 @@ pub const PeerState = enum {
     failed,
 };
 
+/// Lookup-owned contact metadata authenticated at the NODES boundary. The raw
+/// ENR stays inline, so retaining a returned candidate never creates separate
+/// heap ownership.
+pub const Candidate = struct {
+    node_id: NodeId,
+    pubkey: [33]u8,
+    addr: types.Address,
+    raw: enr.RawEnr,
+
+    pub fn fromValidated(validated: *const enr.ValidatedEnr, address: types.Address) Candidate {
+        const advertised = switch (address) {
+            .ip4 => validated.parsed.udpAddress4(),
+            .ip6 => validated.parsed.udpAddress6(),
+        } orelse unreachable;
+        std.debug.assert(advertised.eql(&address));
+        return .{
+            .node_id = validated.node_id,
+            .pubkey = validated.parsed.pubkey orelse unreachable,
+            .addr = address,
+            .raw = validated.raw,
+        };
+    }
+};
+
 pub const Peer = struct {
     node_id: NodeId,
+    local_candidate: ?Candidate = null,
     peers_returned: usize = 0,
     state: PeerState = .not_contacted,
 };
+
+comptime {
+    std.debug.assert(@sizeOf(Candidate) <= 512);
+    std.debug.assert(@sizeOf(Peer) * MAX_CANDIDATES <= 16 * 1024);
+}
 
 pub const State = enum {
     iterating,
@@ -58,7 +91,7 @@ pub const Lookup = struct {
         try lookup.peers.ensureTotalCapacityPrecise(alloc, MAX_CANDIDATES);
 
         for (seeds) |seed| {
-            _ = lookup.insertCandidate(seed);
+            _ = lookup.insertCandidate(&seed, null);
         }
         lookup.truncateCandidates(config.num_results);
         return lookup;
@@ -81,17 +114,20 @@ pub const Lookup = struct {
         };
     }
 
-    fn insertCandidate(self: *Lookup, node_id: NodeId) ?usize {
+    fn insertCandidate(self: *Lookup, node_id: *const NodeId, candidate: ?*const Candidate) ?usize {
         std.debug.assert(self.peers.items.len <= MAX_CANDIDATES);
         std.debug.assert(self.peers.capacity >= MAX_CANDIDATES);
+        if (candidate) |value| std.debug.assert(std.mem.eql(u8, node_id, &value.node_id));
 
-        for (self.peers.items) |peer| {
-            if (std.mem.eql(u8, &peer.node_id, &node_id)) return null;
+        for (self.peers.items) |*peer| {
+            if (!std.mem.eql(u8, &peer.node_id, node_id)) continue;
+            if (peer.local_candidate == null) peer.local_candidate = if (candidate) |value| value.* else null;
+            return null;
         }
 
-        const candidate_distance = kbucket.xorDistance(&self.target, &node_id);
+        const candidate_distance = kbucket.xorDistance(&self.target, node_id);
         var insert_at = self.peers.items.len;
-        for (self.peers.items, 0..) |peer, i| {
+        for (self.peers.items, 0..) |*peer, i| {
             const peer_distance = kbucket.xorDistance(&self.target, &peer.node_id);
             if (std.mem.lessThan(u8, &candidate_distance, &peer_distance)) {
                 insert_at = i;
@@ -113,15 +149,23 @@ pub const Lookup = struct {
             _ = self.peers.orderedRemove(evict_index);
         }
 
-        self.peers.insertAssumeCapacity(insert_at, .{ .node_id = node_id });
+        self.peers.insertAssumeCapacity(insert_at, .{
+            .node_id = node_id.*,
+            .local_candidate = if (candidate) |value| value.* else null,
+        });
         return insert_at;
     }
 
     pub fn findPeerIndex(self: *const Lookup, node_id: *const NodeId) ?usize {
-        for (self.peers.items, 0..) |peer, i| {
+        for (self.peers.items, 0..) |*peer, i| {
             if (std.mem.eql(u8, &peer.node_id, node_id)) return i;
         }
         return null;
+    }
+
+    pub fn localCandidate(self: *const Lookup, node_id: *const NodeId) ?*const Candidate {
+        const index = self.findPeerIndex(node_id) orelse return null;
+        return if (self.peers.items[index].local_candidate) |*candidate| candidate else null;
     }
 
     pub fn truncateCandidates(self: *Lookup, max_candidates: usize) void {
@@ -129,7 +173,7 @@ pub const Lookup = struct {
         self.peers.shrinkRetainingCapacity(max_candidates);
     }
 
-    pub fn onSuccess(self: *Lookup, node_id: *const NodeId, closer_peers: []const NodeId, config: Config) void {
+    pub fn onSuccess(self: *Lookup, node_id: *const NodeId, closer_peers: []const Candidate, config: Config) void {
         if (self.state == .finished) return;
 
         const peer_index = self.findPeerIndex(node_id) orelse {
@@ -146,8 +190,8 @@ pub const Lookup = struct {
 
         const had_few_results = self.peers.items.len < config.num_results;
         var progress = false;
-        for (accepted_peers) |peer_id| {
-            if (self.insertCandidate(peer_id)) |insert_index| {
+        for (accepted_peers) |*candidate| {
+            if (self.insertCandidate(&candidate.node_id, candidate)) |insert_index| {
                 if (insert_index == 0 or had_few_results) progress = true;
             }
         }
@@ -215,7 +259,7 @@ pub const Lookup = struct {
         const limit = @min(config.num_results, self.peers.items.len);
         var blocked = false;
         var succeeded: usize = 0;
-        for (self.peers.items[0..limit]) |peer| {
+        for (self.peers.items[0..limit]) |*peer| {
             switch (peer.state) {
                 .succeeded => succeeded += 1,
                 .waiting, .not_contacted => {
@@ -231,7 +275,7 @@ pub const Lookup = struct {
         }
 
         if (self.num_waiting == 0) {
-            for (self.peers.items) |peer| {
+            for (self.peers.items) |*peer| {
                 if (peer.state == .not_contacted) return;
             }
             self.state = .finished;
@@ -273,6 +317,15 @@ fn testNodeId(last_byte: u8) NodeId {
     return node_id;
 }
 
+fn testCandidate(last_byte: u8) Candidate {
+    return .{
+        .node_id = testNodeId(last_byte),
+        .pubkey = [_]u8{0} ** 33,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, last_byte }, .port = 9000 } },
+        .raw = .{},
+    };
+}
+
 fn testConfig(num_results: usize, parallelism: usize) Config {
     return .{
         .num_results = num_results,
@@ -308,7 +361,7 @@ test "discv5 lookup: success from unknown peer does not add candidates" {
     const config = testConfig(3, 2);
     const target = testNodeId(0);
     const seeds = [_]NodeId{testNodeId(10)};
-    const returned = [_]NodeId{ testNodeId(1), testNodeId(2) };
+    const returned = [_]Candidate{ testCandidate(1), testCandidate(2) };
 
     var lookup = try Lookup.init(alloc, target, &seeds, 0, config);
     defer lookup.deinit(alloc);
@@ -324,23 +377,23 @@ test "discv5 lookup: candidate growth is bounded across responses" {
     const config = testConfig(3, 2);
     const target = testNodeId(0);
     const seeds = [_]NodeId{testNodeId(250)};
-    const first_batch = [_]NodeId{
-        testNodeId(33), testNodeId(34), testNodeId(35), testNodeId(36),
-        testNodeId(37), testNodeId(38), testNodeId(39), testNodeId(40),
-        testNodeId(41), testNodeId(42), testNodeId(43), testNodeId(44),
-        testNodeId(45), testNodeId(46), testNodeId(47), testNodeId(48),
+    const first_batch = [_]Candidate{
+        testCandidate(33), testCandidate(34), testCandidate(35), testCandidate(36),
+        testCandidate(37), testCandidate(38), testCandidate(39), testCandidate(40),
+        testCandidate(41), testCandidate(42), testCandidate(43), testCandidate(44),
+        testCandidate(45), testCandidate(46), testCandidate(47), testCandidate(48),
     };
-    const second_batch = [_]NodeId{
-        testNodeId(1),  testNodeId(2),  testNodeId(3),  testNodeId(4),
-        testNodeId(5),  testNodeId(6),  testNodeId(7),  testNodeId(8),
-        testNodeId(9),  testNodeId(10), testNodeId(11), testNodeId(12),
-        testNodeId(13), testNodeId(14), testNodeId(15), testNodeId(16),
+    const second_batch = [_]Candidate{
+        testCandidate(1),  testCandidate(2),  testCandidate(3),  testCandidate(4),
+        testCandidate(5),  testCandidate(6),  testCandidate(7),  testCandidate(8),
+        testCandidate(9),  testCandidate(10), testCandidate(11), testCandidate(12),
+        testCandidate(13), testCandidate(14), testCandidate(15), testCandidate(16),
     };
-    const third_batch = [_]NodeId{
-        testNodeId(17), testNodeId(18), testNodeId(19), testNodeId(20),
-        testNodeId(21), testNodeId(22), testNodeId(23), testNodeId(24),
-        testNodeId(25), testNodeId(26), testNodeId(27), testNodeId(28),
-        testNodeId(29), testNodeId(30), testNodeId(31), testNodeId(32),
+    const third_batch = [_]Candidate{
+        testCandidate(17), testCandidate(18), testCandidate(19), testCandidate(20),
+        testCandidate(21), testCandidate(22), testCandidate(23), testCandidate(24),
+        testCandidate(25), testCandidate(26), testCandidate(27), testCandidate(28),
+        testCandidate(29), testCandidate(30), testCandidate(31), testCandidate(32),
     };
 
     var lookup = try Lookup.init(alloc, target, &seeds, 0, config);
@@ -356,7 +409,7 @@ test "discv5 lookup: candidate growth is bounded across responses" {
     try std.testing.expectEqual(MAX_CANDIDATES, lookup.peers.items.len);
     const first_index = lookup.findPeerIndex(&first_peer) orelse return error.ContactedPeerEvicted;
     try std.testing.expectEqual(PeerState.succeeded, lookup.peers.items[first_index].state);
-    for (lookup.peers.items[1..], lookup.peers.items[0 .. lookup.peers.items.len - 1]) |peer, previous| {
+    for (lookup.peers.items[1..], lookup.peers.items[0 .. lookup.peers.items.len - 1]) |*peer, *previous| {
         const peer_distance = kbucket.xorDistance(&target, &peer.node_id);
         const previous_distance = kbucket.xorDistance(&target, &previous.node_id);
         try std.testing.expect(!std.mem.lessThan(u8, &peer_distance, &previous_distance));

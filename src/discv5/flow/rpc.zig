@@ -6,6 +6,7 @@ const message = @import("../protocol/message.zig");
 const metrics = @import("../metrics.zig");
 const outbound = @import("outbound.zig");
 const completion = @import("completion.zig");
+const lookup = @import("../service/lookup.zig");
 const request_results = @import("../request_results.zig");
 const request_book = @import("../state/request_book.zig");
 const types = @import("../types.zig");
@@ -128,8 +129,8 @@ fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.E
         return;
     }
 
-    var closer: [MAX_NODES_RESPONSE]types.NodeId = undefined;
-    const closer_len = closerNodeIds(actor, accumulator.validated_enrs.slice(), &closer);
+    var closer: [MAX_NODES_RESPONSE]lookup.Candidate = undefined;
+    const closer_len = closerCandidates(actor, accumulator.validated_enrs.slice(), &closer);
     const terminal_nodes = request_results.RawEnrList.fromValidated(accumulator.validated_enrs.slice());
     var finished = completion.finish(
         actor,
@@ -195,12 +196,13 @@ fn retainNodes(
     return discovered_len;
 }
 
-fn closerNodeIds(actor: *const Actor, validated_enrs: []const enr.ValidatedEnr, closer: *[MAX_NODES_RESPONSE]types.NodeId) usize {
+fn closerCandidates(actor: *const Actor, validated_enrs: []const enr.ValidatedEnr, closer: *[MAX_NODES_RESPONSE]lookup.Candidate) usize {
     std.debug.assert(validated_enrs.len <= MAX_NODES_RESPONSE);
     var closer_len: usize = 0;
     for (validated_enrs) |*validated| {
-        const node_id = actor.validatedDiscoveredNodeId(validated) orelse continue;
-        closer[closer_len] = node_id;
+        if (std.mem.eql(u8, &validated.node_id, &actor.local_node_id)) continue;
+        const address = actor.peers.addressForEnr(&validated.parsed) orelse continue;
+        closer[closer_len] = .fromValidated(validated, address);
         closer_len += 1;
     }
     return closer_len;

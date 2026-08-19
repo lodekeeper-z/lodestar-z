@@ -8,6 +8,7 @@ const message = @import("../protocol/message.zig");
 const outbound = @import("../flow/outbound.zig");
 const packet = @import("../protocol/packet.zig");
 const peer_book = @import("../state/peer_book.zig");
+const lookup_results = @import("../lookup_results.zig");
 const request_results = @import("../request_results.zig");
 const secp = @import("../secp256k1.zig");
 const session_book = @import("../state/session_book.zig");
@@ -190,6 +191,168 @@ test "validated NODES multipart values survive as lookup closer IDs" {
     try std.testing.expect(completed_lookup.findPeerIndex(&returned_b.node_id) != null);
     const responder_index = completed_lookup.findPeerIndex(&responder_id) orelse return error.MissingResponder;
     try std.testing.expectEqual(@as(usize, 2), completed_lookup.peers.items[responder_index].peers_returned);
+}
+
+test "discv5 lookup-local contact dispatch survives full global retention" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xa1} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const responder_key = try secp.keyPairFromSecret(&([_]u8{0xa2} ** 32));
+    const responder_pubkey = secp.compressedPubkey(&responder_key);
+    const responder_id = try enr.nodeIdFromCompressedPubkey(&responder_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = responder_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 162 }, .port = 9162 } },
+    };
+    const returned = try makeEnr(alloc, 0xa3, 3, .{ 127, 0, 0, 163 }, 9163);
+    defer alloc.free(returned.raw);
+    const validated = try enr.ValidatedEnr.init(returned.raw);
+    var cfg = testConfig(local_key, local_id, 8);
+    cfg.lookup_num_results = 1;
+    cfg.lookup_parallelism = 1;
+    cfg.limits.contact_capacity = 1;
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+
+    const contact_id = [_]u8{0xa4} ** 32;
+    actor.peers.rememberContact(contact_id, &responder_pubkey, endpoint.addr, false);
+    try std.testing.expectEqual(@as(usize, 1), actor.peers.contacts.count());
+    const candidate_bucket = kbucket.logDistance(&local_id, &returned.node_id) orelse return error.InvalidTestIdentity;
+    try std.testing.expect(candidate_bucket >= 8);
+    for (1..kbucket.K + 1) |value| {
+        var filler_id = returned.node_id;
+        filler_id[31] ^= @intCast(value);
+        try std.testing.expect(actor.peers.routing.insert(.{
+            .node_id = filler_id,
+            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 1, @intCast(value) }, .port = @intCast(9200 + value) } },
+            .last_seen = 0,
+            .status = .disconnected,
+        }));
+    }
+    try std.testing.expectEqual(kbucket.K, actor.peers.routing.getBucket(candidate_bucket).len);
+
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xa5} ** 16,
+        .recipient_key = [_]u8{0xa6} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+    const lookup_id: u32 = 101;
+    var lookup = try lookup_mod.Lookup.init(alloc, returned.node_id, &.{responder_id}, 0, actor.lookup_config);
+    try std.testing.expectEqual(responder_id, lookup.nextPeer(actor.lookup_config).?);
+    actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
+    const req_id = try actor.sendFindNode(
+        harness.env(),
+        endpoint,
+        &responder_pubkey,
+        &.{wireDistance(&returned.node_id, &responder_id)},
+        .{ .lookup = lookup_id },
+    );
+
+    var nodes_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const nodes = message.Nodes{ .req_id = req_id, .total = 1, .enrs = &.{returned.raw} };
+    try deliverEncrypted(actor, harness.env(), endpoint, &stable.recipient_key, try nodes.encodeInto(&nodes_buffer), 0xa7);
+
+    try std.testing.expect(actor.peers.known(&returned.node_id) == null);
+    try std.testing.expect(actor.peers.findEnr(&returned.node_id) == null);
+    const active_lookup = actor.lookups.getPtr(lookup_id) orelse return error.LookupFinishedBeforeLocalDispatch;
+    const returned_index = active_lookup.findPeerIndex(&returned.node_id) orelse return error.MissingReturnedCandidate;
+    try std.testing.expectEqual(lookup_mod.PeerState.waiting, active_lookup.peers.items[returned_index].state);
+    try std.testing.expectEqual(@as(usize, 1), active_lookup.num_waiting);
+    const retained = active_lookup.localCandidate(&returned.node_id) orelse return error.MissingLookupLocalContact;
+    try std.testing.expectEqual(returned.node_id, retained.node_id);
+    try std.testing.expectEqual(validated.parsed.pubkey.?, retained.pubkey);
+    try std.testing.expect(retained.addr.eql(&returned.address));
+    try std.testing.expectEqualSlices(u8, returned.raw, retained.raw.slice());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expect(harness.recording.datagrams.items[1].address.eql(&returned.address));
+}
+
+test "discv5 lookup-local successful result retains raw ENR without PeerBook" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xa8} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const returned = try makeEnr(alloc, 0xa9, 9, .{ 127, 0, 0, 169 }, 9169);
+    defer alloc.free(returned.raw);
+    const validated = try enr.ValidatedEnr.init(returned.raw);
+    const candidate = lookup_mod.Candidate.fromValidated(&validated, returned.address);
+    var cfg = testConfig(local_key, local_id, 8);
+    cfg.lookup_num_results = 1;
+    cfg.lookup_parallelism = 1;
+    cfg.limits.lookup_result_capacity = 1;
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    var results = try lookup_results.LookupResultOutbox.init(io, alloc, 1);
+    defer results.deinit();
+    try std.testing.expect(results.reserve());
+    try std.testing.expect(results.claim());
+
+    var lookup = try lookup_mod.Lookup.init(alloc, returned.node_id, &.{returned.node_id}, 0, harness.actor.lookup_config);
+    const contacted = lookup.nextPeer(harness.actor.lookup_config).?;
+    lookup.onSuccess(&contacted, &.{candidate}, harness.actor.lookup_config);
+    const returned_index = lookup.findPeerIndex(&returned.node_id) orelse return error.MissingReturnedCandidate;
+    try std.testing.expectEqual(lookup_mod.PeerState.succeeded, lookup.peers.items[returned_index].state);
+    lookup.reliable_result = true;
+    harness.actor.lookups.putAssumeCapacityNoClobber(102, lookup);
+    try std.testing.expect(harness.actor.peers.findEnr(&returned.node_id) == null);
+    var env = harness.env();
+    env.lookup_results = &results;
+
+    harness.actor.finishLookup(env, 102, .completed);
+
+    const result = results.pop() orelse return error.MissingLookupResult;
+    try std.testing.expectEqual(@as(usize, 1), result.enrs.slice().len);
+    try std.testing.expectEqualSlices(u8, returned.raw, result.enrs.slice()[0].slice());
+    var event = harness.outbox.pop() orelse return error.MissingLookupEvent;
+    defer event.deinit(alloc);
+    try std.testing.expect(event == .lookup_finished);
+    try std.testing.expectEqual(@as(usize, 1), event.lookup_finished.enrs.items.len);
+    try std.testing.expectEqualSlices(u8, returned.raw, event.lookup_finished.enrs.items[0]);
+}
+
+test "discv5 lookup-local duplicate enrichment preserves candidate state" {
+    const alloc = std.testing.allocator;
+    const returned = try makeEnr(alloc, 0xaa, 10, .{ 127, 0, 0, 170 }, 9170);
+    defer alloc.free(returned.raw);
+    const validated = try enr.ValidatedEnr.init(returned.raw);
+    const candidate = lookup_mod.Candidate.fromValidated(&validated, returned.address);
+    var responder_id = [_]u8{0xbb} ** 32;
+    if (std.mem.eql(u8, &responder_id, &returned.node_id)) responder_id[31] ^= 1;
+    const lookup_config = lookup_mod.Config{
+        .num_results = 2,
+        .parallelism = 2,
+        .request_limit = 3,
+        .timeout_ms = 60_000,
+    };
+    var lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{ returned.node_id, responder_id }, 0, lookup_config);
+    defer lookup.deinit(alloc);
+    _ = lookup.nextPeer(lookup_config) orelse return error.MissingFirstCandidate;
+    _ = lookup.nextPeer(lookup_config) orelse return error.MissingSecondCandidate;
+
+    lookup.onSuccess(&responder_id, &.{candidate}, lookup_config);
+
+    try std.testing.expectEqual(@as(usize, 2), lookup.peers.items.len);
+    const returned_index = lookup.findPeerIndex(&returned.node_id) orelse return error.MissingReturnedCandidate;
+    try std.testing.expectEqual(lookup_mod.PeerState.waiting, lookup.peers.items[returned_index].state);
+    try std.testing.expectEqual(@as(usize, 1), lookup.num_waiting);
+    const retained = lookup.localCandidate(&returned.node_id) orelse return error.MissingLookupLocalContact;
+    try std.testing.expectEqualSlices(u8, returned.raw, retained.raw.slice());
+
+    lookup.onFailure(&returned.node_id, lookup_config);
+    try std.testing.expectEqual(lookup_mod.PeerState.failed, lookup.peers.items[returned_index].state);
+    lookup.onSuccess(&responder_id, &.{candidate}, lookup_config);
+    try std.testing.expectEqual(@as(usize, 2), lookup.peers.items.len);
+    try std.testing.expectEqual(lookup_mod.PeerState.failed, lookup.peers.items[returned_index].state);
+    try std.testing.expectEqual(@as(usize, 0), lookup.num_waiting);
+}
+
+test "discv5 lookup-local protocol bounds remain unchanged" {
+    try std.testing.expectEqual(@as(usize, 32), lookup_mod.MAX_CANDIDATES);
+    try std.testing.expectEqual(@as(usize, 16), lookup_mod.MAX_RESULTS);
+    try std.testing.expectEqual(@as(usize, 16), lookup_mod.MAX_PARALLELISM);
+    try std.testing.expectEqual(@as(u16, 16), config.MAX_NODES_RESPONSE);
 }
 
 const ReturnedEnr = struct {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const actor_mod = @import("../actor.zig");
+const lookup = @import("../service/lookup.zig");
 const outbound = @import("outbound.zig");
 const request_results = @import("../request_results.zig");
 const types = @import("../types.zig");
@@ -8,7 +9,7 @@ const Actor = actor_mod.Actor;
 const Env = actor_mod.Env;
 
 pub const Outcome = union(enum) {
-    success: []const types.NodeId,
+    success: []const lookup.Candidate,
     failure,
     canceled,
 };
