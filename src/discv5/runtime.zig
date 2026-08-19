@@ -8,6 +8,7 @@ const lookup_results = @import("lookup_results.zig");
 const message = @import("protocol/message.zig");
 const metrics = @import("metrics.zig");
 const packet = @import("protocol/packet.zig");
+const request_results = @import("request_results.zig");
 const transport_mod = @import("transport.zig");
 const types = @import("types.zig");
 const util = @import("util.zig");
@@ -30,6 +31,8 @@ const LookupError = runtime_error.LookupError;
 pub const Error = runtime_error.Error;
 pub const LookupResult = lookup_results.LookupResult;
 pub const LookupTerminalReason = lookup_results.LookupTerminalReason;
+pub const RequestResult = request_results.RequestResult;
+pub const RequestTerminal = request_results.RequestTerminal;
 
 const RuntimeImpl = struct {
     io: Io,
@@ -38,6 +41,7 @@ const RuntimeImpl = struct {
     admission: admission_mod.IngressAdmission,
     outbox: events.EventOutbox,
     lookup_result_outbox: lookup_results.LookupResultOutbox,
+    request_result_outbox: request_results.RequestResultOutbox,
     actor: actor_mod.Actor,
     options: config_mod.Options,
     command_queue: Io.Queue(Command),
@@ -89,6 +93,7 @@ const RuntimeImpl = struct {
         endpoint: types.Endpoint,
         pubkey: [33]u8,
         enr_seq: u64,
+        origin: types.RequestOrigin,
         reply: *PingReply,
     };
 
@@ -97,7 +102,17 @@ const RuntimeImpl = struct {
         pubkey: [33]u8,
         distances: [127]u16,
         distances_len: u8,
+        origin: types.RequestOrigin,
         reply: *FindNodeReply,
+    };
+
+    const SendTalkRequest = struct {
+        endpoint: types.Endpoint,
+        pubkey: [33]u8,
+        protocol_name: []u8,
+        request: []u8,
+        origin: types.RequestOrigin,
+        reply: *TalkRequestReply,
     };
 
     const Command = union(enum) {
@@ -108,13 +123,7 @@ const RuntimeImpl = struct {
         set_local_enr: struct { enr: []u8, reply: *SetLocalEnrReply },
         send_ping: SendPing,
         send_findnode: SendFindNode,
-        send_talk_request: struct {
-            endpoint: types.Endpoint,
-            pubkey: [33]u8,
-            protocol_name: []u8,
-            request: []u8,
-            reply: *TalkRequestReply,
-        },
+        send_talk_request: SendTalkRequest,
         send_talk_response: struct {
             endpoint: types.Endpoint,
             req_id: message.ReqId,
@@ -158,6 +167,7 @@ const RuntimeImpl = struct {
             error.InvalidLookupResultCapacity,
             error.InvalidPublicKey,
             error.InvalidRequestCapacity,
+            error.InvalidRequestResultCapacity,
             error.InvalidSignature,
             error.UnsupportedScheme,
             error.ZeroCapacity,
@@ -176,6 +186,8 @@ const RuntimeImpl = struct {
         errdefer outbox.deinit();
         var lookup_result_outbox = try lookup_results.LookupResultOutbox.init(io, allocator, config.limits.lookup_result_capacity);
         errdefer lookup_result_outbox.deinit();
+        var request_result_outbox = try request_results.RequestResultOutbox.init(io, allocator, config.limits.request_result_capacity);
+        errdefer request_result_outbox.deinit();
         var actor = try actor_mod.Actor.init(allocator, config);
         errdefer actor.deinit(&admission);
         const commands = try allocator.alloc(Command, config.limits.command_capacity);
@@ -186,6 +198,7 @@ const RuntimeImpl = struct {
             .admission = admission,
             .outbox = outbox,
             .lookup_result_outbox = lookup_result_outbox,
+            .request_result_outbox = request_result_outbox,
             .actor = actor,
             .options = options,
             .command_queue = .init(commands),
@@ -198,6 +211,7 @@ const RuntimeImpl = struct {
         self.stop();
         self.outbox.deinit();
         self.lookup_result_outbox.deinit();
+        self.request_result_outbox.deinit();
         self.actor.deinit(&self.admission);
         self.admission.deinit();
         self.transport.deinit();
@@ -228,7 +242,10 @@ const RuntimeImpl = struct {
         self.stop();
         self.drainAcceptedCommands();
         self.group.cancel(self.io);
-        self.actor.finishAllLookups(self.actorEnv(), .runtime_stopped);
+        const env = self.actorEnv();
+        self.actor.finishAllReliableRequests(env);
+        self.actor.finishAllLookups(env, .runtime_stopped);
+        self.request_result_outbox.close();
         self.lookup_result_outbox.close();
         self.outbox.close();
     }
@@ -259,6 +276,14 @@ const RuntimeImpl = struct {
 
     fn popLookupResult(self: *RuntimeImpl) ?lookup_results.LookupResult {
         return self.lookup_result_outbox.pop();
+    }
+
+    fn nextRequestResult(self: *RuntimeImpl) (Io.QueueClosedError || Io.Cancelable)!request_results.RequestResult {
+        return self.request_result_outbox.next();
+    }
+
+    fn popRequestResult(self: *RuntimeImpl) ?request_results.RequestResult {
+        return self.request_result_outbox.pop();
     }
 
     fn ensureRunning(self: *RuntimeImpl) !void {
@@ -305,6 +330,7 @@ const RuntimeImpl = struct {
             .ingress = &self.admission,
             .outbox = &self.outbox,
             .lookup_results = &self.lookup_result_outbox,
+            .request_results = &self.request_result_outbox,
         };
     }
 
@@ -348,12 +374,12 @@ const RuntimeImpl = struct {
                 defer self.allocator.free(value.enr);
                 try replyResult(self.io, value.reply, setLocalEnrResult(&self.actor, env, value.enr));
             },
-            .send_ping => |value| try replyResult(self.io, value.reply, sendPingResult(&self.actor, env, value.endpoint, &value.pubkey, value.enr_seq)),
-            .send_findnode => |value| try replyResult(self.io, value.reply, sendFindNodeResult(&self.actor, env, value.endpoint, &value.pubkey, value.distances[0..value.distances_len])),
+            .send_ping => |value| try self.handleSendPing(env, value),
+            .send_findnode => |value| try self.handleSendFindNode(env, value),
             .send_talk_request => |value| {
                 defer self.allocator.free(value.protocol_name);
                 defer self.allocator.free(value.request);
-                try replyResult(self.io, value.reply, sendTalkRequestResult(&self.actor, env, value.endpoint, &value.pubkey, value.protocol_name, value.request));
+                try self.handleSendTalkRequest(env, value);
             },
             .send_talk_response => |value| {
                 defer self.allocator.free(value.response);
@@ -384,6 +410,38 @@ const RuntimeImpl = struct {
             .peer_enr => |value| value.reply.putOneUncancelable(self.io, self.actor.peerEnr(&value.node_id)) catch {},
             .local_enr_seq => |reply| reply.putOneUncancelable(self.io, self.actor.localEnrSeq()) catch {},
         }
+    }
+
+    fn handleSendPing(self: *RuntimeImpl, env: actor_mod.Env, value: SendPing) Io.Cancelable!void {
+        const reliable = value.origin == .reliable_api;
+        if (reliable and !self.request_result_outbox.claim()) unreachable;
+        const result = sendPingResult(&self.actor, env, value.endpoint, &value.pubkey, value.enr_seq, value.origin);
+        if (result) |_| {} else |_| if (reliable) self.request_result_outbox.release();
+        try replyResult(self.io, value.reply, result);
+    }
+
+    fn handleSendFindNode(self: *RuntimeImpl, env: actor_mod.Env, value: SendFindNode) Io.Cancelable!void {
+        const reliable = value.origin == .reliable_api;
+        if (reliable and !self.request_result_outbox.claim()) unreachable;
+        const result = sendFindNodeResult(&self.actor, env, value.endpoint, &value.pubkey, value.distances[0..value.distances_len], value.origin);
+        if (result) |_| {} else |_| if (reliable) self.request_result_outbox.release();
+        try replyResult(self.io, value.reply, result);
+    }
+
+    fn handleSendTalkRequest(self: *RuntimeImpl, env: actor_mod.Env, value: SendTalkRequest) Io.Cancelable!void {
+        const reliable = value.origin == .reliable_api;
+        if (reliable and !self.request_result_outbox.claim()) unreachable;
+        const result = sendTalkRequestResult(
+            &self.actor,
+            env,
+            value.endpoint,
+            &value.pubkey,
+            value.protocol_name,
+            value.request,
+            value.origin,
+        );
+        if (result) |_| {} else |_| if (reliable) self.request_result_outbox.release();
+        try replyResult(self.io, value.reply, result);
     }
 
     fn handleStartLookup(self: *RuntimeImpl, env: actor_mod.Env, target: types.NodeId, reply: *LookupReply) Io.Cancelable!void {
@@ -459,8 +517,8 @@ fn setLocalEnrResult(actor: *actor_mod.Actor, env: actor_mod.Env, raw: []const u
     };
 }
 
-fn sendPingResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64) RequestError!message.ReqId {
-    return actor.sendPing(env, endpoint, pubkey, enr_seq, .api) catch |err| switch (err) {
+fn sendPingResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64, origin: types.RequestOrigin) RequestError!message.ReqId {
+    return actor.sendPing(env, endpoint, pubkey, enr_seq, origin) catch |err| switch (err) {
         error.Canceled => error.Canceled,
         error.DuplicateChallenge => error.DuplicateChallenge,
         error.DuplicateRequest => error.DuplicateRequest,
@@ -493,8 +551,8 @@ fn sendPingResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.E
     };
 }
 
-fn sendFindNodeResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16) FindNodeError!message.ReqId {
-    return actor.sendFindNode(env, endpoint, pubkey, distances, .api) catch |err| switch (err) {
+fn sendFindNodeResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16, origin: types.RequestOrigin) FindNodeError!message.ReqId {
+    return actor.sendFindNode(env, endpoint, pubkey, distances, origin) catch |err| switch (err) {
         error.Canceled => error.Canceled,
         error.DuplicateChallenge => error.DuplicateChallenge,
         error.DuplicateRequest => error.DuplicateRequest,
@@ -527,8 +585,8 @@ fn sendFindNodeResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: typ
     };
 }
 
-fn sendTalkRequestResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8) TalkRequestError!message.ReqId {
-    return actor.sendTalkRequest(env, endpoint, pubkey, protocol_name, request) catch |err| switch (err) {
+fn sendTalkRequestResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) TalkRequestError!message.ReqId {
+    return actor.sendTalkRequestWithOrigin(env, endpoint, pubkey, protocol_name, request, origin) catch |err| switch (err) {
         // Keep encoder exhaustion normalized in case message layout drifts
         // beyond its packet-sized scratch buffer before the packet preflight.
         error.BufferTooSmall => error.MessageTooLarge,
@@ -620,6 +678,7 @@ pub const Runtime = opaque {
     pub const RunError = runtime_error.RunError;
     pub const EventError = runtime_error.EventError;
     pub const LookupResultError = runtime_error.LookupResultError;
+    pub const RequestResultError = runtime_error.RequestResultError;
     pub const CommandError = runtime_error.CommandError;
     pub const EnrAdmissionError = runtime_error.EnrAdmissionError;
     pub const SetLocalEnrError = runtime_error.SetLocalEnrError;
@@ -630,6 +689,8 @@ pub const Runtime = opaque {
     pub const LookupError = runtime_error.LookupError;
     pub const LookupResult = lookup_results.LookupResult;
     pub const LookupTerminalReason = lookup_results.LookupTerminalReason;
+    pub const RequestResult = request_results.RequestResult;
+    pub const RequestTerminal = request_results.RequestTerminal;
     pub const Error = runtime_error.Error;
 
     pub fn init(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) runtime_error.InitError!*Runtime {
@@ -682,6 +743,14 @@ pub const Runtime = opaque {
         return impl(self).popLookupResult();
     }
 
+    pub fn nextRequestResult(self: *Runtime) runtime_error.RequestResultError!request_results.RequestResult {
+        return impl(self).nextRequestResult();
+    }
+
+    pub fn popRequestResult(self: *Runtime) ?request_results.RequestResult {
+        return impl(self).popRequestResult();
+    }
+
     pub fn addNode(self: *Runtime, node_id: types.NodeId, pubkey: ?*const [33]u8, address: types.Address, enr_bytes: ?[]const u8) runtime_error.EnrAdmissionError!bool {
         const storage = impl(self);
         try storage.ensureRunning();
@@ -730,14 +799,19 @@ pub const Runtime = opaque {
     pub fn sendPing(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, enr_seq: u64) runtime_error.RequestError!message.ReqId {
         const storage = impl(self);
         try storage.ensureRunning();
+        if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
+        var reservation_transferred = false;
+        errdefer if (!reservation_transferred) storage.request_result_outbox.cancelUnclaimed();
         var buffer: [1]RuntimeImpl.PingResult = undefined;
         var reply = RuntimeImpl.PingReply.init(&buffer);
         try storage.enqueueCommand(.{ .send_ping = .{
             .endpoint = .{ .node_id = node_id, .addr = address },
             .pubkey = pubkey.*,
             .enr_seq = enr_seq,
+            .origin = .reliable_api,
             .reply = &reply,
         } });
+        reservation_transferred = true;
         return try reply.getOneUncancelable(storage.io);
     }
 
@@ -745,6 +819,9 @@ pub const Runtime = opaque {
         const storage = impl(self);
         try storage.ensureRunning();
         if (distances.len > 127) return error.TooManyDistances;
+        if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
+        var reservation_transferred = false;
+        errdefer if (!reservation_transferred) storage.request_result_outbox.cancelUnclaimed();
         var copied: [127]u16 = undefined;
         @memcpy(copied[0..distances.len], distances);
         var buffer: [1]RuntimeImpl.FindNodeResult = undefined;
@@ -754,8 +831,10 @@ pub const Runtime = opaque {
             .pubkey = pubkey.*,
             .distances = copied,
             .distances_len = @intCast(distances.len),
+            .origin = .reliable_api,
             .reply = &reply,
         } });
+        reservation_transferred = true;
         return try reply.getOneUncancelable(storage.io);
     }
 
@@ -764,6 +843,9 @@ pub const Runtime = opaque {
         try storage.ensureRunning();
         const payload_len = std.math.add(usize, protocol_name.len, request.len) catch return error.MessageTooLarge;
         if (payload_len > packet.MAX_PACKET_SIZE) return error.MessageTooLarge;
+        if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
+        var reservation_transferred = false;
+        errdefer if (!reservation_transferred) storage.request_result_outbox.cancelUnclaimed();
         var protocol_copy: ?[]u8 = try storage.allocator.dupe(u8, protocol_name);
         errdefer if (protocol_copy) |bytes| storage.allocator.free(bytes);
         var request_copy: ?[]u8 = try storage.allocator.dupe(u8, request);
@@ -775,10 +857,12 @@ pub const Runtime = opaque {
             .pubkey = pubkey.*,
             .protocol_name = protocol_copy.?,
             .request = request_copy.?,
+            .origin = .reliable_api,
             .reply = &reply,
         } });
         protocol_copy = null;
         request_copy = null;
+        reservation_transferred = true;
         return try reply.getOneUncancelable(storage.io);
     }
 

@@ -48,6 +48,7 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
                 .endpoint = endpoint,
                 .pubkey = pubkey,
                 .enr_seq = 0,
+                .origin = .api,
                 .reply = reply,
             } });
         }

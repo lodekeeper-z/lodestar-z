@@ -37,6 +37,11 @@ pub const LookupResultError = error{
     Closed,
 };
 
+pub const RequestResultError = error{
+    Canceled,
+    Closed,
+};
+
 pub const CommandError = error{
     Canceled,
     Closed,
@@ -66,6 +71,7 @@ pub const RequestError = CommandError || error{
     NoSocketForAddressFamily,
     OutOfMemory,
     PermitGenerationExhausted,
+    RequestResultCapacityExceeded,
     TooManyActiveRequests,
     TooManyQueuedRequests,
     TooManyQueuedRequestsForEndpoint,
@@ -94,6 +100,6 @@ pub const LookupError = CommandError || error{
 };
 
 /// Compatibility umbrella for callers that want one Runtime-wide error type.
-pub const Error = InitError || RunError || EventError || LookupResultError || EnrAdmissionError ||
+pub const Error = InitError || RunError || EventError || LookupResultError || RequestResultError || EnrAdmissionError ||
     SetLocalEnrError || RequestError || FindNodeError || TalkRequestError ||
     TalkResponseError || LookupError;

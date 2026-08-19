@@ -1,6 +1,7 @@
 const std = @import("std");
 const actor_mod = @import("../actor.zig");
 const outbound = @import("outbound.zig");
+const request_results = @import("../request_results.zig");
 const types = @import("../types.zig");
 
 const Actor = actor_mod.Actor;
@@ -15,6 +16,8 @@ pub const Outcome = union(enum) {
 pub const Finished = struct {
     kind: types.RequestKind,
     nodes: ?std.ArrayListUnmanaged([]u8) = null,
+    raw_nodes: ?request_results.RawEnrList = null,
+    reliable: bool = false,
 
     pub fn takeNodes(self: *Finished) ?std.ArrayListUnmanaged([]u8) {
         const value = self.nodes;
@@ -34,13 +37,18 @@ pub const Finished = struct {
 /// The sole active-request terminal transition. It takes indexed state first,
 /// moves any owned completion payload, releases admission exactly once, applies
 /// peer/lookup/health state, and only then drains the endpoint lane.
-pub fn finish(actor: *Actor, env: Env, key: types.RequestKey, outcome: Outcome) ?Finished {
+pub fn finish(actor: *Actor, env: Env, key: types.RequestKey, outcome: Outcome, terminal: request_results.RequestTerminal) ?Finished {
     var active = actor.requests.take(key) orelse return null;
-    var result = Finished{ .kind = active.response.kind() };
+    var result = Finished{
+        .kind = active.response.kind(),
+        .reliable = active.origin == .reliable_api,
+    };
     if (active.response == .nodes) {
         result.nodes = active.response.nodes.enrs;
+        result.raw_nodes = active.response.nodes.terminal_enrs;
         active.response.nodes.enrs = .empty;
     }
+    actor.publishRequestTerminal(env, key, result.kind, active.origin, terminal);
     active.admission.release(env.ingress);
     switch (outcome) {
         .success => |closer| actor.onRequestCompletion(env, key, active.origin, true, closer),

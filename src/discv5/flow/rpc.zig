@@ -53,7 +53,11 @@ fn handlePong(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.En
     const key = types.RequestKey.init(endpoint, pong.req_id);
     const request = actor.requests.get(key) orelse return;
     if (request.response != .pong) return;
-    var finished = completion.finish(actor, env, key, .{ .success = &.{} }) orelse return;
+    var finished = completion.finish(actor, env, key, .{ .success = &.{} }, .{ .pong = .{
+        .enr_seq = pong.enr_seq,
+        .recipient_ip = pong.recipient_ip,
+        .recipient_port = pong.recipient_port,
+    } }) orelse return;
     defer finished.deinit(actor.alloc);
     actor.observeAddressVote(env, endpoint.addr, recipientAddress(pong.recipient_ip, pong.recipient_port));
     actor.maybeRequestEnrUpdate(env, endpoint, pong.enr_seq);
@@ -118,17 +122,20 @@ fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.E
     var discovered: [MAX_NODES_RESPONSE]enr.RawEnr = undefined;
     var discovered_len: usize = 0;
     for (nodes.enrs) |raw| {
-        if (accumulator.enrs.items.len >= MAX_NODES_RESPONSE) break;
+        if (accumulator.terminal_enrs.slice().len >= MAX_NODES_RESPONSE) break;
         if (!matchesDistances(raw, &endpoint.node_id, accumulator)) continue;
         if (actor.learnDiscovered(raw, outbound.nowNs(env.io)) != null and discovered_len < discovered.len) {
             discovered[discovered_len] = enr.RawEnr.init(raw) catch continue;
             discovered_len += 1;
         }
-        const copy = actor.alloc.dupe(u8, raw) catch {
-            env.outbox.notePayloadDrop();
-            continue;
-        };
-        accumulator.enrs.appendAssumeCapacity(copy);
+        accumulator.terminal_enrs.append(enr.RawEnr.init(raw) catch unreachable);
+        if (active.origin != .reliable_api) {
+            const copy = actor.alloc.dupe(u8, raw) catch {
+                env.outbox.notePayloadDrop();
+                continue;
+            };
+            accumulator.enrs.appendAssumeCapacity(copy);
+        }
     }
     accumulator.responses_received += 1;
     if (accumulator.responses_received < accumulator.total_responses.?) {
@@ -138,14 +145,35 @@ fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.E
 
     var closer: [MAX_NODES_RESPONSE]types.NodeId = undefined;
     var closer_len: usize = 0;
-    for (accumulator.enrs.items) |raw| {
-        const node_id = actor.discoveredNodeId(raw) orelse continue;
+    for (accumulator.terminal_enrs.slice()) |*raw| {
+        const node_id = actor.discoveredNodeId(raw.slice()) orelse continue;
         closer[closer_len] = node_id;
         closer_len += 1;
     }
-    var finished = completion.finish(actor, env, key, .{ .success = closer[0..closer_len] }) orelse return;
+    var finished = completion.finish(
+        actor,
+        env,
+        key,
+        .{ .success = closer[0..closer_len] },
+        .{ .nodes = accumulator.terminal_enrs },
+    ) orelse return;
     defer finished.deinit(actor.alloc);
-    const event_enrs = finished.takeNodes() orelse unreachable;
+    var event_enrs = finished.takeNodes() orelse unreachable;
+    if (finished.reliable) {
+        std.debug.assert(event_enrs.items.len == 0);
+        const raw_nodes = finished.raw_nodes orelse unreachable;
+        event_enrs.ensureTotalCapacityPrecise(actor.alloc, raw_nodes.slice().len) catch {
+            env.outbox.notePayloadDrop();
+            return;
+        };
+        for (raw_nodes.slice()) |*raw| {
+            const copy = actor.alloc.dupe(u8, raw.slice()) catch {
+                env.outbox.notePayloadDrop();
+                continue;
+            };
+            event_enrs.appendAssumeCapacity(copy);
+        }
+    }
     for (discovered[0..discovered_len]) |raw| actor.publishDiscovered(env.outbox, raw);
     env.outbox.publish(.{ .nodes = .{
         .peer_id = endpoint.node_id,
@@ -182,7 +210,13 @@ fn handleTalkResp(actor: *Actor, env: Env, plaintext: []const u8, endpoint: type
     const key = types.RequestKey.init(endpoint, response.req_id);
     const request = actor.requests.get(key) orelse return;
     if (request.response != .talkresp) return;
-    var finished = completion.finish(actor, env, key, .{ .success = &.{} }) orelse return;
+    var finished = completion.finish(
+        actor,
+        env,
+        key,
+        .{ .success = &.{} },
+        .{ .talk_response = types.PacketBytes.init(response.response) catch unreachable },
+    ) orelse return;
     defer finished.deinit(actor.alloc);
     const copy = actor.alloc.dupe(u8, response.response) catch {
         env.outbox.notePayloadDrop();

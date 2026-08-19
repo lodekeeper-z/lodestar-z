@@ -20,6 +20,7 @@ pub const MaintenanceReason = enum {
 
 pub const RequestOrigin = union(enum) {
     api,
+    reliable_api,
     lookup: u32,
     detached_lookup,
     maintenance: MaintenanceReason,

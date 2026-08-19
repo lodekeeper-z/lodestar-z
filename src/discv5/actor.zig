@@ -17,6 +17,7 @@ const session_flow = @import("flow/session.zig");
 const peer_book = @import("state/peer_book.zig");
 const request_book = @import("state/request_book.zig");
 const response_book = @import("state/response_book.zig");
+const request_results = @import("request_results.zig");
 const session_book = @import("state/session_book.zig");
 const transport = @import("transport.zig");
 const types = @import("types.zig");
@@ -40,6 +41,7 @@ pub const Env = struct {
     ingress: *admission.IngressAdmission,
     outbox: *events.EventOutbox,
     lookup_results: ?*lookup_results.LookupResultOutbox = null,
+    request_results: ?*request_results.RequestResultOutbox = null,
 };
 
 pub const ProbeSnapshot = struct {
@@ -178,12 +180,24 @@ pub const Actor = struct {
         protocol_name: []const u8,
         request: []const u8,
     ) !message.ReqId {
+        return self.sendTalkRequestWithOrigin(env, endpoint, pubkey, protocol_name, request, .api);
+    }
+
+    pub fn sendTalkRequestWithOrigin(
+        self: *Actor,
+        env: Env,
+        endpoint: types.Endpoint,
+        pubkey: *const [33]u8,
+        protocol_name: []const u8,
+        request: []const u8,
+        origin: types.RequestOrigin,
+    ) !message.ReqId {
         const req_id = randomReqId(env.io);
         const talk = message.TalkReq{ .req_id = req_id, .protocol = protocol_name, .request = request };
         var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
         const plaintext = try talk.encodeInto(&buffer);
         if (!packet.ordinaryMessageFits(plaintext.len)) return error.MessageTooLarge;
-        try outbound.sendTracked(self, env, endpoint, pubkey, req_id, .talkreq, &.{}, plaintext, .api);
+        try outbound.sendTracked(self, env, endpoint, pubkey, req_id, .talkreq, &.{}, plaintext, origin);
         return req_id;
     }
 
@@ -287,11 +301,12 @@ pub const Actor = struct {
 
     pub fn cancelRequest(self: *Actor, env: Env, key: types.RequestKey) bool {
         if (self.requests.get(key) != null) {
-            var finished = completion.finish(self, env, key, .canceled) orelse return false;
+            var finished = completion.finish(self, env, key, .canceled, .canceled) orelse return false;
             defer finished.deinit(self.alloc);
             return true;
         }
         const queued = self.requests.takeQueued(key) orelse return false;
+        self.publishRequestTerminal(env, key, queued.kind, queued.origin, .canceled);
         self.onRequestCancellation(env, key, queued.origin);
         outbound.drainEndpoint(self, env, key.endpoint);
         return true;
@@ -304,7 +319,7 @@ pub const Actor = struct {
                 .health, .eviction => _ = self.peers.cancelHealthRequest(key),
                 .enr_refresh => {},
             },
-            .api, .detached_lookup => {},
+            .api, .reliable_api, .detached_lookup => {},
         }
     }
 
@@ -342,9 +357,49 @@ pub const Actor = struct {
                 },
                 .enr_refresh => {},
             },
-            .api => {},
+            .api, .reliable_api => {},
             .detached_lookup => {},
         }
+    }
+
+    pub fn publishRequestTerminal(
+        self: *Actor,
+        env: Env,
+        key: types.RequestKey,
+        kind: types.RequestKind,
+        origin: types.RequestOrigin,
+        terminal: request_results.RequestTerminal,
+    ) void {
+        _ = self;
+        if (origin != .reliable_api) return;
+        switch (terminal) {
+            .pong => std.debug.assert(kind == .ping),
+            .nodes => std.debug.assert(kind == .findnode),
+            .talk_response => std.debug.assert(kind == .talkreq),
+            .timeout, .canceled, .runtime_stopped => {},
+        }
+        const result_outbox = env.request_results orelse unreachable;
+        result_outbox.publishAssumeReserved(.{ .key = key, .kind = kind, .terminal = terminal });
+    }
+
+    pub fn finishAllReliableRequests(self: *Actor, env: Env) void {
+        var active_finished: usize = 0;
+        while (active_finished < self.limits.max_active_requests) : (active_finished += 1) {
+            const snapshot = self.requests.firstReliableActive() orelse break;
+            var active = self.requests.take(snapshot.key) orelse unreachable;
+            self.publishRequestTerminal(env, snapshot.key, snapshot.kind, active.origin, .runtime_stopped);
+            active.admission.release(env.ingress);
+            active.deinit(self.alloc);
+        }
+        std.debug.assert(self.requests.firstReliableActive() == null);
+
+        var queued_finished: usize = 0;
+        while (queued_finished < self.limits.max_queued_requests) : (queued_finished += 1) {
+            const snapshot = self.requests.firstReliableQueued() orelse break;
+            const queued = self.requests.takeQueued(snapshot.key) orelse unreachable;
+            self.publishRequestTerminal(env, snapshot.key, snapshot.kind, queued.origin, .runtime_stopped);
+        }
+        std.debug.assert(self.requests.firstReliableQueued() == null);
     }
 
     pub fn publishConnection(self: *Actor, outbox: *events.EventOutbox, node_id: types.NodeId, transition: peer_book.ConnectionTransition) void {

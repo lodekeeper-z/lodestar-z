@@ -133,6 +133,19 @@ fn initTestRuntime(io: std.Io, alloc: std.mem.Allocator, secret_byte: u8, limits
     }, options);
 }
 
+fn awaitRequestResult(io: std.Io, runtime: *runtime_mod.Runtime) !runtime_mod.RequestResult {
+    for (0..2_000) |_| {
+        if (runtime.popRequestResult()) |result| return result;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return error.MissingRequestResult;
+}
+
+fn expectRequestIdentity(result: *const runtime_mod.RequestResult, endpoint: types.Endpoint, req_id: @import("protocol/message.zig").ReqId, kind: types.RequestKind) !void {
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, req_id)));
+    try std.testing.expectEqual(kind, result.kind);
+}
+
 test "Runtime public handle is opaque" {
     switch (@typeInfo(runtime_mod.Runtime)) {
         .@"opaque" => {},
@@ -895,6 +908,7 @@ test "public Runtime APIs expose exact operation error contracts" {
         expectErrorSet(runtime_mod.Runtime.run, runtime_mod.Runtime.RunError);
         expectErrorSet(runtime_mod.Runtime.nextEvent, runtime_mod.Runtime.EventError);
         expectErrorSet(runtime_mod.Runtime.nextLookupResult, runtime_mod.Runtime.LookupResultError);
+        expectErrorSet(runtime_mod.Runtime.nextRequestResult, runtime_mod.Runtime.RequestResultError);
         expectErrorSet(runtime_mod.Runtime.addNode, runtime_mod.Runtime.EnrAdmissionError);
         expectErrorSet(runtime_mod.Runtime.addEnr, runtime_mod.Runtime.EnrAdmissionError);
         expectErrorSet(runtime_mod.Runtime.setLocalEnr, runtime_mod.Runtime.SetLocalEnrError);
@@ -910,6 +924,317 @@ test "public Runtime APIs expose exact operation error contracts" {
         expectErrorSet(runtime_mod.Runtime.peerEnr, runtime_mod.Runtime.CommandError);
         expectErrorSet(runtime_mod.Runtime.localEnrSeq, runtime_mod.Runtime.CommandError);
     }
+}
+
+test "request result capacity rejects before actor work and pop releases one slot" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x91, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 4,
+        .request_result_capacity = 1,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 92 }, .port = 9092 } },
+    };
+    const first_id = try runtime.sendPing(remote_id, &remote_pubkey, endpoint.addr, 0);
+    try std.testing.expectError(error.RequestResultCapacityExceeded, runtime.sendPing(remote_id, &remote_pubkey, endpoint.addr, 1));
+    var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 1), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 1), counts.permits);
+    var snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.sentMessageCount(.ping));
+
+    try std.testing.expect(try runtime.cancelRequest(remote_id, endpoint.addr, first_id));
+    try std.testing.expectError(error.RequestResultCapacityExceeded, runtime.sendPing(remote_id, &remote_pubkey, endpoint.addr, 2));
+    const canceled = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+    try expectRequestIdentity(&canceled, endpoint, first_id, .ping);
+    try std.testing.expect(canceled.terminal == .canceled);
+    try std.testing.expect(runtime.popRequestResult() == null);
+
+    const second_id = try runtime.sendPing(remote_id, &remote_pubkey, endpoint.addr, 3);
+    try std.testing.expect(try runtime.cancelRequest(remote_id, endpoint.addr, second_id));
+    const second = try runtime.nextRequestResult();
+    try expectRequestIdentity(&second, endpoint, second_id, .ping);
+    try std.testing.expect(second.terminal == .canceled);
+    try std.testing.expect(runtime.popRequestResult() == null);
+    counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+    snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 2), snapshot.sentMessageCount(.ping));
+
+    running.stop();
+    try running.await();
+}
+
+test "reliable request results cover active and queued cancellation exactly once" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x93, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .max_queued_requests_per_endpoint = 2,
+        .event_capacity = 2,
+        .command_capacity = 4,
+        .request_result_capacity = 2,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x94} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 94 }, .port = 9094 } },
+    };
+    const active_id = try runtime.sendPing(endpoint.node_id, &remote_pubkey, endpoint.addr, 0);
+    const queued_id = try runtime.sendTalkRequest(endpoint.node_id, &remote_pubkey, endpoint.addr, "proto", "queued");
+    var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 1), counts.active);
+    try std.testing.expectEqual(@as(usize, 1), counts.queued);
+    try std.testing.expectEqual(@as(usize, 1), counts.permits);
+
+    try std.testing.expect(try runtime.cancelRequest(endpoint.node_id, endpoint.addr, queued_id));
+    try std.testing.expect(try runtime.cancelRequest(endpoint.node_id, endpoint.addr, active_id));
+    const first = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+    const second = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+    try std.testing.expect(first.terminal == .canceled);
+    try std.testing.expect(second.terminal == .canceled);
+    var saw_active = false;
+    var saw_queued = false;
+    for ([_]runtime_mod.RequestResult{ first, second }) |result| {
+        if (types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, active_id))) {
+            try std.testing.expectEqual(types.RequestKind.ping, result.kind);
+            saw_active = true;
+        } else if (types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, queued_id))) {
+            try std.testing.expectEqual(types.RequestKind.talkreq, result.kind);
+            saw_queued = true;
+        } else return error.UnexpectedRequestResult;
+    }
+    try std.testing.expect(saw_active and saw_queued);
+    try std.testing.expect(runtime.popRequestResult() == null);
+    try std.testing.expect(!try runtime.cancelRequest(endpoint.node_id, endpoint.addr, active_id));
+    try std.testing.expect(!try runtime.cancelRequest(endpoint.node_id, endpoint.addr, queued_id));
+    counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+
+    running.stop();
+    try running.await();
+}
+
+test "request timeout publishes one reliable terminal result" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x95} ** 32));
+    const runtime = try runtime_mod.Runtime.init(io, alloc, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key)),
+        .request_timeout_ms = 0,
+        .request_retries = 0,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 1,
+            .max_queued_requests = 1,
+            .event_capacity = 2,
+            .command_capacity = 4,
+            .request_result_capacity = 1,
+        },
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x96} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 96 }, .port = 9096 } },
+    };
+    const req_id = try runtime.sendFindNode(endpoint.node_id, &remote_pubkey, endpoint.addr, &.{1});
+    try runtime_mod.Testing.putMaintenance(runtime);
+    _ = try runtime.metricsSnapshot();
+    const result = runtime.popRequestResult() orelse return error.MissingTimeoutRequestResult;
+    try expectRequestIdentity(&result, endpoint, req_id, .findnode);
+    try std.testing.expect(result.terminal == .timeout);
+    try std.testing.expect(runtime.popRequestResult() == null);
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+
+    running.stop();
+    try running.await();
+}
+
+test "Runtime shutdown terminates active and queued reliable requests" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x97, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .max_queued_requests_per_endpoint = 2,
+        .event_capacity = 2,
+        .command_capacity = 4,
+        .request_result_capacity = 2,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x98} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 98 }, .port = 9098 } },
+    };
+    const active_id = try runtime.sendPing(endpoint.node_id, &remote_pubkey, endpoint.addr, 0);
+    const queued_id = try runtime.sendFindNode(endpoint.node_id, &remote_pubkey, endpoint.addr, &.{1});
+    const before = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 1), before.active);
+    try std.testing.expectEqual(@as(usize, 1), before.queued);
+    try std.testing.expectEqual(@as(usize, 1), before.permits);
+
+    running.stop();
+    try running.await();
+    const first = runtime.popRequestResult() orelse return error.MissingShutdownRequestResult;
+    const second = runtime.popRequestResult() orelse return error.MissingShutdownRequestResult;
+    try std.testing.expect(first.terminal == .runtime_stopped);
+    try std.testing.expect(second.terminal == .runtime_stopped);
+    var saw_active = false;
+    var saw_queued = false;
+    for ([_]runtime_mod.RequestResult{ first, second }) |result| {
+        if (types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, active_id))) {
+            try std.testing.expectEqual(types.RequestKind.ping, result.kind);
+            saw_active = true;
+        } else if (types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, queued_id))) {
+            try std.testing.expectEqual(types.RequestKind.findnode, result.kind);
+            saw_queued = true;
+        } else return error.UnexpectedRequestResult;
+    }
+    try std.testing.expect(saw_active and saw_queued);
+    try std.testing.expect(runtime.popRequestResult() == null);
+    try std.testing.expectError(error.Closed, runtime.nextRequestResult());
+    const after = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), after.active);
+    try std.testing.expectEqual(@as(usize, 0), after.queued);
+    try std.testing.expectEqual(@as(usize, 0), after.permits);
+}
+
+test "request result reservation rolls back on actor send error" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x99, .{
+        .max_active_requests = 1,
+        .max_queued_requests = 1,
+        .event_capacity = 1,
+        .command_capacity = 2,
+        .request_result_capacity = 1,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9a} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const unavailable = types.Address{ .ip6 = .{ .bytes = [_]u8{0} ** 15 ++ .{1}, .port = 9099 } };
+    try std.testing.expectError(error.NoSocketForAddressFamily, runtime.sendPing(remote_id, &remote_pubkey, unavailable, 0));
+    try std.testing.expect(runtime.popRequestResult() == null);
+
+    const available = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 99 }, .port = 9099 } };
+    const req_id = try runtime.sendPing(remote_id, &remote_pubkey, available, 0);
+    try std.testing.expect(try runtime.cancelRequest(remote_id, available, req_id));
+    const result = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+    try std.testing.expect(result.terminal == .canceled);
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+
+    running.stop();
+    try running.await();
+}
+
+test "request result reservation rolls back when command enqueue is full" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x9b, .{
+        .max_active_requests = 1,
+        .max_queued_requests = 1,
+        .event_capacity = 1,
+        .command_capacity = 1,
+        .request_result_capacity = 1,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    var gate = runtime_mod.Testing.CommandGate{};
+    runtime_mod.Testing.setCommandGate(runtime, &gate);
+    var blocker_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var blocker_reply = runtime_mod.Testing.EnrAdmissionReply.init(&blocker_buffer);
+    try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &blocker_reply);
+    try awaitFlag(&gate.entered, error.RuntimeDidNotEnter);
+    var queued_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
+    var queued_reply = runtime_mod.Testing.EnrAdmissionReply.init(&queued_buffer);
+    try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xfe}), &queued_reply);
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9c} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 100 }, .port = 9100 } };
+    try std.testing.expectError(error.CommandQueueFull, runtime.sendPing(remote_id, &remote_pubkey, address, 0));
+    try std.testing.expect(runtime.popRequestResult() == null);
+
+    gate.proceed.store(true, .release);
+    const blocker_result = try blocker_reply.getOneUncancelable(io);
+    _ = try blocker_result;
+    const queued_result = try queued_reply.getOneUncancelable(io);
+    _ = try queued_result;
+    const req_id = try runtime.sendPing(remote_id, &remote_pubkey, address, 1);
+    try std.testing.expect(try runtime.cancelRequest(remote_id, address, req_id));
+    const result = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+    try std.testing.expect(result.terminal == .canceled);
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+
+    running.stop();
+    try running.await();
 }
 
 test "running Runtime rejects oversized TALK before queued ownership admission" {
@@ -1163,6 +1488,127 @@ fn runtimeInitializationLifecycle(alloc: std.mem.Allocator) !void {
 
 test "Runtime partial initialization cleans up every allocator failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, runtimeInitializationLifecycle, .{});
+}
+
+test "full EventOutbox cannot lose reliable pong nodes or talk response payloads" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const key_a = try secp.keyPairFromSecret(&([_]u8{0xa1} ** 32));
+    const pubkey_a = secp.compressedPubkey(&key_a);
+    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
+    const key_b = try secp.keyPairFromSecret(&([_]u8{0xa2} ** 32));
+    const pubkey_b = secp.compressedPubkey(&key_b);
+    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
+    const limits_a = config.Limits{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 1,
+        .command_capacity = 8,
+        .request_result_capacity = 1,
+    };
+    const limits_b = config.Limits{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 8,
+        .command_capacity = 8,
+        .request_result_capacity = 1,
+    };
+    const runtime_a = try runtime_mod.Runtime.init(io, alloc, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_a,
+        .local_node_id = id_a,
+        .rate_limiter = null,
+        .limits = limits_a,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running_a = RunningRuntime.init(io);
+    defer running_a.deinit();
+    try running_a.start(runtime_a);
+    const runtime_b = try runtime_mod.Runtime.init(io, alloc, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_b,
+        .local_node_id = id_b,
+        .rate_limiter = null,
+        .limits = limits_b,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running_b = RunningRuntime.init(io);
+    defer running_b.deinit();
+    try running_b.start(runtime_b);
+    try running_a.awaitStarted();
+    try running_b.awaitStarted();
+    const address_a = runtime_a.boundAddress(.ip4) orelse return error.MissingBoundAddress;
+    const address_b = runtime_b.boundAddress(.ip4) orelse return error.MissingBoundAddress;
+    const endpoint_b = types.Endpoint{ .node_id = id_b, .addr = address_b };
+
+    var builder_a = enr.Builder.init(alloc, key_a, 1);
+    builder_a.ip = address_a.ip4.bytes;
+    builder_a.udp = address_a.ip4.port;
+    const local_enr_a = try builder_a.encode();
+    defer alloc.free(local_enr_a);
+    try runtime_a.setLocalEnr(local_enr_a);
+    var builder_b = enr.Builder.init(alloc, key_b, 1);
+    builder_b.ip = address_b.ip4.bytes;
+    builder_b.udp = address_b.ip4.port;
+    const local_enr_b = try builder_b.encode();
+    defer alloc.free(local_enr_b);
+    try runtime_b.setLocalEnr(local_enr_b);
+    var local_b_event = runtime_b.popEvent() orelse return error.MissingLocalEnrEvent;
+    local_b_event.deinit(alloc);
+    try std.testing.expect(try runtime_a.addNode(id_b, &pubkey_b, address_b, local_enr_b));
+    try std.testing.expect(try runtime_b.addNode(id_a, &pubkey_a, address_a, local_enr_a));
+
+    const ping_id = try runtime_a.sendPing(id_b, &pubkey_b, address_b, 0);
+    const pong_result = try awaitRequestResult(io, runtime_a);
+    try expectRequestIdentity(&pong_result, endpoint_b, ping_id, .ping);
+    try std.testing.expect(pong_result.terminal == .pong);
+    try std.testing.expectEqual(@as(u64, 1), pong_result.terminal.pong.enr_seq);
+    try std.testing.expectEqual(address_a.getPort(), pong_result.terminal.pong.recipient_port);
+
+    const findnode_id = try runtime_a.sendFindNode(id_b, &pubkey_b, address_b, &.{0});
+    const nodes_result = try awaitRequestResult(io, runtime_a);
+    try expectRequestIdentity(&nodes_result, endpoint_b, findnode_id, .findnode);
+    try std.testing.expect(nodes_result.terminal == .nodes);
+    try std.testing.expectEqual(@as(usize, 1), nodes_result.terminal.nodes.slice().len);
+    try std.testing.expectEqualSlices(u8, local_enr_b, nodes_result.terminal.nodes.slice()[0].slice());
+
+    const talk_id = try runtime_a.sendTalkRequest(id_b, &pubkey_b, address_b, "test", "request");
+    var response_sent = false;
+    for (0..2_000) |_| {
+        while (runtime_b.popEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit(alloc);
+            if (event == .talkreq and std.mem.eql(u8, event.talkreq.req_id.slice(), talk_id.slice())) {
+                try runtime_b.sendTalkResponse(id_a, address_a, event.talkreq.req_id, "response bytes");
+                response_sent = true;
+            }
+        }
+        if (response_sent) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(response_sent);
+    const talk_result = try awaitRequestResult(io, runtime_a);
+    try expectRequestIdentity(&talk_result, endpoint_b, talk_id, .talkreq);
+    try std.testing.expect(talk_result.terminal == .talk_response);
+    try std.testing.expectEqualSlices(u8, "response bytes", talk_result.terminal.talk_response.slice());
+    try std.testing.expect(runtime_a.popRequestResult() == null);
+
+    var blocker = runtime_a.popEvent() orelse return error.MissingEventOutboxBlocker;
+    defer blocker.deinit(alloc);
+    try std.testing.expect(blocker == .local_enr_updated);
+    try std.testing.expect(runtime_a.popEvent() == null);
+    const snapshot = try runtime_a.metricsSnapshot();
+    try std.testing.expect(snapshot.dropped_event_count >= 3);
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime_a);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+
+    running_a.stop();
+    running_b.stop();
+    try running_a.await();
+    try running_b.await();
+    try std.testing.expectError(error.Closed, runtime_a.nextRequestResult());
 }
 
 test "two live Runtime sockets complete strict handshake and PING lifecycle" {

@@ -21,10 +21,15 @@ pub const Event = @import("events.zig").Event;
 pub const EventKind = @import("events.zig").EventKind;
 pub const LookupResult = @import("lookup_results.zig").LookupResult;
 pub const LookupTerminalReason = @import("lookup_results.zig").LookupTerminalReason;
+pub const RequestResult = @import("request_results.zig").RequestResult;
+pub const RequestTerminal = @import("request_results.zig").RequestTerminal;
+pub const RequestKey = @import("types.zig").RequestKey;
+pub const RequestKind = @import("types.zig").RequestKind;
 pub const NodeId = enr.NodeId;
 pub const Enr = enr.Enr;
 pub const Address = @import("types.zig").Address;
 pub const MAX_LOOKUP_RESULTS = @import("service/lookup.zig").MAX_RESULTS;
+pub const MAX_REQUEST_RESULTS = @import("config.zig").MAX_REQUEST_RESULTS;
 
 test {
     _ = @import("wire_test_vectors.zig");
@@ -46,6 +51,7 @@ test {
     _ = @import("transport.zig");
     _ = @import("admission.zig");
     _ = @import("events.zig");
+    _ = @import("request_results.zig");
     _ = @import("state/session_book.zig");
     _ = @import("state/request_queue.zig");
     _ = @import("state/request_book_test.zig");

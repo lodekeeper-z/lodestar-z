@@ -1,6 +1,7 @@
 const std = @import("std");
 const admission_mod = @import("../admission.zig");
 const config_mod = @import("../config.zig");
+const request_results = @import("../request_results.zig");
 const request_queue = @import("request_queue.zig");
 const types = @import("../types.zig");
 
@@ -82,6 +83,7 @@ pub const FreshRetryTransition = union(enum) {
 
 pub const NodesAccumulator = struct {
     enrs: std.ArrayListUnmanaged([]u8) = .empty,
+    terminal_enrs: request_results.RawEnrList = .{},
     total_responses: ?u64 = null,
     responses_received: u64 = 0,
     requested_distances: RequestDistances,
@@ -101,6 +103,7 @@ pub const NodesAccumulator = struct {
     pub fn resetGeneration(self: *NodesAccumulator, alloc: Allocator) void {
         for (self.enrs.items) |bytes| alloc.free(bytes);
         self.enrs.clearRetainingCapacity();
+        self.terminal_enrs.clear();
         self.total_responses = null;
         self.responses_received = 0;
     }
@@ -270,7 +273,7 @@ pub const RequestBook = struct {
                 .health, .eviction => return error.EndpointBusy,
                 .enr_refresh => {},
             },
-            .api, .lookup, .detached_lookup => {},
+            .api, .reliable_api, .lookup, .detached_lookup => {},
         }
         const key = types.RequestKey.init(request.endpoint, request.req_id);
         if (self.active.contains(key) or self.containsQueued(key)) return error.DuplicateRequest;
@@ -300,6 +303,31 @@ pub const RequestBook = struct {
 
     pub fn queuedCount(self: *const RequestBook) usize {
         return self.queued_total;
+    }
+
+    pub const ReliableSnapshot = struct {
+        key: types.RequestKey,
+        kind: types.RequestKind,
+    };
+
+    pub fn firstReliableActive(self: *const RequestBook) ?ReliableSnapshot {
+        var active = self.active.iterator();
+        while (active.next()) |entry| {
+            if (entry.value_ptr.origin != .reliable_api) continue;
+            return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.response.kind() };
+        }
+        return null;
+    }
+
+    pub fn firstReliableQueued(self: *const RequestBook) ?ReliableSnapshot {
+        var lanes = self.lanes.iterator();
+        while (lanes.next()) |entry| {
+            for (entry.value_ptr.queued.items.items[entry.value_ptr.queued.head..]) |queued| {
+                if (queued.origin != .reliable_api) continue;
+                return .{ .key = .init(queued.endpoint, queued.req_id), .kind = queued.kind };
+            }
+        }
+        return null;
     }
 
     pub fn collectDrainable(self: *RequestBook, endpoints: []types.Endpoint) usize {

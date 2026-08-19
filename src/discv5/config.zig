@@ -19,6 +19,7 @@ pub const MAX_CONTACTS: usize = MAX_SESSIONS;
 pub const MAX_EVENTS: usize = 1_024;
 pub const MAX_COMMANDS: usize = 1_024;
 pub const MAX_LOOKUPS: usize = 1_024;
+pub const MAX_REQUEST_RESULTS: usize = MAX_ACTIVE_REQUESTS;
 
 pub const BindAddresses = struct {
     ip4: ?types.Address = null,
@@ -41,6 +42,7 @@ pub const Limits = struct {
     event_capacity: usize = MAX_EVENTS,
     command_capacity: usize = MAX_COMMANDS,
     lookup_result_capacity: usize = MAX_LOOKUPS,
+    request_result_capacity: usize = MAX_REQUEST_RESULTS,
 };
 
 pub const Config = struct {
@@ -83,6 +85,7 @@ pub const Config = struct {
             self.limits.contact_capacity == 0 or self.limits.contact_capacity > MAX_CONTACTS or
             self.limits.command_capacity == 0 or self.limits.command_capacity > MAX_COMMANDS or
             self.limits.lookup_result_capacity == 0 or self.limits.lookup_result_capacity > MAX_LOOKUPS or
+            self.limits.request_result_capacity == 0 or self.limits.request_result_capacity > MAX_REQUEST_RESULTS or
             self.limits.event_capacity == 0 or self.limits.event_capacity > MAX_EVENTS) return error.InvalidCapacity;
         if (self.limits.session_capacity == 0 or self.limits.session_capacity > MAX_SESSIONS)
             return error.InvalidSessionCapacity;
@@ -138,6 +141,12 @@ test "config keeps protocol capacities bounded" {
     try std.testing.expectError(error.InvalidCapacity, config.validate());
     config.limits.lookup_result_capacity = MAX_LOOKUPS + 1;
     try std.testing.expectError(error.InvalidCapacity, config.validate());
+    config.limits.lookup_result_capacity = (Limits{}).lookup_result_capacity;
+    config.limits.request_result_capacity = 0;
+    try std.testing.expectError(error.InvalidCapacity, config.validate());
+    config.limits.request_result_capacity = MAX_REQUEST_RESULTS + 1;
+    try std.testing.expectError(error.InvalidCapacity, config.validate());
+    try std.testing.expectEqual(MAX_ACTIVE_REQUESTS, MAX_REQUEST_RESULTS);
 }
 
 test "config rejects address vote thresholds above the bounded voter capacity" {
