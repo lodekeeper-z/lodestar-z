@@ -423,10 +423,10 @@ pub const Actor = struct {
         }
     }
 
-    pub fn metricsSnapshot(self: *Actor, now_ns: i64) metrics_mod.MetricsSnapshot {
+    pub fn metricsSnapshot(self: *const Actor) metrics_mod.MetricsSnapshot {
         return .{
             .kad_table_size = self.peers.routing.nodeCount(),
-            .active_session_count = self.sessions.count(now_ns),
+            .active_session_count = self.sessions.count(),
             .connected_peer_count = self.peers.connectedCount(),
             .lookup_count = self.lookup_count,
             .active_lookup_count = self.lookups.count(),

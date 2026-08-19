@@ -396,7 +396,7 @@ const RuntimeImpl = struct {
                 try self.handleStartLookup(env, target, reply);
             },
             .metrics_snapshot => |reply| {
-                var snapshot = self.actor.metricsSnapshot(util.nowNs(self.io));
+                var snapshot = self.actor.metricsSnapshot();
                 const admission = self.admission.snapshot();
                 snapshot.rate_limit_hit_ip = admission.rate_limit_hit_ip_total;
                 snapshot.rate_limit_hit_total = admission.rate_limit_hit_total;

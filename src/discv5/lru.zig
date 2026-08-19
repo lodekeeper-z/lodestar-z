@@ -77,6 +77,14 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             return self.nodes[index].value;
         }
 
+        /// Return and promote a live value without removing expired state.
+        pub fn getPromote(self: *Self, key: K, now_ns: i64) ?V {
+            const index = self.map.get(key) orelse return null;
+            if (self.isExpired(index, now_ns)) return null;
+            self.moveToFront(index);
+            return self.nodes[index].value;
+        }
+
         /// Read a live value without changing recency or removing expired state.
         pub fn peek(self: *const Self, key: K, now_ns: i64) ?V {
             const index = self.map.get(key) orelse return null;
@@ -105,9 +113,25 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             _ = self.putMove(key, value, ttl_ms, now_ns);
         }
 
+        /// At full capacity, reuse an expired entry before evicting the LRU.
+        pub fn putReplacingExpired(self: *Self, key: K, value: V, ttl_ms: u64, now_ns: i64) void {
+            _ = self.putMoveWithPolicy(key, value, ttl_ms, now_ns, true);
+        }
+
         /// Moves `value` into the cache and returns ownership of a replaced or
         /// evicted entry. Callers storing owned resources must use this API.
         pub fn putMove(self: *Self, key: K, value: V, ttl_ms: u64, now_ns: i64) ?Entry {
+            return self.putMoveWithPolicy(key, value, ttl_ms, now_ns, false);
+        }
+
+        fn putMoveWithPolicy(
+            self: *Self,
+            key: K,
+            value: V,
+            ttl_ms: u64,
+            now_ns: i64,
+            replace_expired: bool,
+        ) ?Entry {
             if (self.map.get(key)) |index| {
                 const node = &self.nodes[index];
                 const removed = Entry{ .key = node.key, .value = node.value };
@@ -120,8 +144,12 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
 
             var removed: ?Entry = null;
             const index = self.free_head orelse blk: {
-                const evicted_index = self.evictTailForReuse();
+                const evicted_index = if (replace_expired)
+                    self.findExpired(now_ns) orelse self.tail.?
+                else
+                    self.tail.?;
                 removed = .{ .key = self.nodes[evicted_index].key, .value = self.nodes[evicted_index].value };
+                self.evictForReuse(evicted_index);
                 break :blk evicted_index;
             };
             self.free_head = self.nodes[index].free_next;
@@ -188,12 +216,22 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             self.len -= 1;
         }
 
-        fn evictTailForReuse(self: *Self) usize {
-            const index = self.tail.?;
+        fn evictForReuse(self: *Self, index: usize) void {
             std.debug.assert(self.map.remove(self.nodes[index].key));
             self.unlink(index);
             self.len -= 1;
-            return index;
+        }
+
+        fn findExpired(self: *const Self, now_ns: i64) ?usize {
+            var current = self.tail;
+            var scanned: usize = 0;
+            while (current != null and scanned < self.nodes.len) : (scanned += 1) {
+                const index = current.?;
+                if (self.isExpired(index, now_ns)) return index;
+                current = self.nodes[index].prev;
+            }
+            std.debug.assert(current == null);
+            return null;
         }
 
         fn releaseNode(self: *Self, index: usize) void {
@@ -315,6 +353,26 @@ test "lru get promotes and put evicts least recently used" {
     try std.testing.expectEqual(@as(?u64, null), cache.get(2, 3));
     try std.testing.expectEqual(@as(?u64, 10), cache.get(1, 3));
     try std.testing.expectEqual(@as(?u64, 30), cache.get(3, 3));
+}
+
+test "lru getPromote promotes live values without refreshing or removing expired state" {
+    const Cache = LruCache(u8, u64);
+    var cache = try Cache.init(std.testing.allocator, 2);
+    defer cache.deinit(std.testing.allocator);
+
+    cache.put(1, 10, 10, 0);
+    cache.put(2, 20, 20, 0);
+    try cache.expectOrder(&.{ 2, 1 });
+
+    try std.testing.expectEqual(@as(?u64, 10), cache.getPromote(1, 5 * std.time.ns_per_ms));
+    try cache.expectOrder(&.{ 1, 2 });
+    try std.testing.expectEqual(@as(?u64, null), cache.getPromote(1, 10 * std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(usize, 2), cache.count());
+    try cache.expectOrder(&.{ 1, 2 });
+
+    cache.pruneExpired(10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    try cache.expectOrder(&.{2});
 }
 
 test "lru replacing a key updates value ttl and recency without growing" {

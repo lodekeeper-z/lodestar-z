@@ -765,6 +765,126 @@ test "failed ciphertext does not refresh stable session LRU recency" {
     try std.testing.expect(actor.sessions.peekPtr(third_endpoint, 4) != null);
 }
 
+test "expired stable outbound paths recover without access-time removal" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x22} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x23} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 44 }, .port = 9044 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .request_timeout_ms = 1,
+        .request_retries = 1,
+        .session_timeout_ms = 1,
+        .ping_interval_ms = 0,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 2,
+            .max_queued_requests = 2,
+            .session_capacity = 1,
+            .event_capacity = 2,
+            .command_capacity = 2,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const now_ns = outbound.nowNs(io);
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, now_ns));
+    actor.sessions.put(endpoint, .{
+        .initiator_key = [_]u8{0x24} ** 16,
+        .recipient_key = [_]u8{0x25} ** 16,
+    }, now_ns - 2 * std.time.ns_per_ms);
+
+    try std.testing.expectError(error.NoSession, actor.sendTalkResponse(
+        harness.env(),
+        endpoint,
+        try message.ReqId.fromSlice(&.{1}),
+        "expired",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), actor.sessions.count());
+
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try std.testing.expectEqual(@as(usize, 1), actor.sessions.count());
+    const active = actor.requests.get(.init(endpoint, req_id)) orelse return error.MissingExpiredSessionRequest;
+    try std.testing.expect(active.phase == .awaiting_whoareyou);
+    const deadline_ns = active.deadline_ns;
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    const initial_probe = harness.recording.datagrams.items[0].bytes;
+
+    actor.maintenanceAt(harness.env(), deadline_ns);
+    try std.testing.expectEqual(@as(usize, 0), actor.sessions.count());
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    try std.testing.expectEqualSlices(u8, initial_probe.slice(), harness.recording.datagrams.items[1].bytes.slice());
+}
+
+test "metrics snapshots preserve session count and recency until maintenance" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x26} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .session_timeout_ms = 10,
+        .ping_interval_ms = 0,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 2,
+            .max_queued_requests = 2,
+            .session_capacity = 2,
+            .event_capacity = 2,
+            .command_capacity = 2,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const first = types.Endpoint{
+        .node_id = [_]u8{0x27} ** 32,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 45 }, .port = 9045 } },
+    };
+    const second = types.Endpoint{
+        .node_id = [_]u8{0x28} ** 32,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 46 }, .port = 9046 } },
+    };
+    const third = types.Endpoint{
+        .node_id = [_]u8{0x29} ** 32,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 47 }, .port = 9047 } },
+    };
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0x2a} ** 16,
+        .recipient_key = [_]u8{0x2b} ** 16,
+    };
+    actor.sessions.put(first, stable, 0);
+    actor.sessions.put(second, stable, std.time.ns_per_ms);
+
+    const inspection: *const actor_mod.Actor = actor;
+    var snapshot = inspection.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.active_session_count);
+    actor.sessions.put(third, stable, 2 * std.time.ns_per_ms);
+    try std.testing.expect(actor.sessions.peekPtr(first, 2 * std.time.ns_per_ms) == null);
+    try std.testing.expect(actor.sessions.peekPtr(second, 2 * std.time.ns_per_ms) != null);
+    try std.testing.expect(actor.sessions.peekPtr(third, 2 * std.time.ns_per_ms) != null);
+
+    snapshot = inspection.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.active_session_count);
+    actor.maintenanceAt(harness.env(), 11 * std.time.ns_per_ms);
+    snapshot = inspection.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.active_session_count);
+    try std.testing.expect(actor.sessions.peekPtr(second, 11 * std.time.ns_per_ms) == null);
+    try std.testing.expect(actor.sessions.peekPtr(third, 11 * std.time.ns_per_ms) != null);
+}
+
 test "authenticated packets reject stale nonce and wrong source address" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;

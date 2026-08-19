@@ -20,6 +20,9 @@ const RetryState = struct {
 };
 
 pub fn run(actor: *Actor, env: Env, now_ns: i64) void {
+    // Stable-session expiry is maintenance-owned. Metrics report the stored
+    // session state left by the most recent completed maintenance pass.
+    actor.sessions.pruneSessions(now_ns);
     actor.sessions.pruneChallenges(now_ns, env.ingress);
     actor.responses.prune(now_ns, env.ingress);
     pruneActive(actor, env, now_ns);

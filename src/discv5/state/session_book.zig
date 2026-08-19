@@ -103,7 +103,7 @@ pub const SessionBook = struct {
     }
 
     pub fn get(self: *SessionBook, endpoint: types.Endpoint, now_ns: i64) ?StableSession {
-        return self.sessions.get(endpoint, now_ns);
+        return self.sessions.getPromote(endpoint, now_ns);
     }
 
     /// Read a live session without changing LRU/TTL recency. Unauthenticated
@@ -129,15 +129,21 @@ pub const SessionBook = struct {
     }
 
     pub fn put(self: *SessionBook, endpoint: types.Endpoint, value: StableSession, now_ns: i64) void {
-        self.sessions.put(endpoint, value, self.session_timeout_ms, now_ns);
+        // Capacity-safe replacement lets authenticated/new admission atomically
+        // reuse expired storage. This is not observational pruning: reads leave
+        // expired sessions in place for proactive maintenance.
+        self.sessions.putReplacingExpired(endpoint, value, self.session_timeout_ms, now_ns);
     }
 
     pub fn remove(self: *SessionBook, endpoint: types.Endpoint) bool {
         return self.sessions.remove(endpoint);
     }
 
-    pub fn count(self: *SessionBook, now_ns: i64) usize {
+    pub fn pruneSessions(self: *SessionBook, now_ns: i64) void {
         self.sessions.pruneExpired(now_ns);
+    }
+
+    pub fn count(self: *const SessionBook) usize {
         return self.sessions.count();
     }
 
@@ -225,6 +231,106 @@ test "session book stores stable keys independently from challenges" {
     try std.testing.expect(book.get(endpoint, 1) != null);
 }
 
+test "expired stable session reads leave stored state for maintenance" {
+    const secp = @import("../secp256k1.zig");
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x11} ** 32));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+        .session_timeout_ms = 10,
+        .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
+    });
+    defer book.deinit(std.testing.allocator, &admission);
+
+    const endpoint = testEndpoint(21);
+    const stable = StableSession{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 };
+    const expired_ns = 10 * std.time.ns_per_ms;
+    book.put(endpoint, stable, 0);
+
+    try std.testing.expect(book.peekPtr(endpoint, 5 * std.time.ns_per_ms) != null);
+    try std.testing.expect(book.get(endpoint, expired_ns) == null);
+    const inspection: *const SessionBook = &book;
+    try std.testing.expectEqual(@as(usize, 1), inspection.count());
+    try std.testing.expect(book.peekPtr(endpoint, expired_ns) == null);
+    try std.testing.expectEqual(@as(usize, 1), inspection.count());
+    const nonce = [_]u8{3} ** packet.NONCE_SIZE;
+    try std.testing.expectEqual(AcceptAuthenticatedResult.missing, book.acceptAuthenticated(endpoint, &nonce, expired_ns));
+    try std.testing.expectEqual(@as(usize, 1), inspection.count());
+
+    book.pruneSessions(expired_ns);
+    try std.testing.expectEqual(@as(usize, 0), inspection.count());
+}
+
+test "put replaces an expired stable session before maintenance" {
+    const secp = @import("../secp256k1.zig");
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x12} ** 32));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 1);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+        .session_timeout_ms = 10,
+        .limits = .{ .session_capacity = 1, .challenge_capacity = 1, .whoareyou_rate_capacity = 1 },
+    });
+    defer book.deinit(std.testing.allocator, &admission);
+
+    const endpoint = testEndpoint(22);
+    const old = StableSession{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 };
+    const replacement = StableSession{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 };
+    const expired_ns = 10 * std.time.ns_per_ms;
+    book.put(endpoint, old, 0);
+    try std.testing.expect(book.get(endpoint, expired_ns) == null);
+    try std.testing.expectEqual(@as(usize, 1), book.count());
+
+    book.put(endpoint, replacement, expired_ns);
+    try std.testing.expectEqual(@as(usize, 1), book.count());
+    const stored = book.get(endpoint, expired_ns) orelse return error.MissingReplacementSession;
+    try std.testing.expectEqual(replacement.initiator_key, stored.initiator_key);
+    try std.testing.expectEqual(replacement.recipient_key, stored.recipient_key);
+    book.pruneSessions(expired_ns);
+    try std.testing.expectEqual(@as(usize, 1), book.count());
+}
+
+test "put reuses a promoted expired stable session before evicting live LRU" {
+    const secp = @import("../secp256k1.zig");
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x14} ** 32));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+        .session_timeout_ms = 10,
+        .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
+    });
+    defer book.deinit(std.testing.allocator, &admission);
+
+    const a = testEndpoint(26);
+    const b = testEndpoint(27);
+    const c = testEndpoint(28);
+    const stable = StableSession{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 };
+    book.put(a, stable, 0);
+    book.put(b, stable, std.time.ns_per_ms);
+
+    try std.testing.expect(book.get(a, 2 * std.time.ns_per_ms) != null);
+    try std.testing.expect(book.get(a, 10 * std.time.ns_per_ms) == null);
+    try std.testing.expect(book.peekPtr(b, 10 * std.time.ns_per_ms) != null);
+    try std.testing.expectEqual(@as(usize, 2), book.count());
+
+    book.put(c, stable, 10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 2), book.count());
+    try std.testing.expect(book.peekPtr(a, 10 * std.time.ns_per_ms) == null);
+    try std.testing.expect(book.peekPtr(b, 10 * std.time.ns_per_ms) != null);
+    try std.testing.expect(book.peekPtr(c, 10 * std.time.ns_per_ms) != null);
+}
+
 test "session book enforces TTL LRU and non-evicting nonce epochs" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
@@ -250,6 +356,9 @@ test "session book enforces TTL LRU and non-evicting nonce epochs" {
     try std.testing.expect(book.get(second, 2) == null);
     try std.testing.expect(book.get(first, 2) != null);
     try std.testing.expect(book.get(first, 10 * std.time.ns_per_ms) == null);
+    try std.testing.expectEqual(@as(usize, 2), book.count());
+    book.pruneSessions(10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 1), book.count());
 
     var seen = SeenNonces{};
     const replay = [_]u8{7} ** packet.NONCE_SIZE;
@@ -297,6 +406,9 @@ test "session book accepts authenticated nonces in place without refreshing reje
     try std.testing.expectEqual(AcceptAuthenticatedResult.replay, book.acceptAuthenticated(first, &accepted, 10 * std.time.ns_per_ms));
     try std.testing.expect(book.peekPtr(first, 15 * std.time.ns_per_ms) == null);
     try std.testing.expectEqual(AcceptAuthenticatedResult.missing, book.acceptAuthenticated(first, &accepted, 15 * std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(usize, 2), book.count());
+    book.pruneSessions(15 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 1), book.count());
 
     var full = stable;
     for (0..SEEN_NONCES_CAP) |i| {
@@ -307,6 +419,53 @@ test "session book accepts authenticated nonces in place without refreshing reje
     const overflow = [_]u8{0xff} ** packet.NONCE_SIZE;
     try std.testing.expectEqual(AcceptAuthenticatedResult.exhausted, book.acceptAuthenticated(first, &overflow, 25 * std.time.ns_per_ms));
     try std.testing.expect(book.peekPtr(first, 30 * std.time.ns_per_ms) == null);
+}
+
+test "replay and exhausted authentication do not promote stable sessions" {
+    const secp = @import("../secp256k1.zig");
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x13} ** 32));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+        .session_timeout_ms = 100,
+        .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
+    });
+    defer book.deinit(std.testing.allocator, &admission);
+
+    const rejected = testEndpoint(23);
+    const other = testEndpoint(24);
+    const replacement = testEndpoint(25);
+    const nonce = [_]u8{5} ** packet.NONCE_SIZE;
+    var replay = StableSession{ .initiator_key = [_]u8{1} ** 16, .recipient_key = [_]u8{2} ** 16 };
+    try std.testing.expect(replay.seen_nonces.insert(&nonce));
+    const stable = StableSession{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 };
+    book.put(rejected, replay, 0);
+    book.put(other, stable, 1);
+    try std.testing.expectEqual(AcceptAuthenticatedResult.replay, book.acceptAuthenticated(rejected, &nonce, 2));
+    book.put(replacement, stable, 3);
+    try std.testing.expect(book.peekPtr(rejected, 4) == null);
+    try std.testing.expect(book.peekPtr(other, 4) != null);
+    try std.testing.expect(book.peekPtr(replacement, 4) != null);
+
+    try std.testing.expect(book.remove(other));
+    try std.testing.expect(book.remove(replacement));
+    var full = stable;
+    for (0..SEEN_NONCES_CAP) |i| {
+        const seen = [_]u8{@intCast(i)} ** packet.NONCE_SIZE;
+        try std.testing.expect(full.seen_nonces.insert(&seen));
+    }
+    book.put(rejected, full, 10);
+    book.put(other, stable, 11);
+    const overflow = [_]u8{0xff} ** packet.NONCE_SIZE;
+    try std.testing.expectEqual(AcceptAuthenticatedResult.exhausted, book.acceptAuthenticated(rejected, &overflow, 12));
+    book.put(replacement, stable, 13);
+    try std.testing.expect(book.peekPtr(rejected, 14) == null);
+    try std.testing.expect(book.peekPtr(other, 14) != null);
+    try std.testing.expect(book.peekPtr(replacement, 14) != null);
 }
 
 test "session challenge cache moves permit ownership through TTL and LRU cleanup" {
@@ -349,6 +508,7 @@ test "WHOAREYOU rate is per source IP and capacity bounded" {
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
         .local_node_id = node_id,
+        .whoareyou_rate_ttl_ms = 10,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });
     defer book.deinit(std.testing.allocator, &admission);
@@ -356,6 +516,7 @@ test "WHOAREYOU rate is per source IP and capacity bounded" {
         try std.testing.expect(book.allowWhoareyou(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = @intCast(9000 + port) } }, 0));
     }
     try std.testing.expect(!book.allowWhoareyou(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 9999 } }, 0));
+    try std.testing.expect(book.allowWhoareyou(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 9999 } }, 10 * std.time.ns_per_ms));
     try std.testing.expect(book.allowWhoareyou(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 9999 } }, std.time.ns_per_s));
     for (2..8) |last| {
         _ = book.allowWhoareyou(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, @intCast(last) }, .port = 9000 } }, 0);
