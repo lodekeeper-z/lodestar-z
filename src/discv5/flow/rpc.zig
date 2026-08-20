@@ -55,22 +55,13 @@ fn handlePong(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.En
     const key = types.RequestKey.init(endpoint, pong.req_id);
     const request = actor.requests.get(key) orelse return;
     if (request.response != .pong) return;
-    var finished = completion.finish(actor, env, key, .{ .success = &.{} }, .{ .pong = .{
+    if (!completion.finish(actor, env, key, .{ .success = &.{} }, .{ .pong = .{
         .enr_seq = pong.enr_seq,
         .recipient_ip = pong.recipient_ip,
         .recipient_port = pong.recipient_port,
-    } }) orelse return;
-    defer finished.deinit(actor.alloc);
+    } })) return;
     actor.observeAddressVote(env, endpoint.addr, recipientAddress(pong.recipient_ip, pong.recipient_port));
     actor.maybeRequestEnrUpdate(env, endpoint, pong.enr_seq);
-    env.outbox.publish(.{ .pong = .{
-        .peer_id = endpoint.node_id,
-        .peer_addr = endpoint.addr,
-        .req_id = pong.req_id,
-        .enr_seq = pong.enr_seq,
-        .recipient_ip = pong.recipient_ip,
-        .recipient_port = pong.recipient_port,
-    } });
 }
 
 fn handleFindNode(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
@@ -132,37 +123,14 @@ fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.E
     var closer: [MAX_NODES_RESPONSE]lookup.Candidate = undefined;
     const closer_len = closerCandidates(actor, accumulator.validated_enrs.slice(), &closer);
     const terminal_nodes = request_results.RawEnrList.fromValidated(accumulator.validated_enrs.slice());
-    var finished = completion.finish(
+    if (!completion.finish(
         actor,
         env,
         key,
         .{ .success = closer[0..closer_len] },
         .{ .nodes = terminal_nodes },
-    ) orelse return;
-    defer finished.deinit(actor.alloc);
-    var event_enrs = finished.takeNodes() orelse unreachable;
-    if (finished.reliable) {
-        std.debug.assert(event_enrs.items.len == 0);
-        const raw_nodes = finished.raw_nodes orelse unreachable;
-        event_enrs.ensureTotalCapacityPrecise(actor.alloc, raw_nodes.slice().len) catch {
-            env.outbox.notePayloadDrop(.response_received);
-            return;
-        };
-        for (raw_nodes.slice()) |*raw| {
-            const copy = actor.alloc.dupe(u8, raw.slice()) catch {
-                env.outbox.notePayloadDrop(.response_received);
-                continue;
-            };
-            event_enrs.appendAssumeCapacity(copy);
-        }
-    }
+    )) return;
     for (discovered[0..discovered_len]) |*validated| actor.publishValidatedDiscovered(env.outbox, validated);
-    env.outbox.publish(.{ .nodes = .{
-        .peer_id = endpoint.node_id,
-        .peer_addr = endpoint.addr,
-        .req_id = nodes.req_id,
-        .enrs = event_enrs,
-    } });
 }
 
 fn retainNodes(
@@ -186,12 +154,6 @@ fn retainNodes(
             discovered_len += 1;
         }
         accumulator.validated_enrs.append(validated);
-        if (active.origin == .reliable_api) continue;
-        const copy = actor.alloc.dupe(u8, validated.raw.slice()) catch {
-            env.outbox.notePayloadDrop(.response_received);
-            continue;
-        };
-        accumulator.enrs.appendAssumeCapacity(copy);
     }
     return discovered_len;
 }
@@ -244,14 +206,13 @@ fn handleTalkResp(actor: *Actor, env: Env, plaintext: []const u8, endpoint: type
     const key = types.RequestKey.init(endpoint, response.req_id);
     const request = actor.requests.get(key) orelse return;
     if (request.response != .talkresp) return;
-    var finished = completion.finish(
+    if (!completion.finish(
         actor,
         env,
         key,
         .{ .success = &.{} },
         .{ .talk_response = types.PacketBytes.init(response.response) catch unreachable },
-    ) orelse return;
-    defer finished.deinit(actor.alloc);
+    )) return;
     const copy = actor.alloc.dupe(u8, response.response) catch {
         env.outbox.notePayloadDrop(.talk_resp_received);
         return;

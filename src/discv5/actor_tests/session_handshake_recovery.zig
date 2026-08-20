@@ -115,10 +115,7 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
 
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
-    var pong_event = outbox_a.pop() orelse return error.MissingRetriedPong;
-    defer pong_event.deinit(alloc);
-    try std.testing.expect(pong_event == .pong);
-    try std.testing.expectEqualSlices(u8, req_id.slice(), pong_event.pong.req_id.slice());
+    try std.testing.expect(outbox_a.pop() == null);
 }
 
 test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained datagram" {
@@ -206,10 +203,7 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
     actor_b.responses.prune(std.math.maxInt(i64), &ingress_b);
     try std.testing.expectEqual(@as(usize, 0), ingress_b.permitCount());
-    var pong_event = outbox_a.pop() orelse return error.MissingRecoveredPong;
-    defer pong_event.deinit(alloc);
-    try std.testing.expect(pong_event == .pong);
-    try std.testing.expectEqualSlices(u8, req_id.slice(), pong_event.pong.req_id.slice());
+    try std.testing.expect(outbox_a.pop() == null);
 }
 
 test "response recovery keeps stable keys until candidate proof then promotes and cleans" {
@@ -273,7 +267,7 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     actor_a.sessions.put(endpoint_b, .{ .initiator_key = a_to_b, .recipient_key = b_to_a }, now_ns);
     actor_b.sessions.put(endpoint_a, .{ .initiator_key = b_to_a, .recipient_key = a_to_b }, now_ns);
 
-    const req_id = try actor_a.sendPing(
+    _ = try actor_a.sendPing(
         .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a },
         endpoint_b,
         &pubkey_b,
@@ -341,10 +335,7 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_b.permitCount());
-    var pong_event = outbox_a.pop() orelse return error.MissingRecoveredResponse;
-    defer pong_event.deinit(alloc);
-    try std.testing.expect(pong_event == .pong);
-    try std.testing.expectEqualSlices(u8, req_id.slice(), pong_event.pong.req_id.slice());
+    try std.testing.expect(outbox_a.pop() == null);
 
     const candidate_keys = actor_a.sessions.get(endpoint_b, outbound.nowNs(io)) orelse return error.MissingCandidatePeerSession;
     const candidate_talkresp = message.TalkResp{
@@ -604,9 +595,7 @@ test "NODES total is exact bounded consistent and controls final permit release"
     );
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    var nodes_event = harness.outbox.pop() orelse return error.MissingNodesEvent;
-    defer nodes_event.deinit(alloc);
-    try std.testing.expect(nodes_event == .nodes);
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
@@ -1243,9 +1232,7 @@ test "old key remains accepted without promotion until candidate response" {
     const promoted = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingPromotedSession;
     try std.testing.expectEqual(pending.keys.initiator_key, promoted.initiator_key);
     try std.testing.expectEqual(pending.keys.recipient_key, promoted.recipient_key);
-    var pong_event = harness.outbox.pop() orelse return error.MissingPongEvent;
-    defer pong_event.deinit(alloc);
-    try std.testing.expect(pong_event == .pong);
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "rekey lane queues stable-key requests and drains FIFO after candidate proof" {

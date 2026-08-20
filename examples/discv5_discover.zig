@@ -368,9 +368,6 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
                     if (options.print_enrs) try stdout.flush();
                 }
             },
-            // Compatibility observation only. Terminal lookup state and payloads
-            // are consumed from the reserved reliable result plane above.
-            .lookup_finished => {},
             else => {},
         }
     }

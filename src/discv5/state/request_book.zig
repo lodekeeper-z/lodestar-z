@@ -82,27 +82,16 @@ pub const FreshRetryTransition = union(enum) {
 };
 
 pub const NodesAccumulator = struct {
-    enrs: std.ArrayListUnmanaged([]u8) = .empty,
     validated_enrs: ValidatedEnrList = .{},
     total_responses: ?u64 = null,
     responses_received: u64 = 0,
     requested_distances: RequestDistances,
 
-    pub fn init(alloc: Allocator, requested_distances: *const RequestDistances) !NodesAccumulator {
-        var result = NodesAccumulator{ .requested_distances = requested_distances.* };
-        errdefer result.deinit(alloc);
-        try result.enrs.ensureTotalCapacityPrecise(alloc, MAX_NODES_RESPONSE);
-        return result;
+    pub fn init(requested_distances: *const RequestDistances) NodesAccumulator {
+        return .{ .requested_distances = requested_distances.* };
     }
 
-    pub fn deinit(self: *NodesAccumulator, alloc: Allocator) void {
-        for (self.enrs.items) |bytes| alloc.free(bytes);
-        self.enrs.deinit(alloc);
-    }
-
-    pub fn resetGeneration(self: *NodesAccumulator, alloc: Allocator) void {
-        for (self.enrs.items) |bytes| alloc.free(bytes);
-        self.enrs.clearRetainingCapacity();
+    pub fn resetGeneration(self: *NodesAccumulator) void {
         self.validated_enrs.clear();
         self.total_responses = null;
         self.responses_received = 0;
@@ -137,13 +126,6 @@ pub const Response = union(enum) {
     nodes: NodesAccumulator,
     talkresp,
 
-    pub fn deinit(self: *Response, alloc: Allocator) void {
-        switch (self.*) {
-            .nodes => |*nodes| nodes.deinit(alloc),
-            .pong, .talkresp => {},
-        }
-    }
-
     pub fn kind(self: Response) types.RequestKind {
         return switch (self) {
             .pong => .ping,
@@ -160,10 +142,6 @@ pub const ActiveRequest = struct {
     admission: AdmissionPermit,
     deadline_ns: i64,
     attempts: u32 = 0,
-
-    pub fn deinit(self: *ActiveRequest, alloc: Allocator) void {
-        self.response.deinit(alloc);
-    }
 };
 
 pub const QueuedRequest = request_queue.QueuedRequest;
@@ -178,9 +156,8 @@ pub const PreparedRequest = struct {
     index_challenge: ?types.ChallengeKey,
     establish: bool,
 
-    pub fn abort(self: *PreparedRequest, alloc: Allocator, admission: *admission_mod.IngressAdmission) void {
+    pub fn abort(self: *PreparedRequest, admission: *admission_mod.IngressAdmission) void {
         self.request.admission.release(admission);
-        self.request.deinit(alloc);
     }
 };
 
@@ -224,7 +201,6 @@ pub const RequestBook = struct {
         var active = self.active.iterator();
         while (active.next()) |entry| {
             entry.value_ptr.admission.release(admission);
-            entry.value_ptr.deinit(self.alloc);
         }
         self.active.deinit();
         var lanes = self.lanes.iterator();
@@ -241,11 +217,11 @@ pub const RequestBook = struct {
         self.challenge_by_nonce.deinit();
     }
 
-    pub fn makeResponse(self: *RequestBook, kind: types.RequestKind, requested_distances: *const RequestDistances) !Response {
+    pub fn makeResponse(_: *RequestBook, kind: types.RequestKind, requested_distances: *const RequestDistances) Response {
         return switch (kind) {
             .ping => .pong,
             .talkreq => .talkresp,
-            .findnode => .{ .nodes = try .init(self.alloc, requested_distances) },
+            .findnode => .{ .nodes = .init(requested_distances) },
         };
     }
 
@@ -259,8 +235,6 @@ pub const RequestBook = struct {
         deadline_ns: i64,
         establish: bool,
     ) !PreparedRequest {
-        var owned_response = response;
-        errdefer owned_response.deinit(self.alloc);
         if (self.active.contains(key)) return error.DuplicateRequest;
         if (self.active.count() >= self.limits.max_active_requests) return error.TooManyActiveRequests;
         if (establish) {
@@ -273,7 +247,7 @@ pub const RequestBook = struct {
             .key = key,
             .request = .{
                 .origin = origin,
-                .response = owned_response,
+                .response = response,
                 .phase = phase,
                 .admission = permit,
                 .deadline_ns = deadline_ns,
@@ -592,7 +566,7 @@ pub const RequestBook = struct {
         self.challenge_by_nonce.putAssumeCapacityNoClobber(.init(key.endpoint.addr, &nonce), key);
         if (transition == .probe) self.setEstablishing(key);
         switch (active.response) {
-            .nodes => |*nodes| nodes.resetGeneration(self.alloc),
+            .nodes => |*nodes| nodes.resetGeneration(),
             .pong, .talkresp => {},
         }
         active.attempts += 1;

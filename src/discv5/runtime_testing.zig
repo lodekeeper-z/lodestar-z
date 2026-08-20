@@ -44,13 +44,18 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
         }
 
         pub fn enqueueSendPing(runtime: *Runtime, endpoint: types.Endpoint, pubkey: [33]u8, reply: *PingReply) !void {
-            try impl(runtime).enqueueCommand(.{ .send_ping = .{
+            const storage = impl(runtime);
+            if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
+            var reservation_transferred = false;
+            errdefer if (!reservation_transferred) storage.request_result_outbox.cancelUnclaimed();
+            try storage.enqueueCommand(.{ .send_ping = .{
                 .endpoint = endpoint,
                 .pubkey = pubkey,
                 .enr_seq = 0,
-                .origin = .api,
+                .origin = .reliable_api,
                 .reply = reply,
             } });
+            reservation_transferred = true;
         }
 
         pub fn putMaintenance(runtime: *Runtime) !void {

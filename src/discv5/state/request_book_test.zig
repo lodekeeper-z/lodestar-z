@@ -128,7 +128,6 @@ test "RequestBook conserves challenge lane active and admission indexes" {
     try std.testing.expect(book.pendingKeys(key.endpoint) == null);
     var removed = book.take(key) orelse return error.MissingActiveRequest;
     removed.admission.release(&ingress);
-    removed.deinit(std.testing.allocator);
     book.assertInvariants();
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
 }
@@ -161,7 +160,6 @@ test "WHOAREYOU phase changes preserve the cumulative retry bound" {
 
     var removed = book.take(key) orelse return error.MissingActiveRequest;
     removed.admission.release(&ingress);
-    removed.deinit(std.testing.allocator);
 }
 
 test "RequestBook keeps every request queued xor active in FIFO order" {
@@ -187,7 +185,6 @@ test "RequestBook keeps every request queued xor active in FIFO order" {
     try std.testing.expect(book.firstQueued(peer) == null);
     var removed = book.take(.init(peer, first)).?;
     removed.admission.release(&ingress);
-    removed.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, second.slice(), book.firstQueued(peer).?.req_id.slice());
 }
 
@@ -327,7 +324,7 @@ fn allocationLifecycle(alloc: std.mem.Allocator) !void {
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(3), try message.ReqId.fromSlice(&.{1}));
     const requested = requestedDistances(&.{1});
-    const prepared = try book.prepareActive(&ingress, key, .api, try book.makeResponse(.findnode, &requested), .{
+    const prepared = try book.prepareActive(&ingress, key, .api, book.makeResponse(.findnode, &requested), .{
         .awaiting_whoareyou = try probe(9),
     }, 0, true);
     book.commitPrepared(prepared);
@@ -338,7 +335,6 @@ fn allocationLifecycle(alloc: std.mem.Allocator) !void {
     }, 1);
     var removed = book.take(key).?;
     removed.admission.release(&ingress);
-    removed.deinit(alloc);
 }
 
 test "RequestBook preparation and admission unwind every allocator failure" {
@@ -361,49 +357,14 @@ test "RequestBook queue initialization unwinds every allocator failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, queueAllocationLifecycle, .{});
 }
 
-fn firstNodesAllocationLifecycle(alloc: std.mem.Allocator) !void {
-    const requested = requestedDistances(&.{1});
-    var response = book_mod.Response{ .nodes = try .init(alloc, &requested) };
-    defer response.deinit(alloc);
-    const copy = try alloc.dupe(u8, "enr");
-    response.nodes.enrs.appendAssumeCapacity(copy);
-}
-
-test "first NODES storage allocation has complete failure cleanup" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, firstNodesAllocationLifecycle, .{});
-}
-
-test "NODES accumulator reserves the canonical response bound" {
-    const requested = requestedDistances(&.{1});
-    var accumulator = try book_mod.NodesAccumulator.init(std.testing.allocator, &requested);
-    defer accumulator.deinit(std.testing.allocator);
-    try std.testing.expectEqual(book_mod.MAX_NODES_RESPONSE, accumulator.enrs.capacity);
-}
-
-test "final NODES completion moves list ownership without allocation" {
-    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
-    defer ingress.deinit();
+test "NODES response retains canonical requested distances without allocation" {
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
-    defer book.deinit(&ingress);
-    const key = types.RequestKey.init(endpoint(5), try message.ReqId.fromSlice(&.{1}));
+    defer book.deinitEmpty();
     const requested = requestedDistances(&.{ 0, 256, 256 });
-    var response = try book.makeResponse(.findnode, &requested);
+    const response = book.makeResponse(.findnode, &requested);
     try std.testing.expect(response.nodes.requested_distances.contains(0));
     try std.testing.expect(response.nodes.requested_distances.contains(256));
     try std.testing.expect(!response.nodes.requested_distances.contains(1));
-    response.nodes.enrs.appendAssumeCapacity(try std.testing.allocator.dupe(u8, "enr"));
-    const prepared = try book.prepareActive(&ingress, key, .api, response, .{
-        .awaiting_whoareyou = try probe(10),
-    }, 10, true);
-    book.commitPrepared(prepared);
-    var removed = book.take(key).?;
-    var moved = removed.response.nodes.enrs;
-    removed.response.nodes.enrs = .empty;
-    removed.admission.release(&ingress);
-    removed.deinit(std.testing.allocator);
-    defer moved.deinit(std.testing.allocator);
-    defer for (moved.items) |bytes| std.testing.allocator.free(bytes);
-    try std.testing.expectEqualStrings("enr", moved.items[0]);
 }
 
 test "challenge preparation and commit remain allocation-free" {
@@ -468,7 +429,6 @@ test "timed-out active scan visits maximum-capacity table once across bounded ba
         for (keys[0..count]) |key| {
             var active = book.take(key) orelse return error.MissingActiveRequest;
             active.admission.release(&ingress);
-            active.deinit(std.testing.allocator);
             expired += 1;
         }
     }

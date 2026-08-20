@@ -313,9 +313,7 @@ pub const Actor = struct {
 
     pub fn cancelRequest(self: *Actor, env: Env, key: types.RequestKey) bool {
         if (self.requests.get(key) != null) {
-            var finished = completion.finish(self, env, key, .canceled, .canceled) orelse return false;
-            defer finished.deinit(self.alloc);
-            return true;
+            return completion.finish(self, env, key, .canceled, .canceled);
         }
         const queued = self.requests.takeQueued(key) orelse return false;
         self.publishRequestTerminal(env, key, queued.kind, queued.origin, .canceled);
@@ -401,7 +399,6 @@ pub const Actor = struct {
             var active = self.requests.take(snapshot.key) orelse unreachable;
             self.publishRequestTerminal(env, snapshot.key, snapshot.kind, active.origin, .runtime_stopped);
             active.admission.release(env.ingress);
-            active.deinit(self.alloc);
         }
         std.debug.assert(self.requests.firstReliableActive() == null);
 
@@ -650,25 +647,6 @@ pub const Actor = struct {
             const result_outbox = env.lookup_results orelse unreachable;
             result_outbox.publishAssumeReserved(terminal);
         }
-
-        var event_enrs: std.ArrayListUnmanaged([]u8) = .empty;
-        event_enrs.ensureTotalCapacityPrecise(self.alloc, self.lookup_config.num_results) catch {
-            env.outbox.notePayloadDrop(.lookup_finished);
-            return;
-        };
-        for (terminal.enrs.slice()) |*raw| {
-            const copy = self.alloc.dupe(u8, raw.slice()) catch {
-                env.outbox.notePayloadDrop(.lookup_finished);
-                continue;
-            };
-            event_enrs.appendAssumeCapacity(copy);
-        }
-        env.outbox.publish(.{ .lookup_finished = .{
-            .lookup_id = id,
-            .target = terminal.target,
-            .enrs = event_enrs,
-            .timed_out = reason == .timed_out,
-        } });
     }
 
     pub fn finishAllLookups(self: *Actor, env: Env, reason: lookup_results.LookupTerminalReason) void {
@@ -836,10 +814,7 @@ test "discv5 actor: lookup pump exhausts bounded synchronous candidate failures"
     actor.pumpLookup(env, 1);
 
     try std.testing.expect(!actor.lookups.contains(1));
-    var event = outbox.pop() orelse return error.MissingLookupCompletion;
-    defer event.deinit(alloc);
-    try std.testing.expect(event == .lookup_finished);
-    try std.testing.expectEqual(@as(u32, 1), event.lookup_finished.lookup_id);
+    try std.testing.expect(outbox.pop() == null);
 }
 
 test "discv5 actor: lookup local backpressure defers until bounded maintenance repump" {
@@ -970,8 +945,5 @@ test "discv5 actor: lookup transport send failure remains terminal" {
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 0), recording.datagrams.items.len);
-    var event = outbox.pop() orelse return error.MissingLookupCompletion;
-    defer event.deinit(alloc);
-    try std.testing.expect(event == .lookup_finished);
-    try std.testing.expectEqual(@as(u32, 1), event.lookup_finished.lookup_id);
+    try std.testing.expect(outbox.pop() == null);
 }

@@ -140,9 +140,7 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
 }
 
 fn timeout(actor: *Actor, env: Env, key: types.RequestKey) void {
-    var finished = completion.finish(actor, env, key, .failure, .timeout) orelse return;
-    defer finished.deinit(actor.alloc);
-    env.outbox.publish(.{ .request_timeout = .{ .peer_id = key.endpoint.node_id, .req_id = key.req_id, .kind = finished.kind } });
+    _ = completion.finish(actor, env, key, .failure, .timeout);
 }
 
 fn pruneQueued(actor: *Actor, env: Env, now_ns: i64) void {
@@ -154,7 +152,6 @@ fn pruneQueued(actor: *Actor, env: Env, now_ns: i64) void {
             const queued = actor.requests.takeQueued(key) orelse unreachable;
             actor.publishRequestTerminal(env, key, queued.kind, queued.origin, .timeout);
             actor.onRequestCompletion(env, key, queued.origin, false, &.{});
-            env.outbox.publish(.{ .request_timeout = .{ .peer_id = key.endpoint.node_id, .req_id = key.req_id, .kind = queued.kind } });
         }
     }
 }

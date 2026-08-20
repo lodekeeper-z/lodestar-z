@@ -7,27 +7,6 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-pub const PongEvent = struct {
-    peer_id: types.NodeId,
-    peer_addr: types.Address,
-    req_id: message.ReqId,
-    enr_seq: u64,
-    recipient_ip: message.Pong.RecipientIp,
-    recipient_port: u16,
-};
-
-pub const NodesEvent = struct {
-    peer_id: types.NodeId,
-    peer_addr: types.Address,
-    req_id: message.ReqId,
-    enrs: std.ArrayListUnmanaged([]u8),
-
-    pub fn deinit(self: *NodesEvent, alloc: Allocator) void {
-        for (self.enrs.items) |bytes| alloc.free(bytes);
-        self.enrs.deinit(alloc);
-    }
-};
-
 pub const TalkReqEvent = struct {
     peer_id: types.NodeId,
     peer_addr: types.Address,
@@ -52,24 +31,6 @@ pub const TalkRespEvent = struct {
     }
 };
 
-pub const RequestTimeoutEvent = struct {
-    peer_id: types.NodeId,
-    req_id: message.ReqId,
-    kind: types.RequestKind,
-};
-
-pub const LookupFinishedEvent = struct {
-    lookup_id: u32,
-    target: types.NodeId,
-    enrs: std.ArrayListUnmanaged([]u8),
-    timed_out: bool,
-
-    pub fn deinit(self: *LookupFinishedEvent, alloc: Allocator) void {
-        for (self.enrs.items) |bytes| alloc.free(bytes);
-        self.enrs.deinit(alloc);
-    }
-};
-
 pub const EnrAddedEvent = struct {
     node_id: types.NodeId,
     addr: types.Address,
@@ -90,9 +51,6 @@ pub const EventKind = enum {
     talk_req_received,
     talk_resp_received,
     session_established,
-    request_failed,
-    response_received,
-    lookup_finished,
     peer_disconnected,
 
     pub fn index(self: EventKind) usize {
@@ -103,10 +61,7 @@ pub const EventKind = enum {
             .talk_req_received => 3,
             .talk_resp_received => 4,
             .session_established => 5,
-            .request_failed => 6,
-            .response_received => 7,
-            .lookup_finished => 8,
-            .peer_disconnected => 9,
+            .peer_disconnected => 6,
         };
     }
 
@@ -119,9 +74,6 @@ pub const EventKind = enum {
             .talk_req_received => "talkReqReceived",
             .talk_resp_received => "talkRespReceived",
             .session_established => "established",
-            .request_failed => "requestFailed",
-            .response_received => "response",
-            .lookup_finished => "lookupFinished",
             .peer_disconnected => "disconnected",
         };
     }
@@ -129,15 +81,13 @@ pub const EventKind = enum {
 
 pub const event_kind_count = @typeInfo(EventKind).@"enum".fields.len;
 
+/// Best-effort observations only. Initiated request and lookup terminal outcomes
+/// are delivered through the reserved RequestResult and LookupResult outboxes.
 pub const Event = union(enum) {
-    pong: PongEvent,
-    nodes: NodesEvent,
     talkreq: TalkReqEvent,
     talkresp: TalkRespEvent,
-    request_timeout: RequestTimeoutEvent,
     discovered_enr: struct { raw: enr.RawEnr, enr: enr.Enr },
     enr_added: EnrAddedEvent,
-    lookup_finished: LookupFinishedEvent,
     local_enr_updated: struct { seq: u64, enr: []u8 },
     peer_connected: struct { peer_id: types.NodeId, peer_addr: types.Address },
     peer_disconnected: struct { peer_id: types.NodeId, peer_addr: types.Address },
@@ -150,9 +100,6 @@ pub const Event = union(enum) {
             .talkreq => .talk_req_received,
             .talkresp => .talk_resp_received,
             .peer_connected => .session_established,
-            .request_timeout => .request_failed,
-            .pong, .nodes => .response_received,
-            .lookup_finished => .lookup_finished,
             .peer_disconnected => .peer_disconnected,
         };
     }
@@ -164,12 +111,10 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: *Event, alloc: Allocator) void {
         switch (self.*) {
-            .pong, .request_timeout, .discovered_enr, .peer_connected, .peer_disconnected => {},
-            .nodes => |*value| value.deinit(alloc),
+            .discovered_enr, .peer_connected, .peer_disconnected => {},
             .talkreq => |*value| value.deinit(alloc),
             .talkresp => |*value| value.deinit(alloc),
             .enr_added => |*value| value.deinit(alloc),
-            .lookup_finished => |*value| value.deinit(alloc),
             .local_enr_updated => |value| alloc.free(value.enr),
         }
     }
@@ -272,7 +217,6 @@ test "event outbox drops and deinitializes owned payloads when full" {
     } });
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedEventCount(.multiaddr_updated));
-    try std.testing.expectEqual(@as(u64, 0), outbox.droppedEventCount(.lookup_finished));
     const counts = outbox.droppedEventCounts();
     try std.testing.expectEqual(@as(u64, 1), counts[EventKind.multiaddr_updated.index()]);
 }
@@ -289,7 +233,6 @@ test "payload drops are classified by intended event kind" {
     try std.testing.expectEqual(@as(u64, 3), outbox.droppedCount());
     try std.testing.expectEqual(@as(u64, 2), outbox.droppedEventCount(.talk_req_received));
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedEventCount(.enr_added));
-    try std.testing.expectEqual(@as(u64, 0), outbox.droppedEventCount(.response_received));
 }
 
 test "every event maps to a stable kind and TS-aligned event name" {
@@ -305,16 +248,6 @@ test "every event maps to a stable kind and TS-aligned event name" {
     };
     const expectations = [_]Expectation{
         .{
-            .event = .{ .pong = .{ .peer_id = peer_id, .peer_addr = addr, .req_id = req_id, .enr_seq = 0, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 } },
-            .kind = .response_received,
-            .name = "response",
-        },
-        .{
-            .event = .{ .nodes = .{ .peer_id = peer_id, .peer_addr = addr, .req_id = req_id, .enrs = .empty } },
-            .kind = .response_received,
-            .name = "response",
-        },
-        .{
             .event = .{ .talkreq = .{ .peer_id = peer_id, .peer_addr = addr, .req_id = req_id, .protocol = empty, .request = empty } },
             .kind = .talk_req_received,
             .name = "talkReqReceived",
@@ -325,11 +258,6 @@ test "every event maps to a stable kind and TS-aligned event name" {
             .name = "talkRespReceived",
         },
         .{
-            .event = .{ .request_timeout = .{ .peer_id = peer_id, .req_id = req_id, .kind = .ping } },
-            .kind = .request_failed,
-            .name = "requestFailed",
-        },
-        .{
             .event = .{ .discovered_enr = .{ .raw = .{}, .enr = undefined } },
             .kind = .discovered,
             .name = "discovered",
@@ -338,11 +266,6 @@ test "every event maps to a stable kind and TS-aligned event name" {
             .event = .{ .enr_added = .{ .node_id = peer_id, .addr = addr, .enr = empty, .replaced_enr = null } },
             .kind = .enr_added,
             .name = "enrAdded",
-        },
-        .{
-            .event = .{ .lookup_finished = .{ .lookup_id = 1, .target = peer_id, .enrs = .empty, .timed_out = false } },
-            .kind = .lookup_finished,
-            .name = "lookupFinished",
         },
         .{
             .event = .{ .local_enr_updated = .{ .seq = 1, .enr = empty } },

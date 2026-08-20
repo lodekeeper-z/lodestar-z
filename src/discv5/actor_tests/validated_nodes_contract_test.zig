@@ -131,12 +131,6 @@ test "validated NODES boundary rejects invalid signatures and preserves reliable
     var discovered_b = harness.outbox.pop() orelse return error.MissingDiscoveredEvent;
     defer discovered_b.deinit(alloc);
     try expectDiscovered(&discovered_b, returned_b);
-    var nodes_event = harness.outbox.pop() orelse return error.MissingNodesEvent;
-    defer nodes_event.deinit(alloc);
-    try std.testing.expect(nodes_event == .nodes);
-    try std.testing.expectEqual(@as(usize, 2), nodes_event.nodes.enrs.items.len);
-    try std.testing.expectEqualSlices(u8, returned_a.raw, nodes_event.nodes.enrs.items[0]);
-    try std.testing.expectEqualSlices(u8, returned_b.raw, nodes_event.nodes.enrs.items[1]);
     try std.testing.expect(harness.outbox.pop() == null);
 }
 
@@ -401,11 +395,7 @@ test "discv5 lookup-local successful result retains raw ENR without PeerBook" {
     const result = results.pop() orelse return error.MissingLookupResult;
     try std.testing.expectEqual(@as(usize, 1), result.enrs.slice().len);
     try std.testing.expectEqualSlices(u8, returned.raw, result.enrs.slice()[0].slice());
-    var event = harness.outbox.pop() orelse return error.MissingLookupEvent;
-    defer event.deinit(alloc);
-    try std.testing.expect(event == .lookup_finished);
-    try std.testing.expectEqual(@as(usize, 1), event.lookup_finished.enrs.items.len);
-    try std.testing.expectEqualSlices(u8, returned.raw, event.lookup_finished.enrs.items[0]);
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "discv5 lookup-local duplicate enrichment does not downgrade newer metadata" {

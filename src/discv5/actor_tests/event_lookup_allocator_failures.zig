@@ -94,7 +94,6 @@ test "event payload allocation failure preserves Actor state and counts one drop
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedCount());
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedEventCount(.enr_added));
-    try std.testing.expectEqual(@as(u64, 0), outbox.droppedEventCount(.response_received));
     const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
     try std.testing.expect(actor.peers.findEnr(&remote_id) != null);
     try std.testing.expect(outbox.pop() == null);
@@ -184,7 +183,7 @@ test "full event outbox preserves completion and queued drain with one owned dro
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
 }
 
-test "full event outbox preserves lookup finalization with one owned drop" {
+test "lookup finalization is independent of a full best-effort event outbox" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x68} ** 32));
@@ -215,10 +214,10 @@ test "full event outbox preserves lookup finalization with one owned drop" {
 
     actor.finishLookup(harness.env(), 1, .completed);
     try std.testing.expectEqual(@as(usize, 0), actor.lookups.count());
-    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
 }
 
-test "maintenance times out every expired lookup once and retains live lookups" {
+test "maintenance removes every expired lookup and retains live lookups" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x7c} ** 32));
@@ -247,28 +246,14 @@ test "maintenance times out every expired lookup once and retains live lookups" 
 
     actor.maintenanceAt(harness.env(), now_ns);
 
-    var timed_out = [_]bool{false} ** 10;
-    var event_count: usize = 0;
-    while (harness.outbox.pop()) |event_value| {
-        var event = event_value;
-        defer event.deinit(alloc);
-        try std.testing.expect(event == .lookup_finished);
-        try std.testing.expect(event.lookup_finished.timed_out);
-        const lookup_id = event.lookup_finished.lookup_id;
-        try std.testing.expect(lookup_id <= 6);
-        try std.testing.expect(!timed_out[lookup_id]);
-        timed_out[lookup_id] = true;
-        event_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 6), event_count);
     for (1..7) |lookup_id| {
-        try std.testing.expect(timed_out[lookup_id]);
         try std.testing.expect(!actor.lookups.contains(@intCast(lookup_id)));
     }
     for (7..10) |lookup_id| try std.testing.expect(actor.lookups.contains(@intCast(lookup_id)));
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
-test "full event outbox preserves matching health completion with one drop" {
+test "health PONG completion is independent of a full best-effort event outbox" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x6a} ** 32));
@@ -307,7 +292,7 @@ test "full event outbox preserves matching health completion with one drop" {
     var pong_buffer: [128]u8 = undefined;
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try pong.encodeInto(&pong_buffer), 12);
 
-    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
     try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
@@ -364,7 +349,7 @@ test "LocalRecord replacement is atomic across allocator failure" {
     try std.testing.expect(updated == .local_enr_updated);
 }
 
-test "lookup finish allocation failure still removes and detaches lookup" {
+test "lookup finish removes and detaches without allocating an event payload" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
     const io = std.Options.debug_io;
@@ -398,14 +383,14 @@ test "lookup finish allocation failure still removes and detaches lookup" {
     failing.fail_index = failing.alloc_index;
 
     actor.finishLookup(harness.env(), 1, .timed_out);
-    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), actor.lookups.count());
-    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
+    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
     try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(.init(endpoint, req_id)).?.origin);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 }
 
-test "lookup terminal payload survives compatibility event allocation failure" {
+test "reliable lookup terminal payload needs no compatibility event allocation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
     const io = std.Options.debug_io;
@@ -450,8 +435,8 @@ test "lookup terminal payload survives compatibility event allocation failure" {
 
     harness.actor.finishLookup(env, 1, .completed);
 
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
     try std.testing.expect(harness.outbox.pop() == null);
     const result = result_outbox.pop() orelse return error.MissingLookupResult;
     try std.testing.expectEqual(@as(u32, 1), result.lookup_id);
@@ -497,9 +482,7 @@ test "detached late multipart NODES still learns emits and releases final permit
     actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
     const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{distance}, .{ .lookup = lookup_id });
     actor.finishLookup(harness.env(), lookup_id, .completed);
-    var lookup_event = harness.outbox.pop() orelse return error.MissingLookupFinished;
-    defer lookup_event.deinit(alloc);
-    try std.testing.expect(lookup_event == .lookup_finished);
+    try std.testing.expect(harness.outbox.pop() == null);
     try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(.init(endpoint, req_id)).?.origin);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
@@ -518,14 +501,10 @@ test "detached late multipart NODES still learns emits and releases final permit
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 14);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    var nodes_event = harness.outbox.pop() orelse return error.MissingNodesEvent;
-    defer nodes_event.deinit(alloc);
-    try std.testing.expect(nodes_event == .nodes);
-    try std.testing.expectEqual(@as(usize, 1), nodes_event.nodes.enrs.items.len);
-    try std.testing.expectEqualSlices(u8, discovered_enr, nodes_event.nodes.enrs.items[0]);
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
-test "Actor RPC NODES allocation failures preserve first and final ownership transitions" {
+test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x82} ** 32));
@@ -578,7 +557,7 @@ test "Actor RPC NODES allocation failures preserve first and final ownership tra
     actor.alloc = fail_first.allocator();
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try first_chunk.encodeInto(&first_chunk_buffer), 15);
     actor.alloc = alloc;
-    try std.testing.expect(fail_first.has_induced_failure);
+    try std.testing.expect(!fail_first.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
     var first_discovered = outbox.pop() orelse return error.MissingFirstDiscovered;
@@ -589,10 +568,7 @@ test "Actor RPC NODES allocation failures preserve first and final ownership tra
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try first_final.encodeInto(&first_final_buffer), 16);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
-    var empty_nodes = outbox.pop() orelse return error.MissingEmptyNodes;
-    defer empty_nodes.deinit(alloc);
-    try std.testing.expect(empty_nodes == .nodes);
-    try std.testing.expectEqual(@as(usize, 0), empty_nodes.nodes.enrs.items.len);
+    try std.testing.expect(outbox.pop() == null);
 
     const final_req = try actor.sendFindNode(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
     var successful_first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
@@ -607,17 +583,13 @@ test "Actor RPC NODES allocation failures preserve first and final ownership tra
     actor.alloc = fail_final.allocator();
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try final_chunk.encodeInto(&final_chunk_buffer), 18);
     actor.alloc = alloc;
-    try std.testing.expect(fail_final.has_induced_failure);
+    try std.testing.expect(!fail_final.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
     var final_discovered = outbox.pop() orelse return error.MissingFinalDiscovered;
     defer final_discovered.deinit(alloc);
     try std.testing.expect(final_discovered == .discovered_enr);
-    var moved_nodes = outbox.pop() orelse return error.MissingMovedNodes;
-    defer moved_nodes.deinit(alloc);
-    try std.testing.expect(moved_nodes == .nodes);
-    try std.testing.expectEqual(@as(usize, 1), moved_nodes.nodes.enrs.items.len);
-    try std.testing.expectEqualSlices(u8, raw_a, moved_nodes.nodes.enrs.items[0]);
+    try std.testing.expect(outbox.pop() == null);
 }
 
 fn actorInitializationLifecycle(alloc: std.mem.Allocator) !void {

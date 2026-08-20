@@ -604,11 +604,11 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
     var saw_first = false;
     var saw_second = false;
     for (0..2) |_| {
-        var timeout_event = runtime.popEvent() orelse return error.MissingTimeoutEvent;
-        defer timeout_event.deinit(alloc);
-        try std.testing.expect(timeout_event == .request_timeout);
-        if (std.mem.eql(u8, &first_id, &timeout_event.request_timeout.peer_id)) saw_first = true;
-        if (std.mem.eql(u8, &second_id, &timeout_event.request_timeout.peer_id)) saw_second = true;
+        const result = runtime.popRequestResult() orelse return error.MissingTimeoutResult;
+        try std.testing.expect(result.terminal == .timeout);
+        try std.testing.expectEqual(types.RequestKind.ping, result.kind);
+        if (std.mem.eql(u8, &first_id, &result.key.endpoint.node_id)) saw_first = true;
+        if (std.mem.eql(u8, &second_id, &result.key.endpoint.node_id)) saw_second = true;
     }
     try std.testing.expect(saw_first);
     try std.testing.expect(saw_second);
@@ -705,10 +705,9 @@ test "failed maintenance enqueue rolls back pending state for retry" {
     } else return error.MaintenanceDidNotRun;
     const barrier_result = try barrier_reply.getOneUncancelable(io);
     try std.testing.expect(!(try barrier_result));
-    var timeout_event = runtime.popEvent() orelse return error.MissingTimeoutEvent;
-    defer timeout_event.deinit(alloc);
-    try std.testing.expect(timeout_event == .request_timeout);
-    try std.testing.expectEqualSlices(u8, &remote_id, &timeout_event.request_timeout.peer_id);
+    const timeout_result = runtime.popRequestResult() orelse return error.MissingTimeoutResult;
+    try std.testing.expect(timeout_result.terminal == .timeout);
+    try std.testing.expectEqualSlices(u8, &remote_id, &timeout_result.key.endpoint.node_id);
 
     runtime.stop();
     try loop_group.await(io);
@@ -762,8 +761,7 @@ test "reliable lookup results survive a full event outbox and release capacity o
     const snapshot = try runtime.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), snapshot.lookup_count);
     try std.testing.expectEqual(@as(usize, 0), snapshot.active_lookup_count);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.dropped_event_count);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.droppedEventCount(.lookup_finished));
+    try std.testing.expectEqual(@as(u64, 0), snapshot.dropped_event_count);
     var classified_total: u64 = 0;
     for (snapshot.dropped_event_count_by_kind) |count| classified_total += count;
     try std.testing.expectEqual(snapshot.dropped_event_count, classified_total);
@@ -1604,7 +1602,8 @@ test "full EventOutbox cannot lose reliable pong nodes or talk response payloads
     try std.testing.expect(blocker == .local_enr_updated);
     try std.testing.expect(runtime_a.popEvent() == null);
     const snapshot = try runtime_a.metricsSnapshot();
-    try std.testing.expect(snapshot.dropped_event_count >= 3);
+    try std.testing.expect(snapshot.dropped_event_count >= 1);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.droppedEventCount(.talk_resp_received));
     const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime_a);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
@@ -1657,17 +1656,10 @@ test "two live Runtime sockets complete strict handshake and PING lifecycle" {
     try std.testing.expect(try runtime_a.addNode(id_b, &pubkey_b, address_b, null));
     try std.testing.expect(try runtime_b.addNode(id_a, &pubkey_a, address_a, null));
     const req_id = try runtime_a.sendPing(id_b, &pubkey_b, address_b, 0);
-    var observed_pong = false;
-    for (0..2_000) |_| {
-        while (runtime_a.popEvent()) |value| {
-            var event = value;
-            defer event.deinit(alloc);
-            if (event == .pong and std.mem.eql(u8, event.pong.req_id.slice(), req_id.slice())) observed_pong = true;
-        }
-        if (observed_pong) break;
-        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(observed_pong);
+    const pong_result = try awaitRequestResult(io, runtime_a);
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, pong_result.key, .init(.{ .node_id = id_b, .addr = address_b }, req_id)));
+    try std.testing.expectEqual(types.RequestKind.ping, pong_result.kind);
+    try std.testing.expect(pong_result.terminal == .pong);
 
     running_a.stop();
     running_b.stop();

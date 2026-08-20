@@ -609,12 +609,6 @@ test "queued request expires exactly at its actor maintenance deadline" {
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
-    var timeout_event = harness.outbox.pop() orelse return error.MissingQueuedTimeoutEvent;
-    defer timeout_event.deinit(alloc);
-    try std.testing.expect(timeout_event == .request_timeout);
-    try std.testing.expectEqualSlices(u8, &endpoint.node_id, &timeout_event.request_timeout.peer_id);
-    try std.testing.expectEqualSlices(u8, queued_req_id.slice(), timeout_event.request_timeout.req_id.slice());
-    try std.testing.expectEqual(types.RequestKind.ping, timeout_event.request_timeout.kind);
     try std.testing.expect(harness.outbox.pop() == null);
 }
 
@@ -657,9 +651,7 @@ test "AdmissionPermit survives retry and releases on final timeout" {
     actor.maintenanceAt(harness.env(), retry_deadline_ns);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    var timeout_event = harness.outbox.pop() orelse return error.MissingTimeoutEvent;
-    defer timeout_event.deinit(alloc);
-    try std.testing.expect(timeout_event == .request_timeout);
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
@@ -730,21 +722,21 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     const partial = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
     try std.testing.expectEqual(@as(u64, 2), partial.total_responses.?);
     try std.testing.expectEqual(@as(u64, 1), partial.responses_received);
-    try std.testing.expectEqual(@as(usize, 1), partial.enrs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), partial.validated_enrs.slice().len);
 
     const deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
     actor.maintenanceAt(harness.env(), deadline_ns);
     const fresh = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
     try std.testing.expect(fresh.total_responses == null);
     try std.testing.expectEqual(@as(u64, 0), fresh.responses_received);
-    try std.testing.expectEqual(@as(usize, 0), fresh.enrs.items.len);
-    try std.testing.expectEqual(@as(usize, request_book.MAX_NODES_RESPONSE), fresh.enrs.capacity);
+    try std.testing.expectEqual(@as(usize, 0), fresh.validated_enrs.slice().len);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, first_plaintext, 0x22);
     const repeated = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
     try std.testing.expectEqual(@as(u64, 1), repeated.responses_received);
-    try std.testing.expectEqual(@as(usize, 1), repeated.enrs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), repeated.validated_enrs.slice().len);
+    try std.testing.expectEqual(id_a, repeated.validated_enrs.slice()[0].node_id);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
@@ -753,15 +745,15 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 0x23);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    var saw_nodes = false;
+    var discovered_count: usize = 0;
     var processed: usize = 0;
     while (processed < cfg.limits.event_capacity) : (processed += 1) {
         var event = harness.outbox.pop() orelse break;
-        if (event == .nodes) {
-            try std.testing.expectEqual(@as(usize, 2), event.nodes.enrs.items.len);
-            saw_nodes = true;
-        }
+        try std.testing.expect(event == .discovered_enr);
+        discovered_count += 1;
         event.deinit(alloc);
     }
-    try std.testing.expect(saw_nodes);
+    try std.testing.expectEqual(@as(usize, 3), discovered_count);
+    try std.testing.expect(actor.peers.findEnr(&id_a) != null);
+    try std.testing.expect(actor.peers.findEnr(&id_b) != null);
 }

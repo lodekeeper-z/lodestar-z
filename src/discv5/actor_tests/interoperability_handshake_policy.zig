@@ -144,10 +144,8 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();
 
-    var pong_event = outbox_a.pop() orelse return error.MissingPongEvent;
-    defer pong_event.deinit(alloc);
-    try std.testing.expect(pong_event == .pong);
-    try std.testing.expectEqualSlices(u8, ping_id.slice(), pong_event.pong.req_id.slice());
+    try std.testing.expect(outbox_a.pop() == null);
+    try std.testing.expect(actor_a.requests.get(.init(.{ .node_id = id_b, .addr = address_b }, ping_id)) == null);
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
     try std.testing.expect(actor_a.sessions.get(.{ .node_id = id_b, .addr = address_b }, now_ns) != null);
@@ -204,11 +202,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer discovered_event.deinit(alloc);
     try std.testing.expect(discovered_event == .discovered_enr);
     try std.testing.expectEqualSlices(u8, enr_d, discovered_event.discovered_enr.raw.slice());
-    var nodes_event = outbox_a.pop() orelse return error.MissingNodesEvent;
-    defer nodes_event.deinit(alloc);
-    try std.testing.expect(nodes_event == .nodes);
-    try std.testing.expectEqual(@as(usize, 1), nodes_event.nodes.enrs.items.len);
-    try std.testing.expectEqualSlices(u8, enr_d, nodes_event.nodes.enrs.items[0]);
+    try std.testing.expect(outbox_a.pop() == null);
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
 }

@@ -83,7 +83,7 @@ fn dispatch(
         .{ .awaiting_whoareyou = .{ .retry_packet = try .init(encoded.bytes), .recovery = recovery } }
     else
         .{ .awaiting_response = .{ .recovery = recovery, .wait = .session_request } };
-    const response = try actor.requests.makeResponse(kind, requested_distances);
+    const response = actor.requests.makeResponse(kind, requested_distances);
     var prepared = try actor.requests.prepareActive(
         env.ingress,
         .init(endpoint, req_id),
@@ -93,7 +93,7 @@ fn dispatch(
         deadlineNs(now_ns, actor.request_timeout_ms),
         stable == null,
     );
-    errdefer prepared.abort(actor.alloc, env.ingress);
+    errdefer prepared.abort(env.ingress);
 
     try env.sender.send(endpoint.addr, encoded.bytes);
     if (from_queue) {
