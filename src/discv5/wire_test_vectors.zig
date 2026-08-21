@@ -5,9 +5,6 @@
 const std = @import("std");
 const hex = @import("hex");
 const packet = @import("protocol/packet.zig");
-const secp = @import("secp256k1.zig");
-const session = @import("protocol/session.zig");
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 
 const node_a_id = hex.hexToBytesComptime(32, "aaaa8419e9f49d0083561b48287df592939a8d19947d8c0ef88f2a4856a69fbb");
 const node_b_id = hex.hexToBytesComptime(32, "bbbb9d047f0488c0b5a93c1c3f2d8bafc7c8ff337024a55434a0d0555de64db9");
@@ -172,5 +169,3 @@ test "discv5 wire: ping handshake with ENR (flag 2)" {
     const ping = try msg.Ping.decode(pt);
     try std.testing.expectEqual(@as(u64, 1), ping.enr_seq);
 }
-
-// =========== Cryptographic primitive test vectors ===========
