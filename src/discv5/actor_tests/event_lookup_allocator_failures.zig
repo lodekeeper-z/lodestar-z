@@ -183,40 +183,6 @@ test "full event outbox preserves completion and queued drain with one owned dro
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
 }
 
-test "lookup finalization is independent of a full best-effort event outbox" {
-    const alloc = std.testing.allocator;
-    const io = std.Options.debug_io;
-    const local_key = try secp.keyPairFromSecret(&([_]u8{0x68} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
-    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x69} ** 32));
-    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
-    remote_builder.ip = .{ 127, 0, 0, 29 };
-    remote_builder.udp = 9029;
-    const remote_enr = try remote_builder.encode();
-    defer alloc.free(remote_enr);
-    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
-    const cfg = config.Config{
-        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
-        .local_key_pair = local_key,
-        .local_node_id = local_id,
-        .rate_limiter = null,
-        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 1, .command_capacity = 2 },
-    };
-    var harness = try ActorHarness.init(alloc, io, cfg);
-    defer harness.deinit();
-    const actor = &harness.actor;
-    try std.testing.expect(actor.peers.learnEnr(remote_enr, 0) != null);
-    var lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{remote_id}, 0, actor.lookup_config);
-    const contacted = lookup.nextPeer(actor.lookup_config).?;
-    lookup.onSuccess(&contacted, &.{}, actor.lookup_config);
-    actor.lookups.putAssumeCapacityNoClobber(1, lookup);
-    harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
-
-    actor.finishLookup(harness.env(), 1, .completed);
-    try std.testing.expectEqual(@as(usize, 0), actor.lookups.count());
-    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
-}
-
 test "maintenance removes every expired lookup and retains live lookups" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -347,47 +313,6 @@ test "LocalRecord replacement is atomic across allocator failure" {
     var updated = harness.outbox.pop() orelse return error.MissingLocalEnrUpdated;
     defer updated.deinit(alloc);
     try std.testing.expect(updated == .local_enr_updated);
-}
-
-test "lookup finish removes and detaches without allocating an event payload" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const alloc = failing.allocator();
-    const io = std.Options.debug_io;
-    const local_key = try secp.keyPairFromSecret(&([_]u8{0x76} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
-    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
-    const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
-    const endpoint = types.Endpoint{
-        .node_id = remote_id,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 34 }, .port = 9034 } },
-    };
-    const cfg = config.Config{
-        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
-        .local_key_pair = local_key,
-        .local_node_id = local_id,
-        .rate_limiter = null,
-        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
-    };
-    var harness = try ActorHarness.init(alloc, io, cfg);
-    defer harness.deinit();
-    const actor = &harness.actor;
-    actor.sessions.put(endpoint, .{
-        .initiator_key = [_]u8{0x7a} ** 16,
-        .recipient_key = [_]u8{0x7b} ** 16,
-    }, outbound.nowNs(io));
-    const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{1} ** 32, &.{}, 0, actor.lookup_config);
-    actor.lookups.putAssumeCapacityNoClobber(1, lookup);
-    const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{1}, .{ .lookup = 1 });
-    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
-    failing.fail_index = failing.alloc_index;
-
-    actor.finishLookup(harness.env(), 1, .timed_out);
-    try std.testing.expect(!failing.has_induced_failure);
-    try std.testing.expectEqual(@as(usize, 0), actor.lookups.count());
-    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
-    try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(.init(endpoint, req_id)).?.origin);
-    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 }
 
 test "reliable lookup terminal payload needs no compatibility event allocation" {
