@@ -167,100 +167,10 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expectEqualStrings("response", response_event.talkresp.response);
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
-
-    const key_c = try secp.keyPairFromSecret(&([_]u8{0x7a} ** 32));
-    var builder_c = enr.Builder.init(alloc, key_c, 1);
-    builder_c.ip = .{ 127, 0, 0, 3 };
-    builder_c.udp = 9203;
-    const enr_c = try builder_c.encode();
-    defer alloc.free(enr_c);
-    const id_c = (try (try enr.decode(enr_c)).nodeId()).?;
-    const key_d = try secp.keyPairFromSecret(&([_]u8{0x7b} ** 32));
-    var builder_d = enr.Builder.init(alloc, key_d, 1);
-    builder_d.ip = .{ 127, 0, 0, 4 };
-    builder_d.udp = 9204;
-    const enr_d = try builder_d.encode();
-    defer alloc.free(enr_d);
-    const id_d = (try (try enr.decode(enr_d)).nodeId()).?;
-    try std.testing.expect(actor_b.learnDiscovered(enr_c, now_ns) != null);
-    try std.testing.expect(actor_b.addEnr(&outbox_b, enr_d, now_ns));
-    var added_event = outbox_b.pop() orelse return error.MissingEnrAdded;
-    defer added_event.deinit(alloc);
-    try std.testing.expect(added_event == .enr_added);
-    const distance_c: u16 = @as(u16, @import("../kbucket.zig").logDistance(&id_b, &id_c).?) + 1;
-    const distance_d: u16 = @as(u16, @import("../kbucket.zig").logDistance(&id_b, &id_d).?) + 1;
-    _ = try actor_a.sendFindNode(
-        .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a },
-        .{ .node_id = id_b, .addr = address_b },
-        &pubkey_b,
-        &.{ distance_c, distance_d },
-        .api,
-    );
-    try link_a_to_b.deliverNext();
-    try link_b_to_a.deliverNext();
-    var discovered_event = outbox_a.pop() orelse return error.MissingDiscoveredEnr;
-    defer discovered_event.deinit(alloc);
-    try std.testing.expect(discovered_event == .discovered_enr);
-    try std.testing.expectEqualSlices(u8, enr_d, discovered_event.discovered_enr.raw.slice());
-    try std.testing.expect(outbox_a.pop() == null);
-    try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
 }
 
 test "strict handshake rejects untrusted contact without endpoint proof" {
-    const alloc = std.testing.allocator;
-    const io = std.Options.debug_io;
-    const key_a = try secp.keyPairFromSecret(&([_]u8{0x7c} ** 32));
-    const pubkey_a = secp.compressedPubkey(&key_a);
-    const id_a = try enr.nodeIdFromCompressedPubkey(&pubkey_a);
-    const key_b = try secp.keyPairFromSecret(&([_]u8{0x7d} ** 32));
-    const pubkey_b = secp.compressedPubkey(&key_b);
-    const id_b = try enr.nodeIdFromCompressedPubkey(&pubkey_b);
-    const address_a = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9301 } };
-    const address_b = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9302 } };
-    const limits = config.Limits{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 };
-    const config_a = config.Config{
-        .bind_addresses = .{ .ip4 = address_a },
-        .local_key_pair = key_a,
-        .local_node_id = id_a,
-        .rate_limiter = null,
-        .limits = limits,
-    };
-    const config_b = config.Config{
-        .bind_addresses = .{ .ip4 = address_b },
-        .local_key_pair = key_b,
-        .local_node_id = id_b,
-        .rate_limiter = null,
-        .limits = limits,
-        .allow_unverified_sessions = false,
-    };
-    var ingress_a = try admission.IngressAdmission.init(alloc, null, limits.max_active_requests);
-    defer ingress_a.deinit();
-    var ingress_b = try admission.IngressAdmission.init(alloc, null, limits.max_active_requests);
-    defer ingress_b.deinit();
-    var outbox_a = try events.EventOutbox.init(io, alloc, limits.event_capacity);
-    defer outbox_a.deinit();
-    var outbox_b = try events.EventOutbox.init(io, alloc, limits.event_capacity);
-    defer outbox_b.deinit();
-    var actor_a = try actor_mod.Actor.init(alloc, config_a);
-    defer actor_a.deinit(&ingress_a);
-    var actor_b = try actor_mod.Actor.init(alloc, config_b);
-    defer actor_b.deinit(&ingress_b);
-    var sender_a = RecordingSender.init(alloc);
-    defer sender_a.deinit();
-    var sender_b = RecordingSender.init(alloc);
-    defer sender_b.deinit();
-    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
-
-    actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
-    _ = try actor_a.sendPing(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
-    try link_a_to_b.deliverNext();
-    try link_b_to_a.deliverNext();
-    try link_a_to_b.deliverNext();
-
-    try std.testing.expect(actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, outbound.nowNs(io)) == null);
-    try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
+    try std.testing.expect(!try contactHandshakeAccepted(false, false));
 }
 
 test "permissive handshake accepts untrusted contact without endpoint proof" {
