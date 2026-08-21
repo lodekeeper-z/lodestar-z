@@ -1597,13 +1597,13 @@ test "full EventOutbox cannot lose reliable pong nodes or talk response payloads
     try std.testing.expectEqualSlices(u8, "response bytes", talk_result.terminal.talk_response.slice());
     try std.testing.expect(runtime_a.popRequestResult() == null);
 
+    const snapshot = try runtime_a.metricsSnapshot();
+    try std.testing.expect(snapshot.dropped_event_count >= 1);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.droppedEventCount(.talk_resp_received));
     var blocker = runtime_a.popEvent() orelse return error.MissingEventOutboxBlocker;
     defer blocker.deinit(alloc);
     try std.testing.expect(blocker == .local_enr_updated);
     try std.testing.expect(runtime_a.popEvent() == null);
-    const snapshot = try runtime_a.metricsSnapshot();
-    try std.testing.expect(snapshot.dropped_event_count >= 1);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.droppedEventCount(.talk_resp_received));
     const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime_a);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
