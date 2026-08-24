@@ -107,28 +107,11 @@ pub fn verifyEnrEndpoint(enr_bytes: []const u8, src_id: NodeId, observed: Addres
 
 /// True when an advertised endpoint matches `observed_addr`.
 fn endpointMatches(parsed: *const enr_mod.Enr, observed_addr: Address) bool {
-    if (parsed.ip) |ip| {
-        if (parsed.udp) |port| {
-            switch (observed_addr) {
-                .ip4 => |ip4| {
-                    if (std.mem.eql(u8, &ip, &ip4.bytes) and port == ip4.port) return true;
-                },
-                .ip6 => {},
-            }
-        }
-    }
-    if (parsed.ip6) |ip6| {
-        if (parsed.udp6) |port| {
-            switch (observed_addr) {
-                .ip4 => {},
-                .ip6 => |addr_ip6| {
-                    if (std.mem.eql(u8, &ip6, &addr_ip6.bytes) and port == addr_ip6.port) return true;
-                },
-            }
-        }
-    }
-
-    return false;
+    const advertised = switch (observed_addr) {
+        .ip4 => parsed.udpAddress4(),
+        .ip6 => parsed.udpAddress6(),
+    } orelse return false;
+    return advertised.eql(&observed_addr);
 }
 
 test "parseAuthdata round-trips a built authdata header" {
@@ -176,4 +159,27 @@ test "parseAuthdata rejects non-v4 sizes" {
     buf[32] = 65; // wrong sig size
     buf[33] = eph_key_size;
     try std.testing.expectError(Error.BadAuthdataSizes, parseAuthdata(&buf));
+}
+
+test "endpoint match applies shared UDP port to IPv6" {
+    const ip6 = [_]u8{0} ** 15 ++ .{1};
+    const parsed = enr_mod.Enr{
+        .seq = 1,
+        .pubkey = null,
+        .ip = null,
+        .udp = 9_000,
+        .tcp = null,
+        .ip6 = ip6,
+        .udp6 = null,
+        .tcp6 = null,
+        .quic = null,
+        .quic6 = null,
+        .eth2_fork_digest = null,
+        .eth2_raw = null,
+        .attnets = null,
+        .syncnets = null,
+        .custody_group_count = null,
+    };
+
+    try std.testing.expect(endpointMatches(&parsed, .{ .ip6 = .{ .bytes = ip6, .port = 9_000 } }));
 }

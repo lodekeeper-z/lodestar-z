@@ -89,10 +89,11 @@ pub const Enr = struct {
         return .{ .ip4 = .{ .bytes = ip, .port = port } };
     }
 
-    /// The advertised IPv6 UDP endpoint, or null if either ip6/udp6 is absent.
+    /// The advertised IPv6 UDP endpoint. Per EIP-778, `udp` is shared when
+    /// the IPv6-specific `udp6` key is absent.
     pub fn udpAddress6(self: *const Enr) ?Address {
         const ip6 = self.ip6 orelse return null;
-        const port = self.udp6 orelse return null;
+        const port = self.udp6 orelse self.udp orelse return null;
         return .{ .ip6 = .{ .bytes = ip6, .port = port } };
     }
 
@@ -520,6 +521,30 @@ test "ENR bounded integers require minimal big-endian encoding" {
     try std.testing.expectEqual(@as(?u16, 1), readBoundedUint(u16, &.{1}, 2));
     try std.testing.expectEqual(@as(?u16, 256), readBoundedUint(u16, &.{ 1, 0 }, 2));
     try std.testing.expectEqual(@as(?u16, null), readBoundedUint(u16, &.{ 1, 0, 0 }, 2));
+}
+
+test "ENR IPv6 endpoint falls back to shared UDP port" {
+    const ip6 = [_]u8{0} ** 15 ++ .{1};
+    const parsed = Enr{
+        .seq = 1,
+        .pubkey = null,
+        .ip = null,
+        .udp = 9_000,
+        .tcp = null,
+        .ip6 = ip6,
+        .udp6 = null,
+        .tcp6 = null,
+        .quic = null,
+        .quic6 = null,
+        .eth2_fork_digest = null,
+        .eth2_raw = null,
+        .attnets = null,
+        .syncnets = null,
+        .custody_group_count = null,
+    };
+
+    const address = parsed.udpAddress6() orelse return error.MissingIpv6Endpoint;
+    try std.testing.expectEqual(Address{ .ip6 = .{ .bytes = ip6, .port = 9_000 } }, address);
 }
 
 test "ENR builder round-trips zero custody group count" {
