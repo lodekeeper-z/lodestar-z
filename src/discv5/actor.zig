@@ -165,6 +165,9 @@ pub const Actor = struct {
         origin: types.RequestOrigin,
     ) !message.ReqId {
         if (distances.len > 127) return error.TooManyDistances;
+        for (distances) |distance| {
+            if (distance > 256) return error.InvalidDistance;
+        }
         const req_id = randomReqId(env.io);
         const findnode = message.FindNode{ .req_id = req_id, .distances = distances };
         var buffer: [512]u8 = undefined;

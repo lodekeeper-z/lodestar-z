@@ -159,6 +159,9 @@ pub const FindNode = struct {
     }
 
     pub fn encodeInto(self: *const FindNode, out: []u8) Error![]u8 {
+        for (self.distances) |distance| {
+            if (distance > 256) return Error.InvalidMessage;
+        }
         if (out.len == 0) return Error.BufferTooSmall;
         var w = rlp.Writer.initBuffer(out[1..]);
         const list_start = try w.beginListBounded();
@@ -420,6 +423,16 @@ test "discv5 messages accept empty request IDs" {
     const encoded_talk_resp = try talk_resp.encodeInto(&encoded_buf);
     const decoded_talk_resp = try TalkResp.decode(encoded_talk_resp);
     try std.testing.expectEqual(@as(usize, 0), decoded_talk_resp.req_id.slice().len);
+}
+
+test "FINDNODE encoder rejects distances above 256" {
+    var encoded: [MAX_ENCODED_SIZE]u8 = undefined;
+    const request = FindNode{
+        .req_id = try ReqId.fromSlice(&.{0x01}),
+        .distances = &.{257},
+    };
+
+    try std.testing.expectError(Error.InvalidMessage, request.encodeInto(&encoded));
 }
 
 test "discv5 messages reject trailing bytes after outer RLP" {

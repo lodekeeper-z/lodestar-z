@@ -557,6 +557,7 @@ fn sendFindNodeResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: typ
         error.Canceled => error.Canceled,
         error.DuplicateChallenge => error.DuplicateChallenge,
         error.DuplicateRequest => error.DuplicateRequest,
+        error.InvalidDistance => error.InvalidDistance,
         error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
         error.OutOfMemory => error.OutOfMemory,
         error.PermitGenerationExhausted => error.PermitGenerationExhausted,
@@ -820,6 +821,9 @@ pub const Runtime = opaque {
         const storage = impl(self);
         try storage.ensureRunning();
         if (distances.len > 127) return error.TooManyDistances;
+        for (distances) |distance| {
+            if (distance > 256) return error.InvalidDistance;
+        }
         if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
         var reservation_transferred = false;
         errdefer if (!reservation_transferred) storage.request_result_outbox.cancelUnclaimed();

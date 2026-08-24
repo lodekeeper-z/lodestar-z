@@ -757,3 +757,35 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     try std.testing.expect(actor.peers.findEnr(&id_a) != null);
     try std.testing.expect(actor.peers.findEnr(&id_b) != null);
 }
+
+test "Actor rejects invalid FINDNODE distance before request or send state" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x7a} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 79 }, .port = 9_079 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+
+    try std.testing.expectError(
+        error.InvalidDistance,
+        harness.actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{257}, .api),
+    );
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
+}

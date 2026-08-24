@@ -1344,6 +1344,48 @@ test "running Runtime rejects exactly 128 FINDNODE distances before request admi
     try std.testing.expect(running.run_result == null);
 }
 
+test "running Runtime rejects invalid FINDNODE distance before request admission" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x77, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x78} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 19077 } };
+
+    const before = runtime_mod.Testing.requestResultReservationCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), before.outstanding);
+    try std.testing.expectEqual(@as(usize, 0), before.unclaimed);
+
+    try std.testing.expectError(error.InvalidDistance, runtime.sendFindNode(remote_id, &remote_pubkey, address, &.{257}));
+
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+    const reservations = runtime_mod.Testing.requestResultReservationCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), reservations.outstanding);
+    try std.testing.expectEqual(@as(usize, 0), reservations.unclaimed);
+    const snapshot = try runtime.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), snapshot.sentMessageCount(.findnode));
+
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
+}
+
 test "persistent receive errors use bounded backoff" {
     const expected = [_]u64{ 1, 2, 4, 8, 16, 32, 64, 100 };
     for (expected, 1..) |delay_ms, consecutive_errors| {

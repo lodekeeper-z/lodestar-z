@@ -78,7 +78,7 @@ pub const RequestError = CommandError || error{
     TransportSendFailed,
 };
 
-pub const FindNodeError = RequestError || error{TooManyDistances};
+pub const FindNodeError = RequestError || error{ InvalidDistance, TooManyDistances };
 pub const TalkRequestError = RequestError || error{MessageTooLarge};
 
 pub const TalkResponseError = CommandError || error{

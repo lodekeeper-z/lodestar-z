@@ -92,6 +92,14 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             };
         }
 
+        pub fn requestResultReservationCount(runtime: *Runtime) struct { outstanding: usize, unclaimed: usize } {
+            const outbox = &impl(runtime).request_result_outbox;
+            return .{
+                .outstanding = outbox.outstanding.load(.acquire),
+                .unclaimed = outbox.unclaimed.load(.acquire),
+            };
+        }
+
         pub fn receiveBackoff(consecutive_errors: u8) u64 {
             return receive_backoff(consecutive_errors);
         }
