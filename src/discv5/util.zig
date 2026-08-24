@@ -16,18 +16,37 @@ pub fn bindDatagramSocket(io: Io, address: Address) !net.Socket {
     });
 }
 
-/// Current real-clock time in nanoseconds.
+/// Current monotonic awake-clock time in nanoseconds.
 pub fn nowNs(io: Io) i64 {
-    return @intCast(Io.Timestamp.now(io, .real).toNanoseconds());
+    return @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
 }
 
-/// Current real-clock Unix time in milliseconds (clamped at 0).
+/// Current monotonic awake-clock time in milliseconds (clamped at 0).
 pub fn nowMs(io: Io) u64 {
-    const ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    const ms = Io.Timestamp.now(io, .awake).toMilliseconds();
     return if (ms < 0) 0 else @intCast(ms);
 }
 
 pub fn deadlineNs(now_ns: i64, timeout_ms: u64) i64 {
     const deadline = @as(i128, now_ns) + @as(i128, timeout_ms) * std.time.ns_per_ms;
     return if (deadline > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(deadline);
+}
+
+test "protocol time uses the monotonic awake clock" {
+    const FakeClock = struct {
+        fn now(_: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+            const milliseconds: i96 = if (clock == .awake) 222 else 111;
+            return Io.Timestamp.fromNanoseconds(milliseconds * std.time.ns_per_ms);
+        }
+
+        const vtable: Io.VTable = blk: {
+            var value: Io.VTable = undefined;
+            value.now = now;
+            break :blk value;
+        };
+    };
+    const io = Io{ .userdata = null, .vtable = &FakeClock.vtable };
+
+    try std.testing.expectEqual(@as(i64, 222 * std.time.ns_per_ms), nowNs(io));
+    try std.testing.expectEqual(@as(u64, 222), nowMs(io));
 }
