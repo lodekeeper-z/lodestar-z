@@ -1,10 +1,12 @@
 //! Discovery v5 packet encoding/decoding
 
 const std = @import("std");
+const handshake = @import("handshake.zig");
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 
 pub const MASKING_IV_SIZE = 16;
+pub const MIN_PACKET_SIZE: usize = 63;
 pub const MAX_PACKET_SIZE: usize = 1280;
 pub const STATIC_HEADER_SIZE = 6 + 2 + 1 + 12 + 2; // = 23
 pub const PROTOCOL_ID = "discv5";
@@ -130,15 +132,13 @@ pub fn aesCtr(key: *const [16]u8, iv: *const [16]u8, data: []u8) void {
 /// from `raw`. The message ciphertext is left untouched. On failure before the
 /// final in-place unmasking step, `raw` is left unchanged.
 pub fn decode(raw: []u8, dest_node_id: *const [32]u8) Error!ParsedPacket {
-    if (raw.len < MASKING_IV_SIZE + STATIC_HEADER_SIZE) return Error.InvalidPacket;
+    try validatePacketSize(raw.len);
 
     const masking_iv = raw[0..16].*;
     const masking_key = dest_node_id[0..16];
 
-    if (raw.len < 39) return Error.InvalidPacket;
-
-    // Probe a stack copy of the static header first so `raw` remains unchanged
-    // until we know the full authdata length and can validate packet bounds.
+    // Probe a bounded stack copy first so `raw` remains unchanged until the
+    // complete packet contract, including per-flag framing, has been validated.
     const masked_static = raw[16 .. 16 + STATIC_HEADER_SIZE];
     var static_buf: [STATIC_HEADER_SIZE]u8 = undefined;
     @memcpy(&static_buf, masked_static);
@@ -155,13 +155,18 @@ pub fn decode(raw: []u8, dest_node_id: *const [32]u8) Error!ParsedPacket {
     const nonce = static_buf[9..21].*;
     const authdata_size = std.mem.readInt(u16, static_buf[21..23], .big);
 
-    if (raw.len < 16 + STATIC_HEADER_SIZE + authdata_size) return Error.InvalidPacket;
+    const header_total = std.math.add(usize, STATIC_HEADER_SIZE, authdata_size) catch return Error.InvalidPacket;
+    const message_offset = std.math.add(usize, MASKING_IV_SIZE, header_total) catch return Error.InvalidPacket;
+    if (header_total > MAX_PACKET_SIZE - MASKING_IV_SIZE or message_offset > raw.len) return Error.InvalidPacket;
 
-    const header_total = STATIC_HEADER_SIZE + authdata_size;
+    var header_buf: [MAX_PACKET_SIZE - MASKING_IV_SIZE]u8 = undefined;
+    @memcpy(header_buf[0..header_total], raw[MASKING_IV_SIZE..message_offset]);
+    aesCtr(masking_key[0..16], &masking_iv, header_buf[0..header_total]);
+    const authdata = header_buf[STATIC_HEADER_SIZE..header_total];
+    try validatePacket(flag, authdata, raw.len - message_offset, raw.len);
+
     const header_raw = raw[16 .. 16 + header_total];
-    // Unmask static_header || authdata in place with the CTR stream starting at
-    // byte zero. This preserves the exact plaintext header used as GCM AD.
-    aesCtr(masking_key[0..16], &masking_iv, header_raw);
+    @memcpy(header_raw, header_buf[0..header_total]);
 
     const static_header = StaticHeader{
         .protocol_id = header_raw[0..6].*,
@@ -227,9 +232,11 @@ pub fn decryptMessageInto(
 /// Encode an ordinary or handshake message packet into caller-owned memory.
 pub fn encodeMessagePacketInto(out: []u8, args: MessagePacketArgs) Error![]u8 {
     const header_total = try headerSize(args.authdata);
-    const message_offset = MASKING_IV_SIZE + header_total;
-    const tag_offset = message_offset + args.plaintext.len;
-    const total = tag_offset + GCM_TAG_SIZE;
+    const message_offset = std.math.add(usize, MASKING_IV_SIZE, header_total) catch return Error.InvalidPacket;
+    const tag_offset = std.math.add(usize, message_offset, args.plaintext.len) catch return Error.InvalidPacket;
+    const total = std.math.add(usize, tag_offset, GCM_TAG_SIZE) catch return Error.InvalidPacket;
+    const message_size = std.math.add(usize, args.plaintext.len, GCM_TAG_SIZE) catch return Error.InvalidPacket;
+    try validatePacket(args.kind.flag(), args.authdata, message_size, total);
     if (total > out.len) return Error.BufferTooSmall;
 
     const encoded = out[0..total];
@@ -258,11 +265,11 @@ pub fn encodeWhoareyouPacketInto(
     args: WhoareyouPacketArgs,
     challenge_data_out: ?*[WHOAREYOU_CHALLENGE_DATA_SIZE]u8,
 ) Error![]u8 {
-    if (out.len < WHOAREYOU_CHALLENGE_DATA_SIZE) return Error.BufferTooSmall;
-
     var authdata: [WHOAREYOU_AUTHDATA_SIZE]u8 = undefined;
     @memcpy(authdata[0..ID_NONCE_SIZE], args.id_nonce);
     std.mem.writeInt(u64, authdata[ID_NONCE_SIZE..WHOAREYOU_AUTHDATA_SIZE], args.enr_seq, .big);
+    try validatePacket(FLAG_WHOAREYOU, &authdata, 0, WHOAREYOU_CHALLENGE_DATA_SIZE);
+    if (out.len < WHOAREYOU_CHALLENGE_DATA_SIZE) return Error.BufferTooSmall;
 
     const encoded = out[0..WHOAREYOU_CHALLENGE_DATA_SIZE];
     @memcpy(encoded[0..MASKING_IV_SIZE], args.masking_iv);
@@ -279,7 +286,30 @@ pub fn encodeWhoareyouPacketInto(
 
 fn headerSize(authdata: []const u8) Error!usize {
     if (authdata.len > std.math.maxInt(u16)) return Error.InvalidPacket;
-    return STATIC_HEADER_SIZE + authdata.len;
+    return std.math.add(usize, STATIC_HEADER_SIZE, authdata.len) catch Error.InvalidPacket;
+}
+
+/// Canonical wire-contract validation shared by decoding and every encoder.
+/// Handshake ENR contents are validated later, while fixed framing is checked here.
+fn validatePacketSize(packet_size: usize) Error!void {
+    if (packet_size < MIN_PACKET_SIZE or packet_size > MAX_PACKET_SIZE) return Error.InvalidPacket;
+}
+
+fn validatePacket(flag: u8, authdata: []const u8, message_size: usize, packet_size: usize) Error!void {
+    try validatePacketSize(packet_size);
+    switch (flag) {
+        FLAG_MESSAGE => {
+            if (authdata.len != NODE_ID_SIZE or message_size < GCM_TAG_SIZE) return Error.InvalidPacket;
+        },
+        FLAG_WHOAREYOU => {
+            if (authdata.len != WHOAREYOU_AUTHDATA_SIZE or message_size != 0) return Error.InvalidPacket;
+        },
+        FLAG_HANDSHAKE => {
+            if (message_size < GCM_TAG_SIZE) return Error.InvalidPacket;
+            _ = handshake.parseAuthdata(authdata) catch return Error.InvalidPacket;
+        },
+        else => return Error.InvalidFlag,
+    }
 }
 
 fn writeHeader(
@@ -299,6 +329,261 @@ fn writeHeader(
     @memcpy(out[9..21], nonce);
     std.mem.writeInt(u16, out[21..23], authdata_size, .big);
     @memcpy(out[STATIC_HEADER_SIZE..], authdata);
+}
+
+fn makeTestWirePacketUnchecked(
+    out: []u8,
+    dest_node_id: *const [NODE_ID_SIZE]u8,
+    flag: u8,
+    authdata: []const u8,
+    message_len: usize,
+) Error![]u8 {
+    const header_total = try headerSize(authdata);
+    const message_offset = std.math.add(usize, MASKING_IV_SIZE, header_total) catch return Error.InvalidPacket;
+    const total = std.math.add(usize, message_offset, message_len) catch return Error.InvalidPacket;
+    if (total > out.len) return Error.BufferTooSmall;
+    const raw = out[0..total];
+    @memset(raw, 0);
+    raw[0..MASKING_IV_SIZE].* = [_]u8{0x11} ** MASKING_IV_SIZE;
+    const header = raw[MASKING_IV_SIZE..][0..header_total];
+    try writeHeader(header, flag, &([_]u8{0x22} ** NONCE_SIZE), authdata);
+    aesCtr(dest_node_id[0..MASKING_IV_SIZE], &([_]u8{0x11} ** MASKING_IV_SIZE), header);
+    return raw;
+}
+
+test "discv5 packet: decode rejects datagrams outside the UDP packet bounds" {
+    const node_id = [_]u8{0x33} ** NODE_ID_SIZE;
+
+    var undersized_buffer: [MIN_PACKET_SIZE - 1]u8 = [_]u8{0xa5} ** (MIN_PACKET_SIZE - 1);
+    for ([_]usize{ 0, 1, 15, 16, 38, MIN_PACKET_SIZE - 1 }) |len| {
+        try std.testing.expectError(Error.InvalidPacket, decode(undersized_buffer[0..len], &node_id));
+    }
+
+    var oversized_buffer: [MAX_PACKET_SIZE + 1]u8 = undefined;
+    const oversized = try makeTestWirePacketUnchecked(
+        &oversized_buffer,
+        &node_id,
+        FLAG_MESSAGE,
+        &([_]u8{0x55} ** NODE_ID_SIZE),
+        MAX_PACKET_SIZE + 1 - MASKING_IV_SIZE - STATIC_HEADER_SIZE - NODE_ID_SIZE,
+    );
+    try std.testing.expectError(Error.InvalidPacket, decode(oversized, &node_id));
+}
+
+test "discv5 packet: decode rejects unknown flags" {
+    const node_id = [_]u8{0x33} ** NODE_ID_SIZE;
+    var buffer: [MAX_PACKET_SIZE]u8 = undefined;
+    const raw = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        3,
+        &([_]u8{0x55} ** NODE_ID_SIZE),
+        GCM_TAG_SIZE,
+    );
+    try std.testing.expectError(Error.InvalidFlag, decode(raw, &node_id));
+}
+
+test "discv5 packet: decode rejects invalid ordinary packet shape" {
+    const node_id = [_]u8{0x33} ** NODE_ID_SIZE;
+    var buffer: [MAX_PACKET_SIZE]u8 = undefined;
+
+    const wrong_authdata = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        FLAG_MESSAGE,
+        &([_]u8{0x55} ** (NODE_ID_SIZE - 1)),
+        GCM_TAG_SIZE,
+    );
+    try std.testing.expectError(Error.InvalidPacket, decode(wrong_authdata, &node_id));
+
+    const oversized_authdata = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        FLAG_MESSAGE,
+        &([_]u8{0x55} ** (NODE_ID_SIZE + 1)),
+        GCM_TAG_SIZE,
+    );
+    try std.testing.expectError(Error.InvalidPacket, decode(oversized_authdata, &node_id));
+
+    const missing_tag = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        FLAG_MESSAGE,
+        &([_]u8{0x55} ** NODE_ID_SIZE),
+        GCM_TAG_SIZE - 1,
+    );
+    try std.testing.expectError(Error.InvalidPacket, decode(missing_tag, &node_id));
+}
+
+test "discv5 packet: decode rejects invalid WHOAREYOU packet shape" {
+    const node_id = [_]u8{0x33} ** NODE_ID_SIZE;
+    var buffer: [MAX_PACKET_SIZE]u8 = undefined;
+
+    const wrong_authdata = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        FLAG_WHOAREYOU,
+        &([_]u8{0x55} ** (WHOAREYOU_AUTHDATA_SIZE + 1)),
+        0,
+    );
+    try std.testing.expectError(Error.InvalidPacket, decode(wrong_authdata, &node_id));
+
+    const undersized_authdata = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        FLAG_WHOAREYOU,
+        &([_]u8{0x55} ** (WHOAREYOU_AUTHDATA_SIZE - 1)),
+        1,
+    );
+    try std.testing.expectEqual(MIN_PACKET_SIZE, undersized_authdata.len);
+    try std.testing.expectError(Error.InvalidPacket, decode(undersized_authdata, &node_id));
+    // The minimum wire size requires one trailing byte for this off-by-one
+    // fixture. Exercise the authdata-size branch independently as well.
+    try std.testing.expectError(
+        Error.InvalidPacket,
+        validatePacket(FLAG_WHOAREYOU, &([_]u8{0x55} ** (WHOAREYOU_AUTHDATA_SIZE - 1)), 0, MIN_PACKET_SIZE),
+    );
+
+    const nonempty_message = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        FLAG_WHOAREYOU,
+        &([_]u8{0x55} ** WHOAREYOU_AUTHDATA_SIZE),
+        1,
+    );
+    try std.testing.expectError(Error.InvalidPacket, decode(nonempty_message, &node_id));
+}
+
+test "discv5 packet: decode rejects malformed handshake framing" {
+    const node_id = [_]u8{0x33} ** NODE_ID_SIZE;
+    var buffer: [MAX_PACKET_SIZE]u8 = undefined;
+
+    var short_authdata = [_]u8{0} ** 33;
+    const short = try makeTestWirePacketUnchecked(&buffer, &node_id, FLAG_HANDSHAKE, &short_authdata, GCM_TAG_SIZE);
+    try std.testing.expectError(Error.InvalidPacket, decode(short, &node_id));
+
+    var framed_authdata = [_]u8{0} ** (34 + handshake.sig_size + handshake.eph_key_size);
+    framed_authdata[32] = handshake.sig_size;
+    framed_authdata[33] = handshake.eph_key_size;
+    const missing_tag = try makeTestWirePacketUnchecked(&buffer, &node_id, FLAG_HANDSHAKE, &framed_authdata, GCM_TAG_SIZE - 1);
+    try std.testing.expectError(Error.InvalidPacket, decode(missing_tag, &node_id));
+
+    var wrong_sizes_authdata = [_]u8{0} ** (34 + handshake.sig_size + handshake.eph_key_size);
+    wrong_sizes_authdata[32] = handshake.sig_size - 1;
+    wrong_sizes_authdata[33] = handshake.eph_key_size;
+    const wrong_sizes = try makeTestWirePacketUnchecked(&buffer, &node_id, FLAG_HANDSHAKE, &wrong_sizes_authdata, GCM_TAG_SIZE);
+    try std.testing.expectError(Error.InvalidPacket, decode(wrong_sizes, &node_id));
+
+    var wrong_eph_size_authdata = [_]u8{0} ** (34 + handshake.sig_size + handshake.eph_key_size - 1);
+    wrong_eph_size_authdata[32] = handshake.sig_size;
+    wrong_eph_size_authdata[33] = handshake.eph_key_size - 1;
+    // This direct assertion proves the fixture is long enough to pass the
+    // truncation check and reaches the declared-size validation branch.
+    try std.testing.expectError(handshake.Error.BadAuthdataSizes, handshake.parseAuthdata(&wrong_eph_size_authdata));
+    const wrong_eph_size = try makeTestWirePacketUnchecked(&buffer, &node_id, FLAG_HANDSHAKE, &wrong_eph_size_authdata, GCM_TAG_SIZE);
+    try std.testing.expectError(Error.InvalidPacket, decode(wrong_eph_size, &node_id));
+
+    var truncated_authdata = [_]u8{0} ** 34;
+    truncated_authdata[32] = handshake.sig_size;
+    truncated_authdata[33] = handshake.eph_key_size;
+    const truncated = try makeTestWirePacketUnchecked(&buffer, &node_id, FLAG_HANDSHAKE, &truncated_authdata, GCM_TAG_SIZE);
+    try std.testing.expectError(Error.InvalidPacket, decode(truncated, &node_id));
+}
+
+test "discv5 packet: semantic decode failures leave masked wire bytes unchanged" {
+    const node_id = [_]u8{0x33} ** NODE_ID_SIZE;
+    var buffer: [MAX_PACKET_SIZE]u8 = undefined;
+
+    const invalid_packet = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        FLAG_MESSAGE,
+        &([_]u8{0x55} ** (NODE_ID_SIZE + 1)),
+        GCM_TAG_SIZE,
+    );
+    var invalid_packet_before: [MAX_PACKET_SIZE]u8 = undefined;
+    @memcpy(invalid_packet_before[0..invalid_packet.len], invalid_packet);
+    try std.testing.expectError(Error.InvalidPacket, decode(invalid_packet, &node_id));
+    try std.testing.expectEqualSlices(u8, invalid_packet_before[0..invalid_packet.len], invalid_packet);
+
+    const invalid_flag = try makeTestWirePacketUnchecked(
+        &buffer,
+        &node_id,
+        3,
+        &([_]u8{0x55} ** NODE_ID_SIZE),
+        GCM_TAG_SIZE,
+    );
+    var invalid_flag_before: [MAX_PACKET_SIZE]u8 = undefined;
+    @memcpy(invalid_flag_before[0..invalid_flag.len], invalid_flag);
+    try std.testing.expectError(Error.InvalidFlag, decode(invalid_flag, &node_id));
+    try std.testing.expectEqualSlices(u8, invalid_flag_before[0..invalid_flag.len], invalid_flag);
+}
+
+test "discv5 packet: public encoders reject invalid packet shapes and sizes" {
+    const node_id = [_]u8{0x33} ** NODE_ID_SIZE;
+    const nonce = [_]u8{0x22} ** NONCE_SIZE;
+    const masking_iv = [_]u8{0x11} ** MASKING_IV_SIZE;
+    const key = [_]u8{0x66} ** 16;
+    var buffer: [MAX_PACKET_SIZE + 1]u8 = undefined;
+
+    try std.testing.expectError(Error.InvalidPacket, encodeMessagePacketInto(&buffer, .{
+        .kind = .ordinary,
+        .masking_iv = &masking_iv,
+        .recipient_node_id = &node_id,
+        .nonce = &nonce,
+        .authdata = &([_]u8{0} ** (NODE_ID_SIZE - 1)),
+        .write_key = &key,
+        .plaintext = &.{},
+    }));
+    try std.testing.expectError(Error.InvalidPacket, encodeMessagePacketInto(&buffer, .{
+        .kind = .handshake,
+        .masking_iv = &masking_iv,
+        .recipient_node_id = &node_id,
+        .nonce = &nonce,
+        .authdata = &([_]u8{0} ** 34),
+        .write_key = &key,
+        .plaintext = &.{},
+    }));
+    try std.testing.expectError(Error.InvalidPacket, encodeMessagePacketInto(&buffer, .{
+        .kind = .ordinary,
+        .masking_iv = &masking_iv,
+        .recipient_node_id = &node_id,
+        .nonce = &nonce,
+        .authdata = &([_]u8{0} ** NODE_ID_SIZE),
+        .write_key = &key,
+        .plaintext = &([_]u8{0} ** (MAX_PACKET_SIZE + 1 - MASKING_IV_SIZE - STATIC_HEADER_SIZE - NODE_ID_SIZE - GCM_TAG_SIZE)),
+    }));
+}
+
+test "discv5 packet: valid WHOAREYOU and maximum ordinary message boundaries round-trip" {
+    const node_id = [_]u8{0x33} ** NODE_ID_SIZE;
+    const nonce = [_]u8{0x22} ** NONCE_SIZE;
+    const masking_iv = [_]u8{0x11} ** MASKING_IV_SIZE;
+    const key = [_]u8{0x66} ** 16;
+    var buffer: [MAX_PACKET_SIZE]u8 = undefined;
+
+    const whoareyou = try encodeWhoareyouPacketInto(&buffer, .{
+        .masking_iv = &masking_iv,
+        .recipient_node_id = &node_id,
+        .request_nonce = &nonce,
+        .id_nonce = &([_]u8{0x77} ** ID_NONCE_SIZE),
+        .enr_seq = 1,
+    }, null);
+    try std.testing.expectEqual(@as(usize, 63), whoareyou.len);
+    try std.testing.expectEqual(FLAG_WHOAREYOU, (try decode(whoareyou, &node_id)).static_header.flag);
+
+    const max_plaintext_len = MAX_PACKET_SIZE - MASKING_IV_SIZE - STATIC_HEADER_SIZE - NODE_ID_SIZE - GCM_TAG_SIZE;
+    const maximum = try encodeMessagePacketInto(&buffer, .{
+        .kind = .ordinary,
+        .masking_iv = &masking_iv,
+        .recipient_node_id = &node_id,
+        .nonce = &nonce,
+        .authdata = &node_id,
+        .write_key = &key,
+        .plaintext = &([_]u8{0x88} ** max_plaintext_len),
+    });
+    try std.testing.expectEqual(MAX_PACKET_SIZE, maximum.len);
+    try std.testing.expectEqual(FLAG_MESSAGE, (try decode(maximum, &node_id)).static_header.flag);
 }
 
 test "discv5 packet: ordinary message plaintext fit boundary" {

@@ -32,7 +32,6 @@ const RecoveryMaterial = struct {
 };
 
 pub fn handlePacket(actor: *Actor, env: Env, raw: []u8, from: types.Address) void {
-    if (raw.len > packet.MAX_PACKET_SIZE) return;
     var parsed = packet.decode(raw, &actor.local_node_id) catch return;
     switch (parsed.static_header.flag) {
         packet.FLAG_MESSAGE => handleMessage(actor, env, &parsed, from),
