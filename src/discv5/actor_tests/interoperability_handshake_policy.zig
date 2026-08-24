@@ -10,7 +10,7 @@ const types = @import("../types.zig");
 const PacketLink = @import("../test_support/packet_link.zig").PacketLink;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
 
-test "WHOAREYOU permit admits a valid HANDSHAKE through an existing source IP ban" {
+test "WHOAREYOU permit admits a valid HANDSHAKE through an exhausted source quota" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x91} ** 32));

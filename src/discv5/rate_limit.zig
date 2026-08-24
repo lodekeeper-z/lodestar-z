@@ -20,15 +20,12 @@ pub const Config = struct {
     /// State keyed by packet source IP is attacker-controlled, so keep it
     /// bounded even when a peer sprays many spoofed or rotating addresses.
     by_ip_state_capacity: usize = 4096,
-    banned_ip_capacity: usize = 4096,
 };
 
 pub const Stats = struct {
     rate_limit_hit_ip_total: u64 = 0,
     rate_limit_hit_total: u64 = 0,
 };
-
-const banned_ip_duration_ms: u64 = 60_000;
 
 pub const IpKey = struct {
     family: Address.Family,
@@ -100,46 +97,34 @@ pub fn RateLimiterGcra(comptime Key: type) type {
 }
 
 pub const RateLimiter = struct {
-    allocator: Allocator,
     global: RateLimiterGcra(u8),
     by_ip: RateLimiterGcra(IpKey),
-    banned_ips: lru.LruCache(IpKey, u8),
     stats: Stats = .{},
 
     pub fn init(allocator: Allocator, config: Config) !RateLimiter {
-        if (config.by_ip_state_capacity == 0 or config.by_ip_state_capacity > MAX_SOURCE_STATE or
-            config.banned_ip_capacity == 0 or config.banned_ip_capacity > MAX_SOURCE_STATE) return error.InvalidRateLimiterCapacity;
+        if (config.by_ip_state_capacity == 0 or config.by_ip_state_capacity > MAX_SOURCE_STATE)
+            return error.InvalidRateLimiterCapacity;
         var global = try RateLimiterGcra(u8).fromQuota(allocator, config.global_quota, 1);
         errdefer global.deinit();
 
         var by_ip = try RateLimiterGcra(IpKey).fromQuota(allocator, config.by_ip_quota, config.by_ip_state_capacity);
         errdefer by_ip.deinit();
 
-        var banned_ips = try lru.LruCache(IpKey, u8).init(allocator, config.banned_ip_capacity);
-        errdefer banned_ips.deinit(allocator);
-
         return .{
-            .allocator = allocator,
             .global = global,
             .by_ip = by_ip,
-            .banned_ips = banned_ips,
         };
     }
 
     pub fn deinit(self: *RateLimiter) void {
         self.global.deinit();
         self.by_ip.deinit();
-        self.banned_ips.deinit(self.allocator);
     }
 
     pub fn allowEncodedPacket(self: *RateLimiter, addr: Address, now_ms: u64) bool {
         const ip = IpKey.fromAddress(addr);
-        const now_ns = timestampMsToNs(now_ms);
-        if (self.banned_ips.get(ip, now_ns) != null) return false;
-
         if (!self.by_ip.allows(ip, 1, now_ms)) {
             self.stats.rate_limit_hit_ip_total +|= 1;
-            self.banned_ips.put(ip, 1, banned_ip_duration_ms, now_ns);
             return false;
         }
 
@@ -175,7 +160,7 @@ test "GCRA allows burst then replenishes over time" {
     try std.testing.expect(limiter.allows(ip, 1, 500));
 }
 
-test "rate limiter bans IP on per-IP quota hit" {
+test "per-IP quota hit does not create a punitive ban" {
     var limiter = try RateLimiter.init(std.testing.allocator, .{
         .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 100 },
         .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
@@ -185,11 +170,23 @@ test "rate limiter bans IP on per-IP quota hit" {
     const addr = Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 9000 } };
     try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
     try std.testing.expect(!limiter.allowEncodedPacket(addr, 0));
-    try std.testing.expect(!limiter.allowEncodedPacket(addr, banned_ip_duration_ms - 1));
-    try std.testing.expect(limiter.allowEncodedPacket(addr, banned_ip_duration_ms));
+    try std.testing.expect(!limiter.allowEncodedPacket(addr, 999));
+    try std.testing.expect(limiter.allowEncodedPacket(addr, 1_000));
 
     const stats = limiter.statsSnapshot();
-    try std.testing.expectEqual(@as(u64, 1), stats.rate_limit_hit_ip_total);
+    try std.testing.expectEqual(@as(u64, 2), stats.rate_limit_hit_ip_total);
+}
+
+test "rate limiter rejects source-state capacities outside the bound" {
+    const base = Config{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 100 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+    };
+    var invalid = base;
+    invalid.by_ip_state_capacity = 0;
+    try std.testing.expectError(error.InvalidRateLimiterCapacity, RateLimiter.init(std.testing.allocator, invalid));
+    invalid.by_ip_state_capacity = MAX_SOURCE_STATE + 1;
+    try std.testing.expectError(error.InvalidRateLimiterCapacity, RateLimiter.init(std.testing.allocator, invalid));
 }
 
 test "IPv4-mapped IPv6 shares one normalized source-IP key" {
@@ -206,7 +203,6 @@ test "rate limiter bounds source IP state" {
         .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 100 },
         .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
         .by_ip_state_capacity = 2,
-        .banned_ip_capacity = 2,
     });
     defer limiter.deinit();
 
@@ -218,6 +214,5 @@ test "rate limiter bounds source IP state" {
         try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
         try std.testing.expect(!limiter.allowEncodedPacket(addr, 0));
         try std.testing.expect(limiter.by_ip.tat_per_key.count() <= 2);
-        try std.testing.expect(limiter.banned_ips.count() <= 2);
     }
 }

@@ -102,8 +102,8 @@ pub const Config = struct {
             return error.InvalidLocalIdentity;
         if (!std.mem.eql(u8, &derived_node_id, &self.local_node_id)) return error.InvalidLocalIdentity;
         if (self.rate_limiter) |limiter| {
-            if (limiter.by_ip_state_capacity == 0 or limiter.by_ip_state_capacity > MAX_WHOAREYOU_SOURCES or
-                limiter.banned_ip_capacity == 0 or limiter.banned_ip_capacity > MAX_WHOAREYOU_SOURCES) return error.InvalidRateLimiterCapacity;
+            if (limiter.by_ip_state_capacity == 0 or limiter.by_ip_state_capacity > MAX_WHOAREYOU_SOURCES)
+                return error.InvalidRateLimiterCapacity;
         }
         if (self.local_enr) |bytes| {
             if (bytes.len > @import("enr.zig").MAX_ENR_SIZE) return error.InvalidEnr;
@@ -159,4 +159,19 @@ test "config rejects address vote thresholds above the bounded voter capacity" {
         .addr_votes_to_update_enr = 201,
     };
     try std.testing.expectError(error.InvalidVoteThreshold, config.validate());
+}
+
+test "config rejects rate limiter source-state capacities outside the bound" {
+    const key_pair = secp.KeyPair.generate(std.Options.debug_io);
+    const node_id = try @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    var config = Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+    };
+
+    config.rate_limiter.?.by_ip_state_capacity = 0;
+    try std.testing.expectError(error.InvalidRateLimiterCapacity, config.validate());
+    config.rate_limiter.?.by_ip_state_capacity = MAX_WHOAREYOU_SOURCES + 1;
+    try std.testing.expectError(error.InvalidRateLimiterCapacity, config.validate());
 }

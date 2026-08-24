@@ -347,7 +347,7 @@ test "admission acquisition remains allocation-free after initialization" {
     permit.release(&admission);
 }
 
-test "expected response IP bypasses a pre-existing rate-limit ban" {
+test "expected response IP bypasses an exhausted per-IP quota" {
     var admission = try IngressAdmission.init(std.testing.allocator, .{
         .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 10 },
         .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
