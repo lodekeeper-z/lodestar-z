@@ -592,6 +592,10 @@ pub const Actor = struct {
                 );
             };
             _ = send_result catch |err| {
+                if (err == error.Canceled) {
+                    self.finishLookup(env, id, .runtime_stopped);
+                    return;
+                }
                 if (isLookupBackpressure(err)) {
                     if (self.lookups.getPtr(id)) |lookup| lookup.onDeferred(&peer_id);
                     break;

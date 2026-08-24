@@ -82,7 +82,19 @@ pub const Transport = struct {
         const self: *Transport = @ptrCast(@alignCast(context));
         if (builtin.is_test) if (self.test_send_gate) |gate| {
             gate.entered.store(true, .release);
-            while (!gate.proceed.load(.acquire)) std.atomic.spinLoopHint();
+            if (gate.cancelable) {
+                while (!gate.proceed.load(.acquire)) {
+                    Io.sleep(self.io, .fromMilliseconds(1), .awake) catch |err| switch (err) {
+                        error.Canceled => {
+                            gate.cancellation_observed.store(true, .release);
+                            self.io.recancel();
+                            return error.Canceled;
+                        },
+                    };
+                }
+            } else {
+                while (!gate.proceed.load(.acquire)) std.atomic.spinLoopHint();
+            }
         };
         const socket_value = self.socket(switch (address) {
             .ip4 => .ip4,
@@ -110,6 +122,8 @@ pub const Testing = if (builtin.is_test) struct {
     pub const SendGate = struct {
         entered: std.atomic.Value(bool) = .init(false),
         proceed: std.atomic.Value(bool) = .init(false),
+        cancellation_observed: std.atomic.Value(bool) = .init(false),
+        cancelable: bool = false,
     };
 
     pub fn setSendGate(transport: *Transport, gate: ?*SendGate) void {

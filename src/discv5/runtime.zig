@@ -34,6 +34,14 @@ pub const LookupTerminalReason = lookup_results.LookupTerminalReason;
 pub const RequestResult = request_results.RequestResult;
 pub const RequestTerminal = request_results.RequestTerminal;
 
+const Lifecycle = enum(u8) {
+    ready,
+    running,
+    stopping,
+    terminalizing,
+    stopped,
+};
+
 const RuntimeImpl = struct {
     io: Io,
     allocator: Allocator,
@@ -47,8 +55,8 @@ const RuntimeImpl = struct {
     command_queue: Io.Queue(Command),
     command_buffer: []Command,
     group: Io.Group = .init,
-    running: std.atomic.Value(bool) = .init(false),
-    closed: std.atomic.Value(bool) = .init(false),
+    lifecycle: std.atomic.Value(Lifecycle) = .init(.ready),
+    terminalized: std.atomic.Value(bool) = .init(false),
     maintenance_due: std.atomic.Value(bool) = .init(false),
     test_command_gate: if (@import("builtin").is_test) ?*Testing.CommandGate else void = if (@import("builtin").is_test) null else {},
     test_cancellation_gate: if (@import("builtin").is_test) ?*Testing.CancellationGate else void = if (@import("builtin").is_test) null else {},
@@ -208,8 +216,8 @@ const RuntimeImpl = struct {
     }
 
     fn deinit(self: *RuntimeImpl) void {
-        std.debug.assert(!self.running.load(.acquire));
         self.stop();
+        std.debug.assert(self.lifecycle.load(.acquire) == .stopped);
         self.outbox.deinit();
         self.lookup_result_outbox.deinit();
         self.request_result_outbox.deinit();
@@ -222,9 +230,11 @@ const RuntimeImpl = struct {
     /// Run the single domain actor on the caller task. The caller schedules
     /// this method in its own group, calls stop, awaits that group, then deinit.
     fn run(self: *RuntimeImpl) (error{ AlreadyRunning, RuntimeStopped } || Io.ConcurrentError || Io.Cancelable)!void {
-        if (self.closed.load(.acquire)) return error.RuntimeStopped;
-        if (self.running.swap(true, .acq_rel)) return error.AlreadyRunning;
-        defer self.running.store(false, .release);
+        if (self.lifecycle.cmpxchgStrong(.ready, .running, .acq_rel, .acquire)) |actual| return switch (actual) {
+            .ready => unreachable,
+            .running => error.AlreadyRunning,
+            .stopping, .terminalizing, .stopped => error.RuntimeStopped,
+        };
         defer self.shutdown();
         if (self.transport.ip4 != null) try self.group.concurrent(self.io, receiveLoop, .{ self, types.Address.Family.ip4 });
         if (self.transport.ip6 != null) try self.group.concurrent(self.io, receiveLoop, .{ self, types.Address.Family.ip6 });
@@ -235,14 +245,37 @@ const RuntimeImpl = struct {
     }
 
     fn stop(self: *RuntimeImpl) void {
-        self.closed.store(true, .release);
-        self.command_queue.close(self.io);
+        while (true) switch (self.lifecycle.load(.acquire)) {
+            .ready => if (self.lifecycle.cmpxchgWeak(.ready, .terminalizing, .acq_rel, .acquire) == null) {
+                self.command_queue.close(self.io);
+                self.terminalize();
+                self.lifecycle.store(.stopped, .release);
+                return;
+            },
+            .running => if (self.lifecycle.cmpxchgWeak(.running, .stopping, .acq_rel, .acquire) == null) {
+                self.command_queue.close(self.io);
+                return;
+            },
+            .stopping, .terminalizing, .stopped => {
+                self.command_queue.close(self.io);
+                return;
+            },
+        };
     }
 
     fn shutdown(self: *RuntimeImpl) void {
-        self.stop();
+        self.command_queue.close(self.io);
+        // Commands carry caller-stack reply queues and, in some cases, owned
+        // allocations. Intake closure bounds this drain by command capacity;
+        // execute accepted commands so neither replies nor ownership dangle.
         self.drainAcceptedCommands();
         self.group.cancel(self.io);
+        self.terminalize();
+        self.lifecycle.store(.stopped, .release);
+    }
+
+    fn terminalize(self: *RuntimeImpl) void {
+        if (self.terminalized.swap(true, .acq_rel)) return;
         const env = self.actorEnv();
         self.actor.finishAllReliableRequests(env);
         self.actor.finishAllLookups(env, .runtime_stopped);
@@ -252,11 +285,14 @@ const RuntimeImpl = struct {
     }
 
     fn isRunning(self: *const RuntimeImpl) bool {
-        return self.running.load(.acquire);
+        return switch (self.lifecycle.load(.acquire)) {
+            .running, .stopping => true,
+            .ready, .terminalizing, .stopped => false,
+        };
     }
 
     fn isClosed(self: *const RuntimeImpl) bool {
-        return self.closed.load(.acquire);
+        return self.lifecycle.load(.acquire) == .stopped;
     }
 
     fn boundAddress(self: *const RuntimeImpl, family: types.Address.Family) ?types.Address {
@@ -288,8 +324,11 @@ const RuntimeImpl = struct {
     }
 
     fn ensureRunning(self: *RuntimeImpl) !void {
-        if (self.closed.load(.acquire)) return error.RuntimeStopped;
-        if (!self.running.load(.acquire)) return error.RuntimeNotRunning;
+        switch (self.lifecycle.load(.acquire)) {
+            .ready => return error.RuntimeNotRunning,
+            .running => {},
+            .stopping, .terminalizing, .stopped => return error.RuntimeStopped,
+        }
     }
 
     pub fn enqueueCommand(self: *RuntimeImpl, command: Command) !void {
@@ -521,7 +560,7 @@ const RuntimeImpl = struct {
         if (self.transport.socket(family) == null) return;
         var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
         var consecutive_errors: u8 = 0;
-        while (!self.closed.load(.acquire)) {
+        while (self.lifecycle.load(.acquire) == .running) {
             const received = self.transport.receiveInto(family, &buffer) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.MessageOversize => {
@@ -552,7 +591,7 @@ const RuntimeImpl = struct {
 
     fn maintenanceLoop(self: *RuntimeImpl) Io.Cancelable!void {
         const interval = @max(self.options.maintenance_interval_ms, 1);
-        while (!self.closed.load(.acquire)) {
+        while (self.lifecycle.load(.acquire) == .running) {
             try Io.sleep(self.io, .fromMilliseconds(@intCast(interval)), .awake);
             self.requestMaintenanceWake() catch |err| switch (err) {
                 error.CommandQueueFull => continue,

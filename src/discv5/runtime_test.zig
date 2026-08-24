@@ -141,6 +141,37 @@ fn awaitRequestResult(io: std.Io, runtime: *runtime_mod.Runtime) !runtime_mod.Re
     return error.MissingRequestResult;
 }
 
+const PlaneClosure = struct {
+    runtime: *runtime_mod.Runtime,
+    event_error: ?anyerror = null,
+    lookup_error: ?anyerror = null,
+    request_error: ?anyerror = null,
+    event_done: std.atomic.Value(bool) = .init(false),
+    lookup_done: std.atomic.Value(bool) = .init(false),
+    request_done: std.atomic.Value(bool) = .init(false),
+};
+
+fn awaitEventClosure(context: *PlaneClosure) void {
+    _ = context.runtime.nextEvent() catch |err| {
+        context.event_error = err;
+        return context.event_done.store(true, .release);
+    };
+}
+
+fn awaitLookupClosure(context: *PlaneClosure) void {
+    _ = context.runtime.nextLookupResult() catch |err| {
+        context.lookup_error = err;
+        return context.lookup_done.store(true, .release);
+    };
+}
+
+fn awaitRequestClosure(context: *PlaneClosure) void {
+    _ = context.runtime.nextRequestResult() catch |err| {
+        context.request_error = err;
+        return context.request_done.store(true, .release);
+    };
+}
+
 fn expectRequestIdentity(result: *const runtime_mod.RequestResult, endpoint: types.Endpoint, req_id: @import("protocol/message.zig").ReqId, kind: types.RequestKind) !void {
     try std.testing.expect(types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, req_id)));
     try std.testing.expectEqual(kind, result.kind);
@@ -151,6 +182,81 @@ test "Runtime public handle is opaque" {
         .@"opaque" => {},
         else => return error.RuntimeIsNotOpaque,
     }
+}
+
+test "stop before run closes blocked event lookup and request readers" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x6c, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+        .lookup_result_capacity = 2,
+        .request_result_capacity = 2,
+    }, .{});
+    defer runtime.deinit();
+
+    var context = PlaneClosure{ .runtime = runtime };
+    var group: std.Io.Group = .init;
+    var joined = false;
+    defer if (!joined) {
+        group.cancel(io);
+        group.await(io) catch {};
+    };
+    try group.concurrent(io, awaitEventClosure, .{&context});
+    try group.concurrent(io, awaitLookupClosure, .{&context});
+    try group.concurrent(io, awaitRequestClosure, .{&context});
+
+    runtime.stop();
+    try awaitFlag(&context.event_done, error.EventPlaneDidNotClose);
+    try awaitFlag(&context.lookup_done, error.LookupPlaneDidNotClose);
+    try awaitFlag(&context.request_done, error.RequestPlaneDidNotClose);
+    try group.await(io);
+    joined = true;
+
+    try std.testing.expectEqual(error.Closed, context.event_error.?);
+    try std.testing.expectEqual(error.Closed, context.lookup_error.?);
+    try std.testing.expectEqual(error.Closed, context.request_error.?);
+    try std.testing.expectError(error.RuntimeStopped, runtime.run());
+}
+
+test "stop remains run-active until blocked shutdown returns" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x6b, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+    }, .{});
+    var runner = RunningRuntime.init(io);
+    var gate = runtime_mod.Testing.CommandGate{};
+    defer {
+        gate.proceed.store(true, .release);
+        runtime_mod.Testing.setCommandGate(runtime, null);
+        runner.deinit();
+    }
+
+    try runner.start(runtime);
+    try runner.awaitStarted();
+    runtime_mod.Testing.setCommandGate(runtime, &gate);
+    try runtime_mod.Testing.putMaintenance(runtime);
+    try awaitFlag(&gate.entered, error.ShutdownGateDidNotBlock);
+
+    runner.stop();
+    try std.testing.expect(runtime.isRunning());
+    try std.testing.expect(!runtime.isClosed());
+
+    gate.proceed.store(true, .release);
+    try runner.await();
+    try std.testing.expect(!runtime.isRunning());
+    try std.testing.expect(runtime.isClosed());
+    try std.testing.expect(runner.run_result == null);
 }
 
 const TransportCancellationContext = struct {
@@ -262,6 +368,20 @@ fn sendRuntimePing(context: *RuntimePingContext) void {
     };
 }
 
+const RuntimeLookupContext = struct {
+    runtime: *runtime_mod.Runtime,
+    target: types.NodeId,
+    lookup_id: ?u32 = null,
+    result_error: ?anyerror = null,
+};
+
+fn startRuntimeLookup(context: *RuntimeLookupContext) void {
+    context.lookup_id = context.runtime.startLookup(context.target) catch |err| {
+        context.result_error = err;
+        return;
+    };
+}
+
 test "Runtime send cancellation closes drains joins and releases command state" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -341,6 +461,88 @@ test "Runtime send cancellation closes drains joins and releases command state" 
     const counts = runtime_mod.Testing.activeAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.permits);
+}
+
+test "lookup send cancellation terminates active lookup as runtime stopped" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x6f, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 4,
+        .lookup_result_capacity = 1,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    defer runtime.deinit();
+
+    var run_error: ?anyerror = null;
+    var runtime_group: std.Io.Group = .init;
+    var runtime_group_started = false;
+    var api_group: std.Io.Group = .init;
+    var api_group_started = false;
+    var gate = transport_mod.Testing.SendGate{ .cancelable = true };
+    var cancel_thread: ?std.Thread = null;
+    var cancel_thread_joined = false;
+    try runtime_group.concurrent(io, runRuntime, .{ runtime, &run_error });
+    runtime_group_started = true;
+    defer {
+        gate.proceed.store(true, .release);
+        if (cancel_thread) |thread| {
+            if (!cancel_thread_joined) thread.join();
+        } else if (runtime_group_started) {
+            runtime_group.cancel(io);
+        }
+        if (api_group_started) {
+            api_group.cancel(io);
+            api_group.await(io) catch {};
+        }
+        if (runtime_group_started) runtime_group.await(io) catch {};
+    }
+    for (0..10_000) |_| {
+        if (runtime.isRunning()) break;
+        try std.Thread.yield();
+    } else return error.RuntimeDidNotStart;
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x70} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 112 }, .port = 9112 } };
+    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
+    remote_builder.ip = .{ 127, 0, 0, 112 };
+    remote_builder.udp = 9112;
+    const remote_enr = try remote_builder.encode();
+    defer alloc.free(remote_enr);
+    try std.testing.expect(try runtime.addNode(remote_id, &remote_pubkey, remote_address, remote_enr));
+    runtime_mod.Testing.setSendGate(runtime, &gate);
+
+    var lookup_context = RuntimeLookupContext{
+        .runtime = runtime,
+        .target = [_]u8{0x71} ** 32,
+    };
+    try api_group.concurrent(io, startRuntimeLookup, .{&lookup_context});
+    api_group_started = true;
+    try awaitFlag(&gate.entered, error.LookupSendDidNotStart);
+
+    var cancel_context = CancelTransportContext{ .io = io, .group = &runtime_group };
+    cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
+    try awaitFlag(&gate.cancellation_observed, error.CancellationWasNotObserved);
+    try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
+    cancel_thread.?.join();
+    cancel_thread_joined = true;
+    try api_group.await(io);
+    api_group_started = false;
+    try runtime_group.await(io);
+    runtime_group_started = false;
+
+    try std.testing.expectEqual(error.Canceled, run_error.?);
+    try std.testing.expect(lookup_context.result_error == null);
+    const result = runtime.popLookupResult() orelse return error.MissingStoppedLookupResult;
+    try std.testing.expectEqual(lookup_context.lookup_id.?, result.lookup_id);
+    try std.testing.expectEqual(runtime_mod.LookupTerminalReason.runtime_stopped, result.reason);
+    try std.testing.expect(runtime.popLookupResult() == null);
+    try std.testing.expectError(error.Closed, runtime.nextLookupResult());
 }
 
 test "actor cancellation closes command intake before draining" {
