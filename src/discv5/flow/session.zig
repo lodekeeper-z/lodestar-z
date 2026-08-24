@@ -7,8 +7,10 @@ const secp = @import("../secp256k1.zig");
 const session_crypto = @import("../protocol/session.zig");
 const session_book = @import("../state/session_book.zig");
 const request_book = @import("../state/request_book.zig");
+const request_results = @import("../request_results.zig");
 const response_book = @import("../state/response_book.zig");
 const types = @import("../types.zig");
+const completion = @import("completion.zig");
 const outbound = @import("outbound.zig");
 const rpc = @import("rpc.zig");
 
@@ -201,7 +203,10 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         .authdata = authdata,
         .write_key = &keys.initiator_key,
         .plaintext = recovery.plaintext.slice(),
-    }) catch return;
+    }) catch {
+        failRequestRecovery(actor, env, source, .packet_too_large);
+        return;
+    };
     env.sender.send(from, datagram) catch return;
     switch (source) {
         .request => |preparation| actor.requests.commitChallenge(preparation, .{
@@ -216,6 +221,13 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         },
     }
     outbound.noteSent(actor, recovery.plaintext.slice());
+}
+
+fn failRequestRecovery(actor: *Actor, env: Env, source: WhoareyouSource, failure: request_results.RequestSendFailure) void {
+    switch (source) {
+        .request => |preparation| _ = completion.finish(actor, env, preparation.key, .failure, .{ .send_failure = failure }),
+        .response => {},
+    }
 }
 
 const RandomSecretCandidates = struct {

@@ -27,6 +27,7 @@ pub const LookupResult = @import("lookup_results.zig").LookupResult;
 pub const LookupTerminalReason = @import("lookup_results.zig").LookupTerminalReason;
 pub const RequestResult = @import("request_results.zig").RequestResult;
 pub const RequestTerminal = @import("request_results.zig").RequestTerminal;
+pub const RequestSendFailure = @import("request_results.zig").RequestSendFailure;
 pub const RequestKey = @import("types.zig").RequestKey;
 pub const RequestKind = @import("types.zig").RequestKind;
 pub const NodeId = enr.NodeId;

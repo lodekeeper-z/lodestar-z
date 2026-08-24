@@ -39,10 +39,15 @@ pub const RawEnrList = struct {
     }
 };
 
+pub const RequestSendFailure = enum {
+    packet_too_large,
+};
+
 pub const RequestTerminal = union(enum) {
     pong: PongResult,
     nodes: RawEnrList,
     talk_response: types.PacketBytes,
+    send_failure: RequestSendFailure,
     timeout,
     canceled,
     runtime_stopped,

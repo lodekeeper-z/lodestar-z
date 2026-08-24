@@ -403,7 +403,7 @@ pub const Actor = struct {
             .pong => std.debug.assert(kind == .ping),
             .nodes => std.debug.assert(kind == .findnode),
             .talk_response => std.debug.assert(kind == .talkreq),
-            .timeout, .canceled, .runtime_stopped => {},
+            .send_failure, .timeout, .canceled, .runtime_stopped => {},
         }
         const result_outbox = env.request_results orelse unreachable;
         result_outbox.publishAssumeReserved(.{ .key = key, .kind = kind, .terminal = terminal });

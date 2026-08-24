@@ -4,9 +4,11 @@ const admission = @import("../admission.zig");
 const config = @import("../config.zig");
 const enr = @import("../enr.zig");
 const events = @import("../events.zig");
+const handshake = @import("../protocol/handshake.zig");
 const outbound = @import("../flow/outbound.zig");
 const packet = @import("../protocol/packet.zig");
 const message = @import("../protocol/message.zig");
+const request_results = @import("../request_results.zig");
 const metrics = @import("../metrics.zig");
 const secp = @import("../secp256k1.zig");
 const session_book = @import("../state/session_book.zig");
@@ -15,6 +17,130 @@ const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
 const PacketLink = @import("../test_support/packet_link.zig").PacketLink;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
 const deliverEncrypted = @import("../test_support/encrypted_delivery.zig").deliverEncrypted;
+
+test "oversized sessionless TALKREQ handshake fails once without waiting for timeout" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xa7} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xa8} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 50 }, .port = 9250 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .request_timeout_ms = 1,
+        .request_retries = 0,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 1,
+            .max_queued_requests = 1,
+            .challenge_capacity = 1,
+            .response_recovery_capacity = 1,
+            .event_capacity = 1,
+            .command_capacity = 1,
+            .request_result_capacity = 1,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    var results = try request_results.RequestResultOutbox.init(io, alloc, 1);
+    defer results.deinit();
+    try std.testing.expect(results.reserve());
+    try std.testing.expect(results.claim());
+    var env = harness.env();
+    env.request_results = &results;
+
+    const request = [_]u8{0x5a} ** 1_100;
+    const req_id = try harness.actor.sendTalkRequestWithOrigin(env, endpoint, &remote_pubkey, "utp", &request, .reliable_api);
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    try std.testing.expect(harness.recording.datagrams.items[0].bytes.len <= packet.MAX_PACKET_SIZE);
+    const key = types.RequestKey.init(endpoint, req_id);
+    const plaintext_len = harness.actor.requests.get(key).?.phase.awaiting_whoareyou.recovery.plaintext.len;
+    const recordless_handshake_overhead = packet.MASKING_IV_SIZE + packet.STATIC_HEADER_SIZE + 34 + handshake.sig_size + handshake.eph_key_size + packet.GCM_TAG_SIZE;
+    try std.testing.expect(recordless_handshake_overhead + plaintext_len > packet.MAX_PACKET_SIZE);
+
+    var initial = harness.recording.datagrams.items[0].bytes;
+    const request_nonce = (try packet.decode(initial.bytes[0..initial.len], &remote_id)).static_header.nonce;
+    var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
+        .masking_iv = &([_]u8{0xa9} ** 16),
+        .recipient_node_id = &local_id,
+        .request_nonce = &request_nonce,
+        .id_nonce = &([_]u8{0xaa} ** 16),
+        .enr_seq = 0,
+    }, null);
+    const duplicate_challenge = challenge_buffer;
+    harness.actor.handlePacket(env, challenge, endpoint.addr);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.requests.challenge(&request_nonce, endpoint.addr) == error.InvalidChallenge);
+    const result = results.pop() orelse return error.MissingSendFailure;
+    try std.testing.expectEqual(types.RequestKind.talkreq, result.kind);
+    try std.testing.expectEqualSlices(u8, req_id.slice(), result.key.req_id.slice());
+    try std.testing.expectEqual(request_results.RequestSendFailure.packet_too_large, result.terminal.send_failure);
+    try std.testing.expect(results.pop() == null);
+
+    harness.actor.maintenanceAt(env, std.math.maxInt(i64));
+    try std.testing.expect(!harness.actor.cancelRequest(env, key));
+    var duplicate = duplicate_challenge;
+    harness.actor.handlePacket(env, &duplicate, endpoint.addr);
+    try std.testing.expect(results.pop() == null);
+    harness.actor.requests.assertInvariants();
+}
+
+test "smaller sessionless TALKREQ still recovers with one handshake packet" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xab} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xac} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 51 }, .port = 9251 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_node_id = local_id,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 1, .command_capacity = 1 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const req_id = try harness.actor.sendTalkRequest(harness.env(), endpoint, &remote_pubkey, "utp", "small request");
+    var initial = harness.recording.datagrams.items[0].bytes;
+    const request_nonce = (try packet.decode(initial.bytes[0..initial.len], &remote_id)).static_header.nonce;
+    var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
+        .masking_iv = &([_]u8{0xad} ** 16),
+        .recipient_node_id = &local_id,
+        .request_nonce = &request_nonce,
+        .id_nonce = &([_]u8{0xae} ** 16),
+        .enr_seq = 0,
+    }, null);
+
+    harness.actor.handlePacket(harness.env(), challenge, endpoint.addr);
+
+    try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    var recovered = harness.recording.datagrams.items[1].bytes;
+    try std.testing.expectEqual(packet.FLAG_HANDSHAKE, (try packet.decode(recovered.bytes[0..recovered.len], &remote_id)).static_header.flag);
+    try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.cancelRequest(harness.env(), .init(endpoint, req_id)));
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    harness.actor.requests.assertInvariants();
+}
 
 test "paired Actors retry an established PING with a fresh nonce and complete on the second PONG" {
     const alloc = std.testing.allocator;
