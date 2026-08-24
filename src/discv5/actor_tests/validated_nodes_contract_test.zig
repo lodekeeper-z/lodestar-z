@@ -282,7 +282,7 @@ test "discv5 lookup duplicate uses newer routed ENR for dispatch and result" {
     try std.testing.expectEqualSlices(u8, newer.raw, result.enrs.slice()[0].slice());
 }
 
-test "discv5 lookup-local contact dispatch survives full global retention" {
+test "discv5 lookup-local contact dispatch replaces full untrusted fallback retention" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0xa1} ** 32));
@@ -343,7 +343,9 @@ test "discv5 lookup-local contact dispatch survives full global retention" {
     const nodes = message.Nodes{ .req_id = req_id, .total = 1, .enrs = &.{returned.raw} };
     try deliverEncrypted(actor, harness.env(), endpoint, &stable.recipient_key, try nodes.encodeInto(&nodes_buffer), 0xa7);
 
-    try std.testing.expect(actor.peers.known(&returned.node_id) == null);
+    try std.testing.expect(actor.peers.known(&returned.node_id) != null);
+    try std.testing.expect(actor.peers.known(&contact_id) == null);
+    try std.testing.expectEqual(@as(u64, 1), actor.metricsSnapshot().contact_replaced_total);
     try std.testing.expect(actor.peers.findEnr(&returned.node_id) == null);
     const active_lookup = actor.lookups.getPtr(lookup_id) orelse return error.LookupFinishedBeforeLocalDispatch;
     const returned_index = active_lookup.findPeerIndex(&returned.node_id) orelse return error.MissingReturnedCandidate;

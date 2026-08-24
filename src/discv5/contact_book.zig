@@ -14,6 +14,7 @@ pub const ContactMetricsSnapshot = struct {
     capacity: usize,
     inserted_total: u64,
     updated_total: u64,
+    replaced_total: u64,
     capacity_rejected_total: u64,
     policy_rejected_total: u64,
     removed_total: u64,
@@ -27,6 +28,7 @@ pub const ContactBook = struct {
     capacity: usize,
     inserted_total: u64 = 0,
     updated_total: u64 = 0,
+    replaced_total: u64 = 0,
     capacity_rejected_total: u64 = 0,
     policy_rejected_total: u64 = 0,
     removed_total: u64 = 0,
@@ -64,8 +66,16 @@ pub const ContactBook = struct {
             }
         }
         if (existing == null and self.contacts.count() >= self.capacity) {
-            self.capacity_rejected_total +|= 1;
-            return;
+            var iterator = self.contacts.iterator();
+            while (iterator.next()) |entry| {
+                if (entry.value_ptr.explicitly_trusted) continue;
+                std.debug.assert(self.contacts.remove(entry.key_ptr.*));
+                self.replaced_total +|= 1;
+                break;
+            } else {
+                self.capacity_rejected_total +|= 1;
+                return;
+            }
         }
         self.contacts.putAssumeCapacity(node_id, .{
             .pubkey = key.*,
@@ -93,6 +103,7 @@ pub const ContactBook = struct {
             .capacity = self.capacity,
             .inserted_total = self.inserted_total,
             .updated_total = self.updated_total,
+            .replaced_total = self.replaced_total,
             .capacity_rejected_total = self.capacity_rejected_total,
             .policy_rejected_total = self.policy_rejected_total,
             .removed_total = self.removed_total,
@@ -110,9 +121,40 @@ test "contact book bounds distinct peers while allowing updates" {
     book.remember([_]u8{2} ** 32, &pubkey, addr_a, false);
     book.remember([_]u8{3} ** 32, &pubkey, addr_a, false);
     try std.testing.expectEqual(@as(usize, 2), book.count());
-    try std.testing.expect(book.get([_]u8{3} ** 32) == null);
+    try std.testing.expect(book.get([_]u8{3} ** 32) != null);
+    try std.testing.expect(book.get([_]u8{1} ** 32) == null or book.get([_]u8{2} ** 32) == null);
     book.remember([_]u8{1} ** 32, &pubkey, addr_b, false);
     try std.testing.expect(book.get([_]u8{1} ** 32).?.addr.eql(&addr_b));
+}
+
+test "trusted contacts displace only untrusted contacts at capacity" {
+    var book = try ContactBook.init(std.testing.allocator, [_]u8{0} ** 32, 2);
+    defer book.deinit();
+    const pubkey = [_]u8{2} ** 33;
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } };
+    const trusted = [_]u8{1} ** 32;
+    const untrusted = [_]u8{2} ** 32;
+    const trusted_replacement = [_]u8{3} ** 32;
+    const rejected_untrusted = [_]u8{4} ** 32;
+    const rejected_trusted = [_]u8{5} ** 32;
+
+    book.remember(trusted, &pubkey, address, true);
+    book.remember(untrusted, &pubkey, address, false);
+    book.remember(trusted_replacement, &pubkey, address, true);
+    try std.testing.expect(book.get(trusted) != null);
+    try std.testing.expect(book.get(untrusted) == null);
+    try std.testing.expect(book.get(trusted_replacement).?.explicitly_trusted);
+
+    book.remember(rejected_untrusted, &pubkey, address, false);
+    book.remember(rejected_trusted, &pubkey, address, true);
+    try std.testing.expect(book.get(rejected_untrusted) == null);
+    try std.testing.expect(book.get(rejected_trusted) == null);
+    try std.testing.expect(book.get(trusted).?.explicitly_trusted);
+    try std.testing.expect(book.get(trusted_replacement).?.explicitly_trusted);
+    try std.testing.expectEqual(@as(usize, 2), book.count());
+    const snapshot = book.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.replaced_total);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.capacity_rejected_total);
 }
 
 test "contact metrics count retention decisions exactly without mutating state" {
@@ -142,12 +184,15 @@ test "contact metrics count retention decisions exactly without mutating state" 
     try std.testing.expectEqual(first_snapshot, second_snapshot);
     try std.testing.expectEqual(@as(usize, 1), first_snapshot.count);
     try std.testing.expectEqual(@as(usize, 2), first_snapshot.capacity);
-    try std.testing.expectEqual(@as(u64, 2), first_snapshot.inserted_total);
+    try std.testing.expectEqual(@as(u64, 3), first_snapshot.inserted_total);
     try std.testing.expectEqual(@as(u64, 1), first_snapshot.updated_total);
-    try std.testing.expectEqual(@as(u64, 1), first_snapshot.capacity_rejected_total);
+    try std.testing.expectEqual(@as(u64, 1), first_snapshot.replaced_total);
+    try std.testing.expectEqual(@as(u64, 0), first_snapshot.capacity_rejected_total);
     try std.testing.expectEqual(@as(u64, 3), first_snapshot.policy_rejected_total);
     try std.testing.expectEqual(@as(u64, 1), first_snapshot.removed_total);
     try std.testing.expect(book.get(protected) != null);
+    try std.testing.expect(book.get(protected).?.explicitly_trusted);
+    try std.testing.expect(book.get(protected).?.addr.eql(&addr_a));
     try std.testing.expect(book.get(first) == null);
     try std.testing.expect(book.get(rejected) == null);
 }

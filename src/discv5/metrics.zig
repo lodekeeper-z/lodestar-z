@@ -100,6 +100,7 @@ pub const MetricsSnapshot = struct {
     /// Monotonic contact retention decisions.
     contact_inserted_total: u64 = 0,
     contact_updated_total: u64 = 0,
+    contact_replaced_total: u64 = 0,
     contact_capacity_rejected_total: u64 = 0,
     contact_policy_rejected_total: u64 = 0,
     contact_removed_total: u64 = 0,

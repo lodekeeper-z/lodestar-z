@@ -445,6 +445,7 @@ pub const Actor = struct {
             .contact_capacity = contacts.capacity,
             .contact_inserted_total = contacts.inserted_total,
             .contact_updated_total = contacts.updated_total,
+            .contact_replaced_total = contacts.replaced_total,
             .contact_capacity_rejected_total = contacts.capacity_rejected_total,
             .contact_policy_rejected_total = contacts.policy_rejected_total,
             .contact_removed_total = contacts.removed_total,

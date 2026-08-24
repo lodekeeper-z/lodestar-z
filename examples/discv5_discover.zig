@@ -413,12 +413,13 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
         },
     );
     try stdout.print(
-        "contacts: {d}/{d} retained, inserted={d} updated={d} capacity_rejected={d} policy_rejected={d} removed={d}\nsession_churn: capacity={d} inserted={d} rekeyed={d} capacity_reused={d} maintenance_expired={d} authenticated_refreshed={d} replay_rejected={d} nonce_exhaustion_rejected={d}\n",
+        "contacts: {d}/{d} retained, inserted={d} updated={d} replaced={d} capacity_rejected={d} policy_rejected={d} removed={d}\nsession_churn: capacity={d} inserted={d} rekeyed={d} capacity_reused={d} maintenance_expired={d} authenticated_refreshed={d} replay_rejected={d} nonce_exhaustion_rejected={d}\n",
         .{
             snapshot.contact_count,
             snapshot.contact_capacity,
             snapshot.contact_inserted_total,
             snapshot.contact_updated_total,
+            snapshot.contact_replaced_total,
             snapshot.contact_capacity_rejected_total,
             snapshot.contact_policy_rejected_total,
             snapshot.contact_removed_total,
