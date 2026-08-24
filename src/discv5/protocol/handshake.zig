@@ -7,9 +7,8 @@
 
 const std = @import("std");
 const enr_mod = @import("../enr.zig");
+const secp = @import("../secp256k1.zig");
 
-const Io = std.Io;
-const Address = Io.net.IpAddress;
 const NodeId = enr_mod.NodeId;
 
 /// id-signature size in handshake authdata (fixed for identity scheme "v4").
@@ -26,7 +25,6 @@ pub const Error = error{
     InvalidEnr,
     EnrMissingPubkey,
     EnrNodeIdMismatch,
-    EnrEndpointMismatch,
     BufferTooSmall,
 };
 
@@ -95,25 +93,6 @@ pub fn pubkeyFromEnr(enr_bytes: []const u8, src_id: NodeId) Error![eph_key_size]
     return pk;
 }
 
-/// Decode `enr_bytes` and confirm its advertised endpoint matches `observed`,
-/// unless `allow_unverified` is set. Identity is always verified.
-pub fn verifyEnrEndpoint(enr_bytes: []const u8, src_id: NodeId, observed: Address, allow_unverified: bool) Error!void {
-    const parsed = enr_mod.decode(enr_bytes) catch return Error.InvalidEnr;
-    const node_id = (parsed.nodeId() catch return Error.InvalidEnr) orelse return Error.EnrMissingPubkey;
-    if (!std.mem.eql(u8, &node_id, &src_id)) return Error.EnrNodeIdMismatch;
-    if (!endpointMatches(&parsed, observed) and !allow_unverified)
-        return Error.EnrEndpointMismatch;
-}
-
-/// True when an advertised endpoint matches `observed_addr`.
-fn endpointMatches(parsed: *const enr_mod.Enr, observed_addr: Address) bool {
-    const advertised = switch (observed_addr) {
-        .ip4 => parsed.udpAddress4(),
-        .ip6 => parsed.udpAddress6(),
-    } orelse return false;
-    return advertised.eql(&observed_addr);
-}
-
 test "parseAuthdata round-trips a built authdata header" {
     const node_id = [_]u8{0xAB} ** 32;
     var sig = [_]u8{0} ** sig_size;
@@ -161,25 +140,15 @@ test "parseAuthdata rejects non-v4 sizes" {
     try std.testing.expectError(Error.BadAuthdataSizes, parseAuthdata(&buf));
 }
 
-test "endpoint match applies shared UDP port to IPv6" {
-    const ip6 = [_]u8{0} ** 15 ++ .{1};
-    const parsed = enr_mod.Enr{
-        .seq = 1,
-        .pubkey = null,
-        .ip = null,
-        .udp = 9_000,
-        .tcp = null,
-        .ip6 = ip6,
-        .udp6 = null,
-        .tcp6 = null,
-        .quic = null,
-        .quic6 = null,
-        .eth2_fork_digest = null,
-        .eth2_raw = null,
-        .attnets = null,
-        .syncnets = null,
-        .custody_group_count = null,
-    };
+test "pubkeyFromEnr rejects a valid ENR for a different source id" {
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x6d} ** 32));
+    var builder = enr_mod.Builder.init(std.testing.allocator, key_pair, 1);
+    builder.ip = .{ 127, 0, 0, 1 };
+    builder.udp = 9_009;
+    const raw = try builder.encode();
+    defer std.testing.allocator.free(raw);
+    var wrong_src_id = try enr_mod.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    wrong_src_id[0] ^= 1;
 
-    try std.testing.expect(endpointMatches(&parsed, .{ .ip6 = .{ .bytes = ip6, .port = 9_000 } }));
+    try std.testing.expectError(Error.EnrNodeIdMismatch, pubkeyFromEnr(raw, wrong_src_id));
 }

@@ -56,7 +56,6 @@ pub const Config = struct {
     challenge_timeout_ms: u64 = 2_000,
     response_recovery_timeout_ms: u64 = 2_000,
     whoareyou_rate_ttl_ms: u64 = 60_000,
-    allow_unverified_sessions: bool = false,
     bucket_pending_timeout_ms: u64 = kbucket.BUCKET_PENDING_TIMEOUT_MS,
     lookup_num_results: usize = lookup.MAX_RESULTS,
     lookup_parallelism: usize = 3,

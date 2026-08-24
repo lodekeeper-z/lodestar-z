@@ -367,8 +367,10 @@ pub const PeerBook = struct {
         if (self.contacts.get(entry.node_id)) |contact| {
             if (contact.explicitly_trusted and contact.addr.eql(&entry.addr) and std.mem.eql(u8, &contact.pubkey, &entry.pubkey)) {
                 entry.runtime_contact_trusted = true;
-                entry.advertised_endpoint_trusted = true;
-                entry.raw_enr_relay_eligible = true;
+                if (entryAdvertisesAddress(&entry, contact.addr)) {
+                    entry.advertised_endpoint_trusted = true;
+                    entry.raw_enr_relay_eligible = true;
+                }
             }
         }
         if (self.routing.getEntryWithPending(&entry.node_id)) |existing| {
@@ -388,7 +390,7 @@ pub const PeerBook = struct {
                 return .{ .inserted = self.routing.getEntry(&entry.node_id) != null };
             }
             const runtime_endpoint_unchanged = existing.addr.eql(&entry.addr);
-            const advertised_endpoint_unchanged = entryAdvertisesAddress(existing, entry.addr);
+            const advertised_endpoint_unchanged = sameAdvertisedEndpoints(existing, &entry);
             if (existing.runtime_contact_trusted and !runtime_endpoint_unchanged and !entry.runtime_contact_trusted) {
                 self.rememberContact(existing.node_id, &existing.pubkey, existing.addr, true);
                 if (!self.trustedContactRetained(existing.node_id, &existing.pubkey, existing.addr)) {
@@ -443,6 +445,17 @@ pub const PeerBook = struct {
 
     fn entryAdvertisesAddress(entry: *const kbucket.Entry, address: types.Address) bool {
         return entry.advertisesAddress(address);
+    }
+
+    fn sameAdvertisedEndpoints(a: *const kbucket.Entry, b: *const kbucket.Entry) bool {
+        return optionalAddressEql(a.advertised_addr4, b.advertised_addr4) and
+            optionalAddressEql(a.advertised_addr6, b.advertised_addr6);
+    }
+
+    fn optionalAddressEql(a: ?types.Address, b: ?types.Address) bool {
+        const left = a orelse return b == null;
+        const right = b orelse return false;
+        return left.eql(&right);
     }
 
     fn trustedRepresentationRetained(self: *const PeerBook, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address) bool {

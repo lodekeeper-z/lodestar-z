@@ -268,22 +268,15 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
     const now_ns = outbound.nowNs(env.io);
     const challenge = actor.sessions.peekChallenge(endpoint, now_ns) orelse return;
     const known = actor.peers.known(&endpoint.node_id);
+    const supplied_enr_pubkey = if (authdata.maybe_enr) |raw|
+        handshake.pubkeyFromEnr(raw, endpoint.node_id) catch return
+    else
+        null;
     const sender_pubkey = if (known) |value|
         value.pubkey
-    else blk: {
-        const raw = authdata.maybe_enr orelse return;
-        break :blk handshake.pubkeyFromEnr(raw, endpoint.node_id) catch return;
-    };
-    var endpoint_verified = false;
-    if (authdata.maybe_enr) |raw| {
-        handshake.verifyEnrEndpoint(raw, endpoint.node_id, from, actor.allow_unverified_sessions) catch return;
-        endpoint_verified = !actor.allow_unverified_sessions;
-    } else if (challenge.remote_enr) |*raw| {
-        handshake.verifyEnrEndpoint(raw.slice(), endpoint.node_id, from, actor.allow_unverified_sessions) catch return;
-        endpoint_verified = !actor.allow_unverified_sessions;
-    }
-    const runtime_contact_trusted = if (known) |value| value.runtime_contact_trusted and value.addr.eql(&from) else false;
-    if (!actor.allow_unverified_sessions and !endpoint_verified and !runtime_contact_trusted) return;
+    else
+        supplied_enr_pubkey orelse return;
+    if (supplied_enr_pubkey) |value| if (!std.mem.eql(u8, &value, &sender_pubkey)) return;
     session_crypto.verifyIdSignature(
         authdata.id_sig,
         &sender_pubkey,

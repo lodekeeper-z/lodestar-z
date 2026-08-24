@@ -72,7 +72,6 @@ pub const Actor = struct {
     lookup_count: u64 = 0,
     request_timeout_ms: u64,
     request_retries: u32,
-    allow_unverified_sessions: bool,
     bucket_pending_timeout_ms: u64,
     lookup_config: lookup_mod.Config,
     ping_interval_ms: u64,
@@ -117,7 +116,6 @@ pub const Actor = struct {
             .limits = config.limits,
             .request_timeout_ms = config.request_timeout_ms,
             .request_retries = config.request_retries,
-            .allow_unverified_sessions = config.allow_unverified_sessions,
             .bucket_pending_timeout_ms = config.bucket_pending_timeout_ms,
             .lookup_config = .{
                 .num_results = config.lookup_num_results,
