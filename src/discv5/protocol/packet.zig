@@ -22,15 +22,12 @@ pub const GCM_TAG_SIZE = 16;
 pub const ID_NONCE_SIZE = 16;
 pub const WHOAREYOU_AUTHDATA_SIZE = ID_NONCE_SIZE + 8;
 pub const WHOAREYOU_CHALLENGE_DATA_SIZE = MASKING_IV_SIZE + STATIC_HEADER_SIZE + WHOAREYOU_AUTHDATA_SIZE;
+pub const MAX_ORDINARY_MESSAGE_SIZE = MAX_PACKET_SIZE - MASKING_IV_SIZE - STATIC_HEADER_SIZE - NODE_ID_SIZE - GCM_TAG_SIZE;
 
 /// Whether an ordinary packet with fixed NodeId authdata fits the wire limit.
 /// Layout: masking IV || static header || NodeId authdata || plaintext || GCM tag.
 pub fn ordinaryMessageFits(plaintext_len: usize) bool {
-    var total = std.math.add(usize, MASKING_IV_SIZE, STATIC_HEADER_SIZE) catch return false;
-    total = std.math.add(usize, total, NODE_ID_SIZE) catch return false;
-    total = std.math.add(usize, total, plaintext_len) catch return false;
-    total = std.math.add(usize, total, GCM_TAG_SIZE) catch return false;
-    return total <= MAX_PACKET_SIZE;
+    return plaintext_len <= MAX_ORDINARY_MESSAGE_SIZE;
 }
 
 pub const Error = error{

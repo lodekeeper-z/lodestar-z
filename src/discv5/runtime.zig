@@ -109,7 +109,7 @@ const RuntimeImpl = struct {
     const SendFindNode = struct {
         endpoint: types.Endpoint,
         pubkey: [33]u8,
-        distances: [127]u16,
+        distances: [types.MAX_OUTBOUND_FINDNODE_DISTANCES]u16,
         distances_len: u8,
         origin: types.RequestOrigin,
         reply: *FindNodeReply,
@@ -928,14 +928,14 @@ pub const Runtime = opaque {
     pub fn sendFindNode(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, distances: []const u16) runtime_error.FindNodeError!message.ReqId {
         const storage = impl(self);
         try storage.ensureRunning();
-        if (distances.len > 127) return error.TooManyDistances;
+        if (distances.len > types.MAX_OUTBOUND_FINDNODE_DISTANCES) return error.TooManyDistances;
         for (distances) |distance| {
             if (distance > 256) return error.InvalidDistance;
         }
         if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
         var reservation_transferred = false;
         errdefer if (!reservation_transferred) storage.request_result_outbox.cancelUnclaimed();
-        var copied: [127]u16 = undefined;
+        var copied: [types.MAX_OUTBOUND_FINDNODE_DISTANCES]u16 = undefined;
         @memcpy(copied[0..distances.len], distances);
         var buffer: [1]RuntimeImpl.FindNodeResult = undefined;
         var reply = RuntimeImpl.FindNodeReply.init(&buffer);

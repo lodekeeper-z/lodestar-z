@@ -5,6 +5,7 @@ const enr = @import("../enr.zig");
 const kbucket = @import("../kbucket.zig");
 const lookup_mod = @import("../service/lookup.zig");
 const message = @import("../protocol/message.zig");
+const metrics = @import("../metrics.zig");
 const outbound = @import("../flow/outbound.zig");
 const packet = @import("../protocol/packet.zig");
 const peer_book = @import("../state/peer_book.zig");
@@ -14,6 +15,77 @@ const secp = @import("../secp256k1.zig");
 const session_book = @import("../state/session_book.zig");
 const types = @import("../types.zig");
 const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
+
+test "authenticated 128-distance FINDNODE crosses packet ingress and returns NODES" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xa1} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xa2} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9002 } },
+    };
+    var harness = try ActorHarness.init(alloc, io, testConfig(local_key, local_id, 4));
+    defer harness.deinit();
+    const actor = &harness.actor;
+    try std.testing.expect(actor.addNode(endpoint.node_id, &remote_pubkey, endpoint.addr, null, 0));
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xb1} ** 16,
+        .recipient_key = [_]u8{0xb2} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+
+    const distances = [_]u16{1} ** 128;
+    const req_id = try message.ReqId.fromSlice(&.{0x01});
+    const request = message.FindNode{ .req_id = req_id, .distances = &distances };
+    var plaintext_buffer: [message.MAX_ENCODED_SIZE]u8 = undefined;
+    const plaintext = try request.encodeInto(&plaintext_buffer);
+    const nonce = [_]u8{0xc1} ** packet.NONCE_SIZE;
+    const masking_iv = [_]u8{0xc2} ** packet.MASKING_IV_SIZE;
+    var packet_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const datagram = try packet.encodeMessagePacketInto(&packet_buffer, .{
+        .kind = .ordinary,
+        .masking_iv = &masking_iv,
+        .recipient_node_id = &actor.local_node_id,
+        .nonce = &nonce,
+        .authdata = &endpoint.node_id,
+        .write_key = &stable.recipient_key,
+        .plaintext = plaintext,
+    });
+    actor.handlePacket(harness.env(), datagram, endpoint.addr);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    try std.testing.expect(harness.recording.datagrams.items[0].address.eql(&endpoint.addr));
+    try std.testing.expectEqual(@as(u64, 1), actor.metrics.rcvd_message_count[metrics.MessageType.findnode.index()]);
+    try std.testing.expectEqual(@as(u64, 1), actor.metrics.sent_message_count[metrics.MessageType.nodes.index()]);
+    const session_metrics = actor.sessions.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), session_metrics.count);
+    try std.testing.expectEqual(@as(u64, 1), session_metrics.authenticated_refreshed_total);
+    try std.testing.expect(actor.sessions.peekPtr(endpoint, outbound.nowNs(io)).?.seen_nonces.contains(&nonce));
+
+    var response_bytes = harness.recording.datagrams.items[0].bytes;
+    const parsed = try packet.decode(response_bytes.bytes[0..response_bytes.len], &endpoint.node_id);
+    try std.testing.expectEqual(packet.FLAG_MESSAGE, parsed.static_header.flag);
+    try std.testing.expectEqualSlices(u8, &actor.local_node_id, parsed.authdata_raw);
+    var response_plaintext_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    var response_ad_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const response_plaintext = try packet.decryptMessageInto(
+        &response_plaintext_buffer,
+        &response_ad_buffer,
+        &stable.initiator_key,
+        &parsed.static_header.nonce,
+        parsed.message_ciphertext,
+        &parsed.masking_iv,
+        parsed.header_raw,
+    );
+    var enr_buffer: [1][]const u8 = undefined;
+    const nodes = try message.Nodes.decodeInto(response_plaintext, &enr_buffer);
+    try std.testing.expectEqualSlices(u8, req_id.slice(), nodes.req_id.slice());
+    try std.testing.expectEqual(@as(u64, 1), nodes.total);
+    try std.testing.expectEqual(@as(usize, 0), nodes.enrs.len);
+}
 
 test "validated NODES ENR preserves fields and enabled address selection" {
     const alloc = std.testing.allocator;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const message = @import("message.zig");
+const packet = @import("packet.zig");
 const rlp = @import("../rlp.zig");
 
 const Error = message.Error;
@@ -76,6 +77,149 @@ test "discv5 messages: FINDNODE encode/decode" {
     defer alloc.free(result.distances);
     try std.testing.expectEqual(@as(usize, 3), result.distances.len);
     try std.testing.expectEqual(@as(u16, 256), result.distances[0]);
+}
+
+test "discv5 messages: fitting 128-distance FINDNODE round-trips through public codecs" {
+    const alloc = std.testing.allocator;
+    const distances = [_]u16{1} ** 128;
+    const msg = FindNode{
+        .req_id = try ReqId.fromSlice(&.{0x01}),
+        .distances = &distances,
+    };
+
+    const encoded = try msg.encode(alloc);
+    defer alloc.free(encoded);
+
+    const decoded = try FindNode.decode(alloc, encoded);
+    defer alloc.free(decoded.distances);
+    try std.testing.expectEqualSlices(u16, &distances, decoded.msg.distances);
+
+    var distances_out: [128]u16 = undefined;
+    const decoded_into = try FindNode.decodeInto(encoded, &distances_out);
+    try std.testing.expectEqualSlices(u16, &distances, decoded_into.distances);
+}
+
+fn encodeFindNodeWireUnchecked(out: []u8, distances: []const u16) ![]const u8 {
+    out[0] = message.MSG_FINDNODE;
+    var writer = rlp.Writer.initBuffer(out[1..]);
+    const message_start = try writer.beginListBounded();
+    try writer.writeBytesBounded(&.{});
+    const distances_start = try writer.beginListBounded();
+    for (distances) |distance| try writer.writeUint64Bounded(distance);
+    try writer.finishList(distances_start);
+    try writer.finishList(message_start);
+    return out[0 .. 1 + writer.bytes().len];
+}
+
+test "discv5 messages: FINDNODE rejects distance 257 through public codecs" {
+    const alloc = std.testing.allocator;
+    const invalid = FindNode{
+        .req_id = try ReqId.fromSlice(&.{}),
+        .distances = &.{257},
+    };
+    var encoded_buffer: [message.MAX_ENCODED_SIZE]u8 = undefined;
+    try std.testing.expectError(Error.InvalidMessage, invalid.encode(alloc));
+    try std.testing.expectError(Error.InvalidMessage, invalid.encodeInto(&encoded_buffer));
+
+    const encoded = try encodeFindNodeWireUnchecked(&encoded_buffer, &.{257});
+    var no_allocation_storage: [0]u8 = .{};
+    var no_allocation = std.heap.FixedBufferAllocator.init(&no_allocation_storage);
+    try std.testing.expectError(Error.InvalidMessage, FindNode.decode(no_allocation.allocator(), encoded));
+    var distance_out: [1]u16 = undefined;
+    try std.testing.expectError(Error.InvalidMessage, FindNode.decodeInto(encoded, &distance_out));
+}
+
+test "discv5 messages: FINDNODE decodeInto validates a later invalid distance before output capacity" {
+    var encoded_buffer: [message.MAX_ENCODED_SIZE]u8 = undefined;
+    const encoded = try encodeFindNodeWireUnchecked(&encoded_buffer, &.{ 1, 257 });
+    var storage = [_]u16{0xa5a5};
+    const unchanged = storage;
+
+    try std.testing.expectError(Error.InvalidMessage, FindNode.decodeInto(encoded, storage[0..0]));
+    try std.testing.expectEqualSlices(u16, &unchanged, &storage);
+    try std.testing.expectError(Error.InvalidMessage, FindNode.decodeInto(encoded, storage[0..1]));
+    try std.testing.expectEqualSlices(u16, &unchanged, &storage);
+}
+
+test "discv5 messages: FINDNODE decodeInto validates later noncanonical RLP before output capacity" {
+    const encoded = [_]u8{
+        message.MSG_FINDNODE,
+        0xc5, // [request-id, distances]
+        0x80, // empty request ID
+        0xc3, // two distance items occupy three bytes
+        0x01,
+        0x81, 0x02, // noncanonical encoding of the single byte 0x02
+    };
+    var storage = [_]u16{0xa5a5};
+    const unchanged = storage;
+
+    try std.testing.expectError(Error.InvalidEncoding, FindNode.decodeInto(&encoded, storage[0..0]));
+    try std.testing.expectEqualSlices(u16, &unchanged, &storage);
+    try std.testing.expectError(Error.InvalidEncoding, FindNode.decodeInto(&encoded, storage[0..1]));
+    try std.testing.expectEqualSlices(u16, &unchanged, &storage);
+}
+
+test "discv5 messages: FINDNODE decodeInto valid input is failure-atomic when output is undersized" {
+    var encoded_buffer: [message.MAX_ENCODED_SIZE]u8 = undefined;
+    const encoded = try encodeFindNodeWireUnchecked(&encoded_buffer, &.{ 1, 2 });
+    var storage = [_]u16{0xa5a5};
+    const unchanged = storage;
+
+    try std.testing.expectError(Error.BufferTooSmall, FindNode.decodeInto(encoded, &storage));
+    try std.testing.expectEqualSlices(u16, &unchanged, &storage);
+}
+
+test "discv5 messages: FINDNODE encodeInto reports undersized output buffers" {
+    const request = FindNode{
+        .req_id = try ReqId.fromSlice(&.{0x01}),
+        .distances = &.{ 1, 2 },
+    };
+    var storage = [_]u8{0xa5} ** 6;
+
+    try std.testing.expectError(Error.BufferTooSmall, request.encodeInto(storage[0..0]));
+    try std.testing.expectError(Error.BufferTooSmall, request.encodeInto(&storage));
+}
+
+test "discv5 messages: FINDNODE wire cardinality accepts 1185 and rejects 1186" {
+    const alloc = std.testing.allocator;
+    const maximum = [_]u16{0} ** 1185;
+    const accepted = FindNode{
+        .req_id = try ReqId.fromSlice(&.{}),
+        .distances = &maximum,
+    };
+
+    const encoded = try accepted.encode(alloc);
+    defer alloc.free(encoded);
+    const max_ordinary_plaintext = packet.MAX_PACKET_SIZE - packet.MASKING_IV_SIZE - packet.STATIC_HEADER_SIZE - packet.NODE_ID_SIZE - packet.GCM_TAG_SIZE;
+    try std.testing.expectEqual(max_ordinary_plaintext, encoded.len);
+
+    var encoded_into_buffer: [message.MAX_ENCODED_SIZE]u8 = undefined;
+    const encoded_into = try accepted.encodeInto(&encoded_into_buffer);
+    try std.testing.expectEqualSlices(u8, encoded, encoded_into);
+
+    const decoded = try FindNode.decode(alloc, encoded);
+    defer alloc.free(decoded.distances);
+    try std.testing.expectEqualSlices(u16, &maximum, decoded.distances);
+
+    var maximum_out: [1185]u16 = undefined;
+    const decoded_into = try FindNode.decodeInto(encoded, &maximum_out);
+    try std.testing.expectEqualSlices(u16, &maximum, decoded_into.distances);
+
+    const excessive = [_]u16{0} ** 1186;
+    const rejected = FindNode{
+        .req_id = try ReqId.fromSlice(&.{}),
+        .distances = &excessive,
+    };
+    try std.testing.expectError(Error.InvalidMessage, rejected.encode(alloc));
+    try std.testing.expectError(Error.InvalidMessage, rejected.encodeInto(&encoded_into_buffer));
+
+    var oversized_buffer: [message.MAX_ENCODED_SIZE + 1]u8 = undefined;
+    const oversized = try encodeFindNodeWireUnchecked(&oversized_buffer, &excessive);
+    var no_allocation_storage: [0]u8 = .{};
+    var no_allocation = std.heap.FixedBufferAllocator.init(&no_allocation_storage);
+    try std.testing.expectError(Error.InvalidMessage, FindNode.decode(no_allocation.allocator(), oversized));
+    var excessive_out: [1186]u16 = undefined;
+    try std.testing.expectError(Error.InvalidMessage, FindNode.decodeInto(oversized, &excessive_out));
 }
 
 test "discv5 messages: TALKREQ encode/decode" {

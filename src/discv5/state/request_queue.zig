@@ -40,7 +40,7 @@ pub const QueuedRequest = struct {
         plaintext: []const u8,
         deadline_ns: i64,
     ) !QueuedRequest {
-        if (distances.len > 127) return error.TooManyDistances;
+        if (distances.len > types.MAX_OUTBOUND_FINDNODE_DISTANCES) return error.TooManyDistances;
         return .{
             .origin = origin,
             .endpoint = endpoint,

@@ -3,6 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rlp = @import("../rlp.zig");
+const packet = @import("packet.zig");
 
 pub const MSG_PING: u8 = 0x01;
 pub const MSG_PONG: u8 = 0x02;
@@ -12,6 +13,15 @@ pub const MSG_TALKREQ: u8 = 0x05;
 pub const MSG_TALKRESP: u8 = 0x06;
 
 pub const MAX_ENCODED_SIZE: usize = 1280;
+
+/// A FINDNODE request is carried in an ordinary packet. The wire specification
+/// caps that packet at 1280 bytes, leaving `MAX_ORDINARY_MESSAGE_SIZE` bytes
+/// after the masking IV, static header, NodeId authdata, and GCM tag. At the
+/// maximum cardinality, zero is the smallest valid RLP integer (one byte), and
+/// the message type, empty request ID, and two three-byte long-list prefixes
+/// consume eight bytes. The specification does not require unique distances,
+/// so packet capacity, rather than the 257-value distance domain, sets the cap.
+pub const MAX_FINDNODE_DISTANCES: usize = packet.MAX_ORDINARY_MESSAGE_SIZE - 8;
 
 pub const Error = error{
     InvalidMessage,
@@ -159,6 +169,7 @@ pub const FindNode = struct {
     }
 
     pub fn encodeInto(self: *const FindNode, out: []u8) Error![]u8 {
+        if (self.distances.len > MAX_FINDNODE_DISTANCES) return Error.InvalidMessage;
         for (self.distances) |distance| {
             if (distance > 256) return Error.InvalidMessage;
         }
@@ -173,36 +184,71 @@ pub const FindNode = struct {
         try w.finishList(dist_start);
         try w.finishList(list_start);
         const rlp_bytes = w.bytes();
+        if (!packet.ordinaryMessageFits(1 + rlp_bytes.len)) return Error.InvalidMessage;
         out[0] = MSG_FINDNODE;
         return out[0 .. 1 + rlp_bytes.len];
     }
 
-    pub fn decode(alloc: Allocator, data: []const u8) Error!struct { msg: FindNode, distances: []u16 } {
-        var stack_distances: [127]u16 = undefined;
-        const msg = try decodeInto(data, &stack_distances);
-        const dist_slice = try alloc.dupe(u16, msg.distances);
-        return .{
-            .msg = FindNode{ .req_id = msg.req_id, .distances = dist_slice },
-            .distances = dist_slice,
-        };
-    }
+    const Validated = struct {
+        req_id: ReqId,
+        encoded_distances: rlp.Reader,
+        distances_len: usize,
+    };
 
-    pub fn decodeInto(data: []const u8, distances_out: []u16) Error!FindNode {
+    /// Validate the complete message and retain a reader over the already
+    /// validated distance list. Publication can then be infallible and is only
+    /// attempted after the caller's output capacity is known to be sufficient.
+    fn validate(data: []const u8) Error!Validated {
+        if (data.len > packet.MAX_ORDINARY_MESSAGE_SIZE) return Error.InvalidMessage;
         var list = try readMessageList(data, MSG_FINDNODE);
         const req_id_bytes = list.readBytes() catch return Error.InvalidEncoding;
         const req_id = try ReqId.fromSlice(req_id_bytes);
 
         var dist_list = list.readList() catch return Error.InvalidEncoding;
+        const encoded_distances = dist_list;
         var distances_len: usize = 0;
         while (!dist_list.atEnd()) {
-            const d = dist_list.readUint64() catch return Error.InvalidEncoding;
-            if (d > 256) return Error.InvalidMessage;
-            if (distances_len >= distances_out.len) return Error.BufferTooSmall;
-            distances_out[distances_len] = @intCast(d);
+            const distance = dist_list.readUint64() catch return Error.InvalidEncoding;
+            if (distance > 256) return Error.InvalidMessage;
+            if (distances_len == MAX_FINDNODE_DISTANCES) return Error.InvalidMessage;
             distances_len += 1;
         }
         try expectEnd(&list);
-        return FindNode{ .req_id = req_id, .distances = distances_out[0..distances_len] };
+        return .{
+            .req_id = req_id,
+            .encoded_distances = encoded_distances,
+            .distances_len = distances_len,
+        };
+    }
+
+    fn publish(validated: Validated, distances_out: []u16) FindNode {
+        std.debug.assert(distances_out.len >= validated.distances_len);
+        var dist_list = validated.encoded_distances;
+        for (distances_out[0..validated.distances_len]) |*distance| {
+            const value = dist_list.readUint64() catch unreachable;
+            std.debug.assert(value <= 256);
+            distance.* = @intCast(value);
+        }
+        std.debug.assert(dist_list.atEnd());
+        return .{
+            .req_id = validated.req_id,
+            .distances = distances_out[0..validated.distances_len],
+        };
+    }
+
+    pub fn decode(alloc: Allocator, data: []const u8) Error!struct { msg: FindNode, distances: []u16 } {
+        const validated = try validate(data);
+        const distances = try alloc.alloc(u16, validated.distances_len);
+        return .{
+            .msg = publish(validated, distances),
+            .distances = distances,
+        };
+    }
+
+    pub fn decodeInto(data: []const u8, distances_out: []u16) Error!FindNode {
+        const validated = try validate(data);
+        if (distances_out.len < validated.distances_len) return Error.BufferTooSmall;
+        return publish(validated, distances_out);
     }
 };
 

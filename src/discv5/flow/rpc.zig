@@ -91,7 +91,9 @@ fn handlePong(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.En
 }
 
 fn handleFindNode(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
-    var distance_buffer: [127]u16 = undefined;
+    // Public wire decoding accepts the full packet-derived cardinality. The
+    // smaller outbound actor/runtime policy does not apply to remote requests.
+    var distance_buffer: [message.MAX_FINDNODE_DISTANCES]u16 = undefined;
     const findnode = message.FindNode.decodeInto(plaintext, &distance_buffer) catch return;
     noteReceived(actor, plaintext);
     var seen = [_]bool{false} ** 257;

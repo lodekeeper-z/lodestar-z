@@ -1,4 +1,8 @@
 const std = @import("std");
+
+/// Local outbound request policy. This bounds runtime command copies, queued
+/// request work, and lookup fanout independently of the larger wire-codec cap.
+pub const MAX_OUTBOUND_FINDNODE_DISTANCES: usize = 127;
 const enr = @import("enr.zig");
 const message = @import("protocol/message.zig");
 const packet = @import("protocol/packet.zig");

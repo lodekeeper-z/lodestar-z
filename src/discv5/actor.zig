@@ -167,7 +167,7 @@ pub const Actor = struct {
         distances: []const u16,
         origin: types.RequestOrigin,
     ) !message.ReqId {
-        if (distances.len > 127) return error.TooManyDistances;
+        if (distances.len > types.MAX_OUTBOUND_FINDNODE_DISTANCES) return error.TooManyDistances;
         for (distances) |distance| {
             if (distance > 256) return error.InvalidDistance;
         }
@@ -582,7 +582,7 @@ pub const Actor = struct {
                 break :blk .{ .peer_id = peer_id, .target = lookup.target };
             };
             const peer_id = attempt.peer_id;
-            var distances: [127]u16 = undefined;
+            var distances: [types.MAX_OUTBOUND_FINDNODE_DISTANCES]u16 = undefined;
             const count = lookup_mod.findNodeLogDistances(&attempt.target, &peer_id, @min(self.lookup_config.request_limit, distances.len), &distances);
             const send_result = blk: {
                 const lookup = self.lookups.getPtr(id) orelse return;
