@@ -334,9 +334,13 @@ pub const Actor = struct {
         switch (origin) {
             .lookup => self.onRequestCompletion(env, key, origin, false, &.{}),
             .maintenance => |reason| switch (reason) {
-                .health, .eviction => _ = self.peers.cancelHealthRequest(key),
+                .health => _ = self.peers.cancelHealthRequest(key),
                 .enr_refresh => {},
             },
+            .eviction => |generation| _ = self.peers.cancelEvictionRequest(.{
+                .incumbent_id = key.endpoint.node_id,
+                .generation = generation,
+            }, key),
             .api, .reliable_api, .detached_lookup => {},
         }
     }
@@ -350,7 +354,14 @@ pub const Actor = struct {
         closer: []const lookup_mod.Candidate,
     ) void {
         if (success) {
-            const responsive = self.peers.markResponsive(key.endpoint.node_id, key.endpoint.addr, outbound.nowNs(env.io), key);
+            const now_ns = outbound.nowNs(env.io);
+            const responsive = switch (origin) {
+                .eviction => |generation| self.peers.markEvictionResponsive(.{
+                    .incumbent_id = key.endpoint.node_id,
+                    .generation = generation,
+                }, key, now_ns),
+                else => self.peers.markResponsive(key.endpoint.node_id, key.endpoint.addr, now_ns, key),
+            };
             self.publishConnection(env.outbox, key.endpoint.node_id, responsive.transition);
         }
         switch (origin) {
@@ -362,18 +373,18 @@ pub const Actor = struct {
             },
             .maintenance => |reason| switch (reason) {
                 .health => if (!success) self.publishConnection(env.outbox, key.endpoint.node_id, self.peers.markDisconnected(key, outbound.nowNs(env.io))),
-                .eviction => if (success) {
-                    // Exact-candidate result: the probed incumbent answered,
-                    // so the bucket keeps it and drops the pending newcomer.
-                    self.peers.resolveEvictionSuccess(&key.endpoint.node_id);
-                } else {
-                    // Exact-candidate result: the probe timed out, so the
-                    // unresponsive candidate is removed and the pending
-                    // replacement resolves immediately.
-                    if (self.peers.completeEvictionTimeout(key)) |event|
-                        self.publishConnection(env.outbox, event.node_id, event.transition);
-                },
                 .enr_refresh => {},
+            },
+            .eviction => |generation| {
+                const ticket = kbucket.EvictionTicket{
+                    .incumbent_id = key.endpoint.node_id,
+                    .generation = generation,
+                };
+                if (success) {
+                    _ = self.peers.resolveEvictionSuccess(ticket, key);
+                } else if (self.peers.completeEvictionTimeout(ticket, key)) |event| {
+                    self.publishConnection(env.outbox, event.node_id, event.transition);
+                }
             },
             .api, .reliable_api => {},
             .detached_lookup => {},
@@ -520,14 +531,21 @@ pub const Actor = struct {
         self.pingAll(env);
     }
 
-    pub fn probeEviction(self: *Actor, env: Env, candidate: kbucket.Entry) void {
-        if (candidate.health_request != null) return;
-        const known = self.peers.known(&candidate.node_id) orelse return;
-        const endpoint = types.Endpoint{ .node_id = known.node_id, .addr = candidate.addr };
-        // The genuine full-bucket candidate is normally disconnected, so the
-        // reservation policy must admit it; the send failure path rolls the
-        // reservation back inside sendProbe.
-        _ = self.sendProbe(env, endpoint, &known.pubkey, .eviction, .allow_eviction_candidate) catch return;
+    pub fn probeEviction(self: *Actor, env: Env, probe: kbucket.EvictionProbe) void {
+        self.sendEvictionProbe(env, probe) catch return;
+    }
+
+    fn sendEvictionProbe(self: *Actor, env: Env, probe: kbucket.EvictionProbe) !void {
+        if (probe.entry.health_request != null) return error.ProbeUnavailable;
+        const known = self.peers.known(&probe.entry.node_id) orelse return error.ProbeUnavailable;
+        const endpoint = types.Endpoint{ .node_id = known.node_id, .addr = probe.entry.addr };
+        const req_id = randomReqId(env.io);
+        const key = types.RequestKey.init(endpoint, req_id);
+        if (!self.peers.armHealthRequest(key, .{ .allow_eviction_candidate = probe.ticket })) return error.ProbeUnavailable;
+        errdefer _ = self.peers.cancelEvictionRequest(probe.ticket, key);
+        const ping = message.Ping{ .req_id = req_id, .enr_seq = self.local.seq };
+        var buffer: [128]u8 = undefined;
+        try outbound.sendTracked(self, env, endpoint, &known.pubkey, req_id, .ping, &.{}, try ping.encodeInto(&buffer), .{ .eviction = probe.ticket.generation });
     }
 
     /// Pre-send reservation transaction for health/eviction liveness probes:
@@ -542,7 +560,7 @@ pub const Actor = struct {
         reason: types.MaintenanceReason,
         policy: peer_book.PeerBook.HealthReservationPolicy,
     ) !message.ReqId {
-        std.debug.assert(reason == .health or reason == .eviction);
+        std.debug.assert(reason == .health);
         const req_id = randomReqId(env.io);
         const key = types.RequestKey.init(endpoint, req_id);
         if (!self.peers.armHealthRequest(key, policy)) return error.ProbeUnavailable;

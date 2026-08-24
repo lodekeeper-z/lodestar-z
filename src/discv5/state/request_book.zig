@@ -267,9 +267,10 @@ pub const RequestBook = struct {
     pub fn queue(self: *RequestBook, request: QueuedRequest) !void {
         switch (request.origin) {
             .maintenance => |reason| switch (reason) {
-                .health, .eviction => return error.EndpointBusy,
+                .health => return error.EndpointBusy,
                 .enr_refresh => {},
             },
+            .eviction => return error.EndpointBusy,
             .api, .reliable_api, .lookup, .detached_lookup => {},
         }
         const key = types.RequestKey.init(request.endpoint, request.req_id);

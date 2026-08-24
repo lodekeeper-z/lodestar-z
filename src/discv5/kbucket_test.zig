@@ -7,6 +7,8 @@ const EntryStatus = kbucket.EntryStatus;
 const K = kbucket.K;
 const KBucket = kbucket.KBucket;
 const NodeId = @import("enr.zig").NodeId;
+const message = @import("protocol/message.zig");
+const types = @import("types.zig");
 const RoutingTable = kbucket.RoutingTable;
 const logDistance = kbucket.logDistance;
 
@@ -218,7 +220,7 @@ test "kbucket: refreshing the pending node preserves the original eviction deadl
     try std.testing.expectEqual(t0 + timeout_ns + 1, bucket.pending.?.inserted_at_ns);
 }
 
-test "kbucket: reconnecting oldest entry clears pending replacement" {
+test "kbucket: ticketed incumbent liveness clears pending replacement" {
     var bucket = KBucket.init();
 
     for (0..K) |i| {
@@ -233,22 +235,70 @@ test "kbucket: reconnecting oldest entry clears pending replacement" {
     }
 
     const pending_id: NodeId = [_]u8{0xaa} ** 32;
-    try std.testing.expect(!bucket.insert(.{
+    const outcome = bucket.insertDetailed(.{
         .node_id = pending_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 1 } },
         .last_seen = 100,
         .status = .connected,
-    }));
-    try std.testing.expect(bucket.pending != null);
+    });
+    try std.testing.expect(!outcome.inserted);
+    const probe = outcome.pending_eviction orelse return error.MissingEvictionProbe;
 
     const oldest_id = bucket.entries[0].node_id;
+    const key = types.RequestKey.init(
+        .{ .node_id = oldest_id, .addr = bucket.entries[0].addr },
+        try message.ReqId.fromSlice(&.{1}),
+    );
+    try std.testing.expect(bucket.bindPendingRequest(probe.ticket, key));
     try std.testing.expect(bucket.insert(.{
         .node_id = oldest_id,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 3 }, .port = 2 } },
+        .addr = key.endpoint.addr,
         .last_seen = 101,
         .status = .connected,
     }));
+    try std.testing.expect(bucket.resolvePending(probe.ticket, key));
 
     try std.testing.expect(bucket.pending == null);
     try std.testing.expectEqual(EntryStatus.connected, bucket.entries[K - 1].status);
+}
+
+test "kbucket: pending expiry evicts the exact incumbent after reordering" {
+    var bucket = KBucket.init();
+
+    for (0..K) |i| {
+        var node_id: NodeId = [_]u8{0} ** 32;
+        node_id[31] = @intCast(i);
+        try std.testing.expect(bucket.insert(.{
+            .node_id = node_id,
+            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = @intCast(i) } },
+            .last_seen = @intCast(i),
+            .status = .disconnected,
+        }));
+    }
+
+    const incumbent_id = bucket.entries[0].node_id;
+    const newcomer_id = [_]u8{0xff} ** 32;
+    const inserted_at_ns: i64 = 1_000;
+    const outcome = bucket.insertDetailed(.{
+        .node_id = newcomer_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9_000 } },
+        .last_seen = inserted_at_ns,
+        .status = .connected,
+    });
+    try std.testing.expect(!outcome.inserted);
+    try std.testing.expectEqualDeep(incumbent_id, outcome.pending_eviction.?.entry.node_id);
+
+    // Metadata refresh reorders the probed incumbent behind another
+    // disconnected peer. Expiry must still remove the peer selected when the
+    // replacement ticket was created, never the new entries[0].
+    var reordered = bucket.get(&incumbent_id).?.*;
+    reordered.last_seen += 1;
+    try std.testing.expect(bucket.insert(reordered));
+    const unprobed_oldest_id = bucket.entries[0].node_id;
+    try std.testing.expect(!std.mem.eql(u8, &unprobed_oldest_id, &incumbent_id));
+
+    try std.testing.expect(bucket.applyPendingIfExpired(inserted_at_ns + std.time.ns_per_ms, 1));
+    try std.testing.expect(bucket.get(&incumbent_id) == null);
+    try std.testing.expect(bucket.get(&unprobed_oldest_id) != null);
+    try std.testing.expect(bucket.get(&newcomer_id) != null);
 }

@@ -326,15 +326,19 @@ test "locally trusted contact remains durable while a pending ENR can still be r
     try std.testing.expect(peers.addTrusted(trusted_id, &trusted_pubkey, trusted_address, null, 0));
     try fillBucketFor(&peers, trusted_id);
     const accepted = peers.acceptHandshake(trusted_id, &trusted_pubkey, trusted_address, trusted_enr, 1);
-    const incumbent = accepted.eviction_candidate orelse return error.MissingEvictionCandidate;
+    const eviction = accepted.eviction_candidate orelse return error.MissingEvictionCandidate;
+    const incumbent = eviction.entry;
     try std.testing.expect(peers.routing.getEntry(&trusted_id) == null);
     try std.testing.expect(peers.routing.getEntryWithPending(&trusted_id) != null);
     try std.testing.expect(peers.contacts.get(trusted_id).?.explicitly_trusted);
 
-    var responsive_incumbent = incumbent;
-    responsive_incumbent.status = .connected;
-    _ = peers.routing.insertDetailed(responsive_incumbent);
-    peers.resolveEvictionSuccess(&incumbent.node_id);
+    const eviction_key = types.RequestKey.init(
+        .{ .node_id = incumbent.node_id, .addr = incumbent.addr },
+        try message.ReqId.fromSlice(&.{0x42}),
+    );
+    try std.testing.expect(peers.armHealthRequest(eviction_key, .{ .allow_eviction_candidate = eviction.ticket }));
+    _ = peers.markResponsive(incumbent.node_id, incumbent.addr, 2, eviction_key);
+    try std.testing.expect(peers.resolveEvictionSuccess(eviction.ticket, eviction_key));
     try std.testing.expect(peers.routing.getEntryWithPending(&trusted_id) == null);
     try std.testing.expect(peers.contacts.get(trusted_id).?.explicitly_trusted);
     try std.testing.expect(peers.known(&trusted_id).?.addr.eql(&trusted_address));
@@ -422,6 +426,158 @@ test "PeerBook knownEnrSeq reads routed and pending canonical metadata" {
     try std.testing.expect(pending.routing.getEntry(&pending_id) == null);
     try std.testing.expect(pending.routing.getEntryWithPending(&pending_id) != null);
     try std.testing.expectEqual(@as(?u64, 7), pending.knownEnrSeq(&pending_id));
+}
+
+test "stale P1 eviction timeout does not promote P2 when RequestKey is reused" {
+    const alloc = std.testing.allocator;
+    var peers = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, false);
+    defer peers.deinit();
+    const incumbent_id = [_]u8{0x80} ** 32;
+    const incumbent_addr = types.Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 10_001 } };
+    try fillBucketWithIncumbent(&peers, incumbent_id, incumbent_addr);
+    const reused_key = types.RequestKey.init(
+        .{ .node_id = incumbent_id, .addr = incumbent_addr },
+        try message.ReqId.fromSlice(&.{0x44}),
+    );
+
+    const p1_id = [_]u8{0x81} ** 32;
+    const p1_probe = peers.routing.insertDetailed(testEntry(p1_id, 20_001, 1, .connected)).pending_eviction orelse return error.MissingP1;
+    try std.testing.expect(peers.armHealthRequest(reused_key, .{ .allow_eviction_candidate = p1_probe.ticket }));
+    _ = peers.markResponsive(incumbent_id, incumbent_addr, 2, reused_key);
+    try std.testing.expect(peers.resolveEvictionSuccess(p1_probe.ticket, reused_key));
+    const distance = kbucket.logDistance(&peers.local_node_id, &incumbent_id).?;
+    while (peers.routing.buckets[distance].count > 0) {
+        const node_id = peers.routing.buckets[distance].entries[0].node_id;
+        _ = peers.routing.buckets[distance].remove(&node_id);
+    }
+    try fillBucketWithIncumbent(&peers, incumbent_id, incumbent_addr);
+
+    const p2_id = [_]u8{0x82} ** 32;
+    const p2_probe = peers.routing.insertDetailed(testEntry(p2_id, 20_002, 3, .connected)).pending_eviction orelse return error.MissingP2;
+    try std.testing.expect(peers.armHealthRequest(reused_key, .{ .allow_eviction_candidate = p2_probe.ticket }));
+
+    // Request keys are bounded wire identifiers and may be reused. P1's late
+    // timeout still carries P1's replacement generation and cannot own P2.
+    try std.testing.expect(peers.completeEvictionTimeout(p1_probe.ticket, reused_key) == null);
+    const bucket = &peers.routing.buckets[distance];
+    try std.testing.expect(bucket.pending != null);
+    try std.testing.expectEqualDeep(p2_id, bucket.pending.?.entry.node_id);
+    try std.testing.expect(peers.routing.getEntry(&incumbent_id) != null);
+    try std.testing.expect(peers.routing.getEntry(&p2_id) == null);
+}
+
+test "pending expiry clears only its exact eviction health reservation" {
+    const alloc = std.testing.allocator;
+    var peers = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, false);
+    defer peers.deinit();
+    const incumbent_id = [_]u8{0x80} ** 32;
+    const incumbent_addr = types.Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 10_001 } };
+    try fillBucketWithIncumbent(&peers, incumbent_id, incumbent_addr);
+    const pending_id = [_]u8{0x81} ** 32;
+    const probe = peers.routing.insertDetailed(testEntry(pending_id, 20_001, 1, .connected)).pending_eviction orelse return error.MissingPending;
+    const key = types.RequestKey.init(
+        .{ .node_id = incumbent_id, .addr = incumbent_addr },
+        try message.ReqId.fromSlice(&.{0x45}),
+    );
+    try std.testing.expect(peers.armHealthRequest(key, .{ .allow_eviction_candidate = probe.ticket }));
+
+    // P1 remains bound to the pending generation even though an authenticated
+    // endpoint change disarms its old-endpoint health reservation.
+    const moved_addr = types.Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 2 }, .port = 10_002 } };
+    _ = peers.markResponsive(incumbent_id, moved_addr, 2, null);
+    try std.testing.expect(peers.routing.getEntry(&incumbent_id).?.health_request == null);
+    try std.testing.expect(peers.routing.buckets[kbucket.logDistance(&peers.local_node_id, &incumbent_id).?].pending != null);
+
+    // An ordinary P2 at the authenticated endpoint is unrelated to P1 and
+    // must survive fixed pending expiry.
+    const newer = types.RequestKey.init(
+        .{ .node_id = incumbent_id, .addr = moved_addr },
+        try message.ReqId.fromSlice(&.{0x46}),
+    );
+    try std.testing.expect(peers.armHealthRequest(newer, .connected_only));
+    var transitions: [256]peer_book.ConnectionEvent = undefined;
+    try std.testing.expectEqual(@as(usize, 0), peers.prune(std.time.ns_per_ms + 1, 1, &transitions));
+    try std.testing.expect(peers.routing.buckets[kbucket.logDistance(&peers.local_node_id, &incumbent_id).?].pending == null);
+    try expectHealthRequest(&peers, incumbent_id, newer);
+}
+
+test "successful pending resolution preserves a newer unrelated health request" {
+    const alloc = std.testing.allocator;
+    var peers = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, false);
+    defer peers.deinit();
+    const incumbent_id = [_]u8{0x80} ** 32;
+    const address_a = types.Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 3 }, .port = 10_003 } };
+    const address_b = types.Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 4 }, .port = 10_004 } };
+    try fillBucketWithIncumbent(&peers, incumbent_id, address_a);
+    const probe = peers.routing.insertDetailed(testEntry([_]u8{0x81} ** 32, 20_003, 1, .connected)).pending_eviction orelse return error.MissingPending;
+    const p1 = types.RequestKey.init(.{ .node_id = incumbent_id, .addr = address_a }, try message.ReqId.fromSlice(&.{0x47}));
+    try std.testing.expect(peers.armHealthRequest(p1, .{ .allow_eviction_candidate = probe.ticket }));
+
+    _ = peers.markResponsive(incumbent_id, address_b, 2, null);
+    const p2 = types.RequestKey.init(.{ .node_id = incumbent_id, .addr = address_b }, try message.ReqId.fromSlice(&.{0x48}));
+    try std.testing.expect(peers.armHealthRequest(p2, .connected_only));
+    try std.testing.expect(peers.resolveEvictionSuccess(probe.ticket, p1));
+    try std.testing.expect(peers.routing.buckets[kbucket.logDistance(&peers.local_node_id, &incumbent_id).?].pending == null);
+    try expectHealthRequest(&peers, incumbent_id, p2);
+}
+
+test "non-request pending consumption releases its exact health reservation" {
+    const alloc = std.testing.allocator;
+    var peers = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, false);
+    defer peers.deinit();
+    const incumbent_id = [_]u8{0x80} ** 32;
+    const incumbent_addr = types.Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 5 }, .port = 10_005 } };
+    try fillBucketWithIncumbent(&peers, incumbent_id, incumbent_addr);
+    const distance = kbucket.logDistance(&peers.local_node_id, &incumbent_id).?;
+    const bucket = &peers.routing.buckets[distance];
+    const p1_id = [_]u8{0x81} ** 32;
+    const p1 = peers.routing.insertDetailed(testEntry(p1_id, 20_005, 1, .connected)).pending_eviction orelse return error.MissingP1;
+    const key1 = types.RequestKey.init(.{ .node_id = incumbent_id, .addr = incumbent_addr }, try message.ReqId.fromSlice(&.{0x49}));
+    try std.testing.expect(peers.armHealthRequest(key1, .{ .allow_eviction_candidate = p1.ticket }));
+
+    try std.testing.expect(bucket.remove(&p1_id));
+    try std.testing.expect(peers.routing.getEntry(&incumbent_id).?.health_request == null);
+
+    const p2_id = [_]u8{0x82} ** 32;
+    const p2 = peers.routing.insertDetailed(testEntry(p2_id, 20_006, 2, .connected)).pending_eviction orelse return error.MissingP2;
+    const key2 = types.RequestKey.init(.{ .node_id = incumbent_id, .addr = incumbent_addr }, try message.ReqId.fromSlice(&.{0x4a}));
+    try std.testing.expect(peers.armHealthRequest(key2, .{ .allow_eviction_candidate = p2.ticket }));
+
+    var unrelated_id = bucket.entries[1].node_id;
+    if (std.mem.eql(u8, &unrelated_id, &incumbent_id)) unrelated_id = bucket.entries[2].node_id;
+    try std.testing.expect(bucket.remove(&unrelated_id));
+    try std.testing.expect(bucket.pending == null);
+    try std.testing.expect(bucket.get(&p2_id) != null);
+    try std.testing.expect(peers.routing.getEntry(&incumbent_id).?.health_request == null);
+
+    _ = peers.markResponsive(incumbent_id, incumbent_addr, 3, null);
+    const later = types.RequestKey.init(.{ .node_id = incumbent_id, .addr = incumbent_addr }, try message.ReqId.fromSlice(&.{0x4b}));
+    try std.testing.expect(peers.armHealthRequest(later, .connected_only));
+}
+
+fn fillBucketWithIncumbent(peers: *peer_book.PeerBook, incumbent_id: types.NodeId, incumbent_addr: types.Address) !void {
+    try std.testing.expect(peers.routing.insert(.{
+        .node_id = incumbent_id,
+        .pubkey = [_]u8{1} ** 33,
+        .addr = incumbent_addr,
+        .last_seen = 0,
+        .status = .disconnected,
+    }));
+    for (1..kbucket.K) |index| {
+        var sibling = incumbent_id;
+        sibling[31] ^= @intCast(index);
+        try std.testing.expect(peers.routing.insert(testEntry(sibling, @intCast(10_001 + index), @intCast(index), .disconnected)));
+    }
+}
+
+fn testEntry(node_id: types.NodeId, port: u16, last_seen: i64, status: kbucket.EntryStatus) kbucket.Entry {
+    return .{
+        .node_id = node_id,
+        .pubkey = [_]u8{2} ** 33,
+        .addr = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 2 }, .port = port } },
+        .last_seen = last_seen,
+        .status = status,
+    };
 }
 
 fn fillBucketFor(peers: *peer_book.PeerBook, target_id: types.NodeId) !void {

@@ -163,7 +163,7 @@ pub const PeerBook = struct {
 
     pub const ResponsiveResult = struct {
         transition: ConnectionTransition,
-        eviction_candidate: ?kbucket.Entry,
+        eviction_candidate: ?kbucket.EvictionProbe,
     };
 
     pub fn markResponsive(self: *PeerBook, node_id: types.NodeId, address: types.Address, now_ns: i64, completed_key: ?types.RequestKey) ResponsiveResult {
@@ -197,11 +197,28 @@ pub const PeerBook = struct {
         };
     }
 
-    pub const HealthReservationPolicy = enum {
+    /// Record authenticated liveness for an eviction response, but clear the
+    /// incumbent's health reservation only when this exact ticket and request
+    /// still own the bucket's current pending replacement.
+    pub fn markEvictionResponsive(
+        self: *PeerBook,
+        ticket: kbucket.EvictionTicket,
+        key: types.RequestKey,
+        now_ns: i64,
+    ) ResponsiveResult {
+        const distance = kbucket.logDistance(&self.routing.local_id, &ticket.incumbent_id);
+        const owns_pending = if (distance) |value|
+            self.routing.buckets[value].pendingMatches(ticket, key)
+        else
+            false;
+        return self.markResponsive(ticket.incumbent_id, key.endpoint.addr, now_ns, if (owns_pending) key else null);
+    }
+
+    pub const HealthReservationPolicy = union(enum) {
         connected_only,
         /// A genuine full-bucket eviction candidate is normally the oldest
         /// disconnected entry; its liveness probe must still be reservable.
-        allow_eviction_candidate,
+        allow_eviction_candidate: kbucket.EvictionTicket,
     };
 
     /// Pre-send reservation of exact health/eviction probe ownership. Take it
@@ -210,11 +227,14 @@ pub const PeerBook = struct {
     pub fn armHealthRequest(self: *PeerBook, key: types.RequestKey, policy: HealthReservationPolicy) bool {
         const entry = self.routing.getEntryMutWithPending(&key.endpoint.node_id) orelse return false;
         if (!entry.addr.eql(&key.endpoint.addr)) return false;
+        if (entry.health_request != null) return false;
         switch (policy) {
             .connected_only => if (entry.status != .connected) return false,
-            .allow_eviction_candidate => {},
+            .allow_eviction_candidate => |ticket| {
+                const dist = kbucket.logDistance(&self.routing.local_id, &ticket.incumbent_id) orelse return false;
+                if (!self.routing.buckets[dist].bindPendingRequest(ticket, key)) return false;
+            },
         }
-        if (entry.health_request != null) return false;
         entry.health_request = key;
         return true;
     }
@@ -227,32 +247,44 @@ pub const PeerBook = struct {
         return true;
     }
 
+    pub fn cancelEvictionRequest(self: *PeerBook, ticket: kbucket.EvictionTicket, key: types.RequestKey) bool {
+        const dist = kbucket.logDistance(&self.routing.local_id, &ticket.incumbent_id) orelse return false;
+        const bucket = &self.routing.buckets[dist];
+        if (!bucket.pendingMatches(ticket, key)) return false;
+        const entry = self.routing.getEntryMutWithPending(&ticket.incumbent_id) orelse return false;
+        const health_key = entry.health_request orelse return false;
+        if (!types.RequestKeyContext.eql(.{}, health_key, key)) return false;
+        if (!bucket.cancelPendingRequest(ticket, key)) return false;
+        entry.health_request = null;
+        return true;
+    }
+
     /// The exact eviction candidate proved liveness: keep the incumbent and
-    /// drop the bucket's pending replacement.
-    pub fn resolveEvictionSuccess(self: *PeerBook, node_id: *const types.NodeId) void {
-        const dist = kbucket.logDistance(&self.routing.local_id, node_id) orelse return;
-        self.routing.buckets[dist].resolvePendingAgainst(node_id);
+    /// drop only the pending replacement generation owned by this request.
+    pub fn resolveEvictionSuccess(self: *PeerBook, ticket: kbucket.EvictionTicket, key: types.RequestKey) bool {
+        const dist = kbucket.logDistance(&self.routing.local_id, &ticket.incumbent_id) orelse return false;
+        return self.routing.buckets[dist].resolvePending(ticket, key);
     }
 
     /// The exact eviction probe timed out. Remove the unresponsive candidate
     /// and promote the bucket's pending replacement; returns the promoted
     /// peer's connection event when one entered the table.
-    pub fn completeEvictionTimeout(self: *PeerBook, key: types.RequestKey) ?ConnectionEvent {
-        const entry = self.routing.getEntryMutWithPending(&key.endpoint.node_id) orelse return null;
+    pub fn completeEvictionTimeout(self: *PeerBook, ticket: kbucket.EvictionTicket, key: types.RequestKey) ?ConnectionEvent {
+        const dist = kbucket.logDistance(&self.routing.local_id, &ticket.incumbent_id) orelse return null;
+        const bucket = &self.routing.buckets[dist];
+        if (!bucket.pendingMatches(ticket, key)) return null;
+        const entry = self.routing.getEntryMutWithPending(&ticket.incumbent_id) orelse return null;
         const health_key = entry.health_request orelse return null;
         if (!types.RequestKeyContext.eql(.{}, health_key, key)) return null;
         if (!entry.addr.eql(&key.endpoint.addr)) return null;
-        entry.health_request = null;
-        const dist = kbucket.logDistance(&self.routing.local_id, &key.endpoint.node_id) orelse return null;
-        const bucket = &self.routing.buckets[dist];
         if (entry.status == .connected) {
             // Other authenticated traffic proved liveness while the exact
             // probe was in flight; keep the incumbent, drop the replacement.
-            bucket.resolvePendingAgainst(&key.endpoint.node_id);
+            _ = bucket.resolvePending(ticket, key);
             return null;
         }
         const pending_before = bucket.pending;
-        _ = bucket.remove(&key.endpoint.node_id);
+        _ = bucket.remove(&ticket.incumbent_id);
         const pending = (pending_before orelse return null).entry;
         if (bucket.pending != null or pending.status != .connected) return null;
         if (bucket.get(&pending.node_id) == null) return null;
@@ -289,14 +321,15 @@ pub const PeerBook = struct {
     pub fn prune(self: *PeerBook, now_ns: i64, timeout_ms: u64, transitions: []ConnectionEvent) usize {
         var count: usize = 0;
         for (self.routing.buckets) |*bucket| {
-            const pending = (bucket.pending orelse continue).entry;
+            const pending = bucket.pending orelse continue;
+            if (!bucket.pendingExpired(now_ns, timeout_ms)) continue;
             if (!bucket.applyPendingIfExpired(now_ns, timeout_ms)) continue;
-            self.forgetRepresentedContact(&pending.node_id);
-            if (pending.status != .connected) continue;
+            self.forgetRepresentedContact(&pending.entry.node_id);
+            if (pending.entry.status != .connected) continue;
             std.debug.assert(count < transitions.len);
             transitions[count] = .{
-                .node_id = pending.node_id,
-                .transition = .{ .connected = pending.addr },
+                .node_id = pending.entry.node_id,
+                .transition = .{ .connected = pending.entry.addr },
             };
             count += 1;
         }

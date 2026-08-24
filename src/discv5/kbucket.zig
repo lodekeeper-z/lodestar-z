@@ -60,12 +60,24 @@ pub const Entry = struct {
 
 pub const InsertOutcome = struct {
     inserted: bool,
-    pending_eviction: ?Entry = null,
+    pending_eviction: ?EvictionProbe = null,
+};
+
+pub const EvictionTicket = struct {
+    incumbent_id: NodeId,
+    generation: u64,
+};
+
+pub const EvictionProbe = struct {
+    entry: Entry,
+    ticket: EvictionTicket,
 };
 
 const PendingReplacement = struct {
     entry: Entry,
     inserted_at_ns: i64,
+    ticket: EvictionTicket,
+    request_key: ?RequestKey = null,
 };
 
 pub const KBucket = struct {
@@ -73,6 +85,7 @@ pub const KBucket = struct {
     count: usize,
     first_connected_index: ?usize,
     pending: ?PendingReplacement,
+    next_pending_generation: u64,
 
     pub fn init() KBucket {
         return .{
@@ -80,6 +93,7 @@ pub const KBucket = struct {
             .count = 0,
             .first_connected_index = null,
             .pending = null,
+            .next_pending_generation = 1,
         };
     }
 
@@ -101,9 +115,6 @@ pub const KBucket = struct {
 
         for (self.entries[0..self.count], 0..) |existing, i| {
             if (!std.mem.eql(u8, &existing.node_id, &entry.node_id)) continue;
-            if (i == 0 and entry.status == .connected) {
-                self.pending = null;
-            }
             _ = self.removeAt(i);
             self.insertOrdered(entry);
             return .{ .inserted = true };
@@ -117,11 +128,16 @@ pub const KBucket = struct {
         if (entry.status == .connected or entry.status == .pending) {
             if (self.first_connected_index != 0 and self.pending == null) {
                 const pending_eviction = self.entries[0];
+                const ticket = EvictionTicket{
+                    .incumbent_id = pending_eviction.node_id,
+                    .generation = self.allocatePendingGeneration(),
+                };
                 self.pending = .{
                     .entry = entry,
                     .inserted_at_ns = entry.last_seen,
+                    .ticket = ticket,
                 };
-                return .{ .inserted = false, .pending_eviction = pending_eviction };
+                return .{ .inserted = false, .pending_eviction = .{ .entry = pending_eviction, .ticket = ticket } };
             }
         }
 
@@ -131,7 +147,7 @@ pub const KBucket = struct {
     pub fn remove(self: *KBucket, node_id: *const NodeId) bool {
         if (self.pending) |pending| {
             if (std.mem.eql(u8, &pending.entry.node_id, node_id)) {
-                self.pending = null;
+                _ = self.takePending();
                 return true;
             }
         }
@@ -174,40 +190,93 @@ pub const KBucket = struct {
     }
 
     pub fn applyPendingIfExpired(self: *KBucket, now_ns: i64, timeout_ms: u64) bool {
-        const pending = self.pending orelse return false;
-        const elapsed_ns: i128 = @as(i128, now_ns) - @as(i128, pending.inserted_at_ns);
-        const timeout_ns: i128 = @as(i128, timeout_ms) * std.time.ns_per_ms;
-        if (elapsed_ns < timeout_ns) return false;
+        if (self.pending == null) return false;
+        if (!self.pendingExpired(now_ns, timeout_ms)) return false;
 
-        self.pending = null;
+        const pending = self.takePending().?;
 
         if (self.count < K) {
             self.insertOrdered(pending.entry);
             return true;
         }
 
-        if (self.first_connected_index == 0) {
-            return false;
+        for (self.entries[0..self.count], 0..) |incumbent, i| {
+            if (!std.mem.eql(u8, &incumbent.node_id, &pending.ticket.incumbent_id)) continue;
+            if (incumbent.status == .connected) return false;
+            _ = self.removeAt(i);
+            self.insertOrdered(pending.entry);
+            return true;
         }
+        return false;
+    }
 
-        _ = self.removeAt(0);
-        self.insertOrdered(pending.entry);
+    pub fn pendingExpired(self: *const KBucket, now_ns: i64, timeout_ms: u64) bool {
+        const pending = self.pending orelse return false;
+        const elapsed_ns: i128 = @as(i128, now_ns) - @as(i128, pending.inserted_at_ns);
+        const timeout_ns: i128 = @as(i128, timeout_ms) * std.time.ns_per_ms;
+        return elapsed_ns >= timeout_ns;
+    }
+
+    pub fn bindPendingRequest(self: *KBucket, ticket: EvictionTicket, key: RequestKey) bool {
+        const pending = &(self.pending orelse return false);
+        if (!ticketEql(pending.ticket, ticket)) return false;
+        if (!std.mem.eql(u8, &key.endpoint.node_id, &ticket.incumbent_id)) return false;
+        const incumbent = self.get(&ticket.incumbent_id) orelse return false;
+        if (!incumbent.addr.eql(&key.endpoint.addr)) return false;
+        if (pending.request_key != null) return false;
+        pending.request_key = key;
         return true;
     }
 
-    /// Drop the pending replacement after its eviction candidate proved
+    pub fn cancelPendingRequest(self: *KBucket, ticket: EvictionTicket, key: RequestKey) bool {
+        const pending = &(self.pending orelse return false);
+        if (!ticketEql(pending.ticket, ticket)) return false;
+        const request_key = pending.request_key orelse return false;
+        if (!requestKeyEql(request_key, key)) return false;
+        pending.request_key = null;
+        return true;
+    }
+
+    /// Drop the exact pending generation after its ticketed incumbent proved
     /// liveness. Kademlia keeps a responsive incumbent over the newcomer.
-    pub fn resolvePendingAgainst(self: *KBucket, candidate_id: *const NodeId) void {
-        if (self.pending == null) return;
-        const entry = self.get(candidate_id) orelse return;
-        if (entry.status == .connected) self.pending = null;
+    pub fn resolvePending(self: *KBucket, ticket: EvictionTicket, key: RequestKey) bool {
+        const pending = self.pending orelse return false;
+        if (!ticketEql(pending.ticket, ticket)) return false;
+        const request_key = pending.request_key orelse return false;
+        if (!requestKeyEql(request_key, key)) return false;
+        const incumbent = self.get(&ticket.incumbent_id) orelse return false;
+        if (incumbent.status != .connected) return false;
+        _ = self.takePending();
+        return true;
+    }
+
+    pub fn pendingMatches(self: *const KBucket, ticket: EvictionTicket, key: RequestKey) bool {
+        const pending = self.pending orelse return false;
+        if (!ticketEql(pending.ticket, ticket)) return false;
+        const request_key = pending.request_key orelse return false;
+        return requestKeyEql(request_key, key);
     }
 
     fn maybeInsertPending(self: *KBucket) void {
         if (self.count >= K) return;
-        const pending = self.pending orelse return;
-        self.pending = null;
+        const pending = self.takePending() orelse return;
         self.insertOrdered(pending.entry);
+    }
+
+    /// Consume the current replacement generation and release only the health
+    /// reservation that its exact request key owns. This is the sole path that
+    /// clears `pending`, including non-request removal and promotion paths.
+    fn takePending(self: *KBucket) ?PendingReplacement {
+        const pending = self.pending orelse return null;
+        self.pending = null;
+        const request_key = pending.request_key orelse return pending;
+        for (self.entries[0..self.count]) |*incumbent| {
+            if (!std.mem.eql(u8, &incumbent.node_id, &pending.ticket.incumbent_id)) continue;
+            const health_key = incumbent.health_request orelse return pending;
+            if (requestKeyEql(health_key, request_key)) incumbent.health_request = null;
+            return pending;
+        }
+        return pending;
     }
 
     fn removeAt(self: *KBucket, index: usize) Entry {
@@ -256,7 +325,22 @@ pub const KBucket = struct {
         }
         self.count += 1;
     }
+
+    fn allocatePendingGeneration(self: *KBucket) u64 {
+        const generation = self.next_pending_generation;
+        self.next_pending_generation +%= 1;
+        if (self.next_pending_generation == 0) self.next_pending_generation = 1;
+        return generation;
+    }
 };
+
+fn ticketEql(a: EvictionTicket, b: EvictionTicket) bool {
+    return a.generation == b.generation and std.mem.eql(u8, &a.incumbent_id, &b.incumbent_id);
+}
+
+fn requestKeyEql(a: RequestKey, b: RequestKey) bool {
+    return @import("types.zig").RequestKeyContext.eql(.{}, a, b);
+}
 
 /// XOR distance bit index: returns 0..255 or null if equal
 pub fn logDistance(a: *const NodeId, b: *const NodeId) ?u8 {

@@ -15,7 +15,6 @@ pub const RequestKind = enum {
 pub const MaintenanceReason = enum {
     health,
     enr_refresh,
-    eviction,
 };
 
 pub const RequestOrigin = union(enum) {
@@ -24,6 +23,7 @@ pub const RequestOrigin = union(enum) {
     lookup: u32,
     detached_lookup,
     maintenance: MaintenanceReason,
+    eviction: u64,
 };
 
 pub const Endpoint = struct {
