@@ -71,6 +71,7 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
     var ad_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     if (stable) |stable_value| {
         if (decryptParsedMessage(parsed, &stable_value.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
+            if (!acceptExpectedMessage(actor, env, endpoint, plaintext)) return;
             switch (actor.sessions.acceptAuthenticated(endpoint, &parsed.static_header.nonce, now_ns)) {
                 .accepted => authenticated(actor, env, endpoint, plaintext),
                 .exhausted => if (sendWhoareyou(actor, env, endpoint, &parsed.static_header.nonce))
@@ -83,6 +84,7 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
 
     if (actor.requests.pendingKeys(endpoint)) |pending| {
         if (decryptParsedMessage(parsed, &pending.keys.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
+            if (!acceptExpectedMessage(actor, env, endpoint, plaintext)) return;
             var accepted = session_book.StableSession{
                 .initiator_key = pending.keys.initiator_key,
                 .recipient_key = pending.keys.recipient_key,
@@ -98,6 +100,7 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
 
     if (actor.responses.candidate(endpoint, now_ns)) |candidate| {
         if (decryptParsedMessage(parsed, &candidate.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
+            if (!acceptExpectedMessage(actor, env, endpoint, plaintext)) return;
             var accepted = session_book.StableSession{
                 .initiator_key = candidate.initiator_key,
                 .recipient_key = candidate.recipient_key,
@@ -110,6 +113,13 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
         }
     }
     _ = sendWhoareyou(actor, env, endpoint, &parsed.static_header.nonce);
+}
+
+fn acceptExpectedMessage(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) bool {
+    if (env.expected_credit == null) return true;
+    if (!rpc.isExpectedResponse(actor, plaintext, endpoint)) return false;
+    env.commitExpected();
+    return true;
 }
 
 fn authenticated(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) void {
@@ -135,6 +145,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         ) orelse return },
         else => return,
     };
+    env.commitExpected();
     const recovery: RecoveryMaterial = switch (source) {
         .request => |preparation| .{
             .endpoint = preparation.key.endpoint,
@@ -298,6 +309,7 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         &parsed.masking_iv,
         parsed.header_raw,
     ) catch return;
+    env.commitExpected();
     var stable = session_book.StableSession{
         .initiator_key = keys.recipient_key,
         .recipient_key = keys.initiator_key,

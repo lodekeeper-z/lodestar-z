@@ -79,6 +79,7 @@ const RuntimeImpl = struct {
     const Inbound = struct {
         from: types.Address,
         bytes: types.PacketBytes,
+        expected: ?admission_mod.ExpectedCredit = null,
     };
 
     const AddNode = struct {
@@ -307,6 +308,12 @@ const RuntimeImpl = struct {
         }
     }
 
+    pub fn closeCommandsAndDrainForTesting(self: *RuntimeImpl) void {
+        std.debug.assert(@import("builtin").is_test);
+        self.command_queue.close(self.io);
+        self.drainAcceptedCommands();
+    }
+
     fn drainAcceptedCommands(self: *RuntimeImpl) void {
         const previous_protection = self.io.swapCancelProtection(.blocked);
         defer _ = self.io.swapCancelProtection(previous_protection);
@@ -314,9 +321,15 @@ const RuntimeImpl = struct {
             const command = self.command_queue.getOneUncancelable(self.io) catch |err| switch (err) {
                 error.Closed => return,
             };
-            self.handleCommand(command) catch |err| switch (err) {
-                error.Canceled => {},
-            };
+            switch (command) {
+                .inbound => |value| if (value.expected) |credit_value| {
+                    var credit = credit_value;
+                    credit.rollback(&self.admission);
+                },
+                else => self.handleCommand(command) catch |err| switch (err) {
+                    error.Canceled => {},
+                },
+            }
         }
     }
 
@@ -335,6 +348,11 @@ const RuntimeImpl = struct {
     }
 
     fn handleCommand(self: *RuntimeImpl, command: Command) Io.Cancelable!void {
+        var expected = switch (command) {
+            .inbound => |value| value.expected,
+            else => null,
+        };
+        defer if (expected) |*credit| credit.rollback(&self.admission);
         if (@import("builtin").is_test) if (self.test_command_gate) |gate| {
             gate.entered.store(true, .release);
             while (!gate.proceed.load(.acquire)) std.atomic.spinLoopHint();
@@ -350,7 +368,8 @@ const RuntimeImpl = struct {
                 error.Closed => unreachable,
             };
         };
-        const env = self.actorEnv();
+        var env = self.actorEnv();
+        env.expected_credit = if (expected) |*credit| credit else null;
         switch (command) {
             .inbound => |value| {
                 var bytes = value.bytes;
@@ -451,6 +470,53 @@ const RuntimeImpl = struct {
         try replyResult(self.io, reply, result);
     }
 
+    fn enqueueInbound(
+        self: *RuntimeImpl,
+        from: types.Address,
+        raw: []const u8,
+        expected_value: ?admission_mod.ExpectedCredit,
+    ) !void {
+        var expected = expected_value;
+        defer if (expected) |*credit| credit.rollback(&self.admission);
+        const bytes = try types.PacketBytes.init(raw);
+        var inbound = Inbound{
+            .from = from,
+            .bytes = bytes,
+            .expected = if (expected) |*credit| credit.move() else null,
+        };
+        self.enqueueCommand(.{ .inbound = inbound }) catch |err| {
+            if (inbound.expected) |*credit| credit.rollback(&self.admission);
+            return err;
+        };
+    }
+
+    pub fn enqueueInboundForTesting(
+        self: *RuntimeImpl,
+        from: types.Address,
+        raw: []const u8,
+        expected: ?admission_mod.ExpectedCredit,
+    ) !void {
+        std.debug.assert(@import("builtin").is_test);
+        return self.enqueueInbound(from, raw, expected);
+    }
+
+    pub fn handleInboundForTesting(
+        self: *RuntimeImpl,
+        from: types.Address,
+        raw: []const u8,
+        expected_value: ?admission_mod.ExpectedCredit,
+    ) !void {
+        std.debug.assert(@import("builtin").is_test);
+        var expected = expected_value;
+        defer if (expected) |*credit| credit.rollback(&self.admission);
+        const bytes = try types.PacketBytes.init(raw);
+        return self.handleCommand(.{ .inbound = .{
+            .from = from,
+            .bytes = bytes,
+            .expected = if (expected) |*credit| credit.move() else null,
+        } });
+    }
+
     fn receiveLoop(self: *RuntimeImpl, family: types.Address.Family) Io.Cancelable!void {
         if (self.transport.socket(family) == null) return;
         var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
@@ -471,10 +537,13 @@ const RuntimeImpl = struct {
                 },
             };
             consecutive_errors = 0;
-            if (!self.admission.accept(received.from, util.nowMs(self.io))) continue;
-            const bytes = types.PacketBytes.init(received.data) catch continue;
-            self.enqueueCommand(.{ .inbound = .{ .from = received.from, .bytes = bytes } }) catch |err| switch (err) {
-                error.CommandQueueFull => continue,
+            const expected: ?admission_mod.ExpectedCredit = switch (self.admission.admit(received.from, util.nowMs(self.io))) {
+                .filtered => continue,
+                .ordinary => null,
+                .expected => |credit| credit,
+            };
+            self.enqueueInbound(received.from, received.data, expected) catch |err| switch (err) {
+                error.PacketTooLarge, error.CommandQueueFull => continue,
                 error.Closed => return,
                 error.Canceled => return error.Canceled,
             };

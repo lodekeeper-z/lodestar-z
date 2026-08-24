@@ -1,4 +1,5 @@
 const std = @import("std");
+const admission = @import("admission.zig");
 const message = @import("protocol/message.zig");
 const runtime_error = @import("runtime_error.zig");
 const transport = @import("transport.zig");
@@ -98,6 +99,40 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
                 .outstanding = outbox.outstanding.load(.acquire),
                 .unclaimed = outbox.unclaimed.load(.acquire),
             };
+        }
+
+        pub fn acquireAdmission(runtime: *Runtime, address: types.Address, budget: u16) !admission.AdmissionPermit {
+            return impl(runtime).admission.acquire(address, budget);
+        }
+
+        pub fn admissionState(runtime: *Runtime) *admission.IngressAdmission {
+            return &impl(runtime).admission;
+        }
+
+        pub fn admit(runtime: *Runtime, address: types.Address, now_ms: u64) admission.Admission {
+            return impl(runtime).admission.admit(address, now_ms);
+        }
+
+        pub fn enqueueInbound(
+            runtime: *Runtime,
+            address: types.Address,
+            raw: []const u8,
+            credit: ?admission.ExpectedCredit,
+        ) !void {
+            return impl(runtime).enqueueInboundForTesting(address, raw, credit);
+        }
+
+        pub fn handleInbound(
+            runtime: *Runtime,
+            address: types.Address,
+            raw: []const u8,
+            credit: ?admission.ExpectedCredit,
+        ) !void {
+            return impl(runtime).handleInboundForTesting(address, raw, credit);
+        }
+
+        pub fn closeCommandsAndDrain(runtime: *Runtime) void {
+            impl(runtime).closeCommandsAndDrainForTesting();
         }
 
         pub fn receiveBackoff(consecutive_errors: u8) u64 {

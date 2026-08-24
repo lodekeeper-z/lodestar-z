@@ -1,4 +1,5 @@
 const actor_mod = @import("../actor.zig");
+const admission = @import("../admission.zig");
 const types = @import("../types.zig");
 const RecordingSender = @import("recording_sender.zig").RecordingSender;
 
@@ -28,6 +29,15 @@ pub const PacketLink = struct {
 
     pub fn deliverNext(self: *PacketLink) !void {
         try self.deliverNextFrom(self.source_address);
+    }
+
+    pub fn deliverNextExpected(self: *PacketLink, credit: *admission.ExpectedCredit) !void {
+        const index = try self.snapshotNext();
+        var env = self.destination_env;
+        env.expected_credit = credit;
+        var bytes = (try self.packetBytes(index)).*;
+        self.destination.handlePacket(env, bytes.bytes[0..bytes.len], self.source_address);
+        self.next_index += 1;
     }
 
     pub fn deliverNextFrom(self: *PacketLink, source_address: types.Address) !void {

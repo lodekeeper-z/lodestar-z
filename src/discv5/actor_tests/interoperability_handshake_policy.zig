@@ -46,7 +46,7 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an exhausted source quot
         },
         .limits = limits,
     };
-    var ingress_a = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(limits));
+    var ingress_a = try admission.IngressAdmission.init(alloc, config_b.rate_limiter, try admission.permitCapacity(limits));
     defer ingress_a.deinit();
     var ingress_b = try admission.IngressAdmission.init(alloc, config_b.rate_limiter, try admission.permitCapacity(limits));
     defer ingress_b.deinit();
@@ -68,9 +68,10 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an exhausted source quot
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
 
-    try std.testing.expect(ingress_b.accept(address_a, 0));
+    try std.testing.expect(ingress_a.acceptForTesting(address_b, 0));
+    try std.testing.expect(ingress_b.acceptForTesting(address_a, 0));
     const same_ip_other_port = types.Address{ .ip4 = .{ .bytes = address_a.ip4.bytes, .port = address_a.ip4.port + 1 } };
-    try std.testing.expect(!ingress_b.accept(same_ip_other_port, 0));
+    try std.testing.expect(!ingress_b.acceptForTesting(same_ip_other_port, 0));
 
     _ = try actor_a.sendTalkRequest(
         .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a },
@@ -81,10 +82,22 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an exhausted source quot
     );
     try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
-    try std.testing.expect(ingress_a.accept(address_b, 1));
-    try link_b_to_a.deliverNext();
-    try std.testing.expect(ingress_b.accept(address_a, 1));
-    try link_a_to_b.deliverNext();
+    const challenge_admission = ingress_a.admit(address_b, 1);
+    var challenge_credit = switch (challenge_admission) {
+        .expected => |value| value,
+        else => return error.MissingChallengeCredit,
+    };
+    defer challenge_credit.rollback(&ingress_a);
+    try link_b_to_a.deliverNextExpected(&challenge_credit);
+    try std.testing.expect(!challenge_credit.armed);
+    const handshake_admission = ingress_b.admit(address_a, 1);
+    var handshake_credit = switch (handshake_admission) {
+        .expected => |value| value,
+        else => return error.MissingHandshakeCredit,
+    };
+    defer handshake_credit.rollback(&ingress_b);
+    try link_a_to_b.deliverNextExpected(&handshake_credit);
+    try std.testing.expect(!handshake_credit.armed);
 
     try std.testing.expect(actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, outbound.nowNs(io)) != null);
     try std.testing.expectEqual(@as(usize, 0), ingress_b.permitCount());
@@ -116,7 +129,11 @@ test "paired Actors complete handshake PING and TALK request response flows" {
         .rate_limiter = null,
         .limits = limits,
     };
-    var ingress_a = try admission.IngressAdmission.init(alloc, null, limits.max_active_requests);
+    const expected_bypass_limiter = @import("../rate_limit.zig").Config{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+    };
+    var ingress_a = try admission.IngressAdmission.init(alloc, expected_bypass_limiter, limits.max_active_requests);
     defer ingress_a.deinit();
     var ingress_b = try admission.IngressAdmission.init(alloc, null, limits.max_active_requests);
     defer ingress_b.deinit();
@@ -151,7 +168,32 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expect(actor_a.sessions.get(.{ .node_id = id_b, .addr = address_b }, now_ns) != null);
     try std.testing.expect(actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, now_ns) != null);
 
+    try std.testing.expect(ingress_a.admit(address_b, 0) == .ordinary);
     const talk_id = try actor_a.sendTalkRequest(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, "test", "request");
+
+    const unrelated_ping_id = try actor_b.sendPing(
+        .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b },
+        .{ .node_id = id_a, .addr = address_a },
+        &pubkey_a,
+        0,
+        .api,
+    );
+    const unrelated_admission = ingress_a.admit(address_b, 1);
+    var unrelated_credit = switch (unrelated_admission) {
+        .expected => |value| value,
+        else => return error.MissingUnrelatedPacketCredit,
+    };
+    defer unrelated_credit.rollback(&ingress_a);
+    const sends_before_unrelated = sender_a.datagrams.items.len;
+    try link_b_to_a.deliverNextExpected(&unrelated_credit);
+    try std.testing.expect(unrelated_credit.armed);
+    try std.testing.expectEqual(sends_before_unrelated, sender_a.datagrams.items.len);
+    unrelated_credit.rollback(&ingress_a);
+    try std.testing.expect(actor_b.cancelRequest(
+        .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b },
+        .init(.{ .node_id = id_a, .addr = address_a }, unrelated_ping_id),
+    ));
+
     try link_a_to_b.deliverNext();
     var request_event = outbox_b.pop() orelse return error.MissingTalkRequest;
     defer request_event.deinit(alloc);
@@ -160,7 +202,14 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expectEqualStrings("request", request_event.talkreq.request);
     try std.testing.expectEqualSlices(u8, talk_id.slice(), request_event.talkreq.req_id.slice());
     try actor_b.sendTalkResponse(.{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b }, .{ .node_id = id_a, .addr = address_a }, request_event.talkreq.req_id, "response");
-    try link_b_to_a.deliverNext();
+    const response_admission = ingress_a.admit(address_b, 1);
+    var response_credit = switch (response_admission) {
+        .expected => |value| value,
+        else => return error.MissingResponseCredit,
+    };
+    defer response_credit.rollback(&ingress_a);
+    try link_b_to_a.deliverNextExpected(&response_credit);
+    try std.testing.expect(!response_credit.armed);
     var response_event = outbox_a.pop() orelse return error.MissingTalkResponse;
     defer response_event.deinit(alloc);
     try std.testing.expect(response_event == .talkresp);

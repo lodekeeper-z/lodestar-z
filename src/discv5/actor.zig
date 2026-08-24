@@ -42,6 +42,11 @@ pub const Env = struct {
     outbox: *events.EventOutbox,
     lookup_results: ?*lookup_results.LookupResultOutbox = null,
     request_results: ?*request_results.RequestResultOutbox = null,
+    expected_credit: ?*admission.ExpectedCredit = null,
+
+    pub fn commitExpected(self: Env) void {
+        if (self.expected_credit) |credit| credit.commit(self.ingress);
+    }
 };
 
 pub const ProbeSnapshot = struct {

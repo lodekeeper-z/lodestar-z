@@ -31,6 +31,32 @@ pub fn dispatch(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.
     }
 }
 
+pub fn isExpectedResponse(actor: *Actor, plaintext: []const u8, endpoint: types.Endpoint) bool {
+    if (plaintext.len == 0) return false;
+    switch (plaintext[0]) {
+        message.MSG_PONG => {
+            const pong = message.Pong.decode(plaintext) catch return false;
+            const active = actor.requests.get(.init(endpoint, pong.req_id)) orelse return false;
+            return active.response == .pong;
+        },
+        message.MSG_NODES => {
+            var enr_buffer: [MAX_NODES_RESPONSE][]const u8 = undefined;
+            const nodes = message.Nodes.decodeInto(plaintext, &enr_buffer) catch return false;
+            if (nodes.total == 0 or nodes.total > MAX_NODES_RESPONSE) return false;
+            const active = actor.requests.get(.init(endpoint, nodes.req_id)) orelse return false;
+            if (active.response != .nodes) return false;
+            if (active.response.nodes.total_responses) |expected| return expected == nodes.total;
+            return true;
+        },
+        message.MSG_TALKRESP => {
+            const response = message.TalkResp.decode(plaintext) catch return false;
+            const active = actor.requests.get(.init(endpoint, response.req_id)) orelse return false;
+            return active.response == .talkresp;
+        },
+        else => return false,
+    }
+}
+
 fn handlePing(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
     const ping = message.Ping.decode(plaintext) catch return;
     noteReceived(actor, plaintext);

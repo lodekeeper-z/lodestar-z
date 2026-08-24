@@ -1386,6 +1386,112 @@ test "running Runtime rejects invalid FINDNODE distance before request admission
     try std.testing.expect(running.run_result == null);
 }
 
+test "malformed inbound packet rolls back tentative expected credit" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0xa8} ** 32));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const runtime = try runtime_mod.Runtime.init(io, alloc, config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+        .rate_limiter = .{
+            .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+            .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+        },
+        .limits = .{ .command_capacity = 1 },
+    }, .{});
+    defer runtime.deinit();
+    const address = types.Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 80 }, .port = 9000 } };
+    try std.testing.expect(runtime_mod.Testing.admit(runtime, address, 0) == .ordinary);
+    var permit = try runtime_mod.Testing.acquireAdmission(runtime, address, 1);
+    defer permit.release(runtime_mod.Testing.admissionState(runtime));
+
+    const admitted = runtime_mod.Testing.admit(runtime, address, 0);
+    var queue_credit = switch (admitted) {
+        .expected => |value| value,
+        else => return error.MissingExpectedCredit,
+    };
+    defer queue_credit.rollback(runtime_mod.Testing.admissionState(runtime));
+    try runtime_mod.Testing.enqueueStaleMaintenance(runtime);
+    try std.testing.expectError(
+        error.CommandQueueFull,
+        runtime_mod.Testing.enqueueInbound(runtime, address, &.{0xff}, queue_credit.move()),
+    );
+
+    const after_queue_full = runtime_mod.Testing.admit(runtime, address, 0);
+    var oversized_credit = switch (after_queue_full) {
+        .expected => |value| value,
+        else => return error.QueueFullDidNotRestoreCredit,
+    };
+    defer oversized_credit.rollback(runtime_mod.Testing.admissionState(runtime));
+    const oversized = [_]u8{0xff} ** (packet.MAX_PACKET_SIZE + 1);
+    try std.testing.expectError(
+        error.PacketTooLarge,
+        runtime_mod.Testing.handleInbound(runtime, address, &oversized, oversized_credit.move()),
+    );
+
+    const after_oversized = runtime_mod.Testing.admit(runtime, address, 0);
+    var malformed_credit = switch (after_oversized) {
+        .expected => |value| value,
+        else => return error.OversizedPacketDidNotRestoreCredit,
+    };
+    defer malformed_credit.rollback(runtime_mod.Testing.admissionState(runtime));
+    try runtime_mod.Testing.handleInbound(runtime, address, &.{0xff}, malformed_credit.move());
+
+    const retried = runtime_mod.Testing.admit(runtime, address, 0);
+    var restored = switch (retried) {
+        .expected => |value| value,
+        else => return error.ExpectedCreditNotRestored,
+    };
+    restored.rollback(runtime_mod.Testing.admissionState(runtime));
+}
+
+test "shutdown drain rolls back queued expected credit without processing packet" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0xa9} ** 32));
+    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    const runtime = try runtime_mod.Runtime.init(io, alloc, config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .local_node_id = node_id,
+        .rate_limiter = .{
+            .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+            .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+        },
+        .limits = .{ .command_capacity = 1 },
+    }, .{});
+    defer runtime.deinit();
+    const address = types.Address{ .ip4 = .{ .bytes = .{ 198, 51, 100, 81 }, .port = 9000 } };
+    try std.testing.expect(runtime_mod.Testing.admit(runtime, address, 0) == .ordinary);
+    var permit = try runtime_mod.Testing.acquireAdmission(runtime, address, 1);
+    defer permit.release(runtime_mod.Testing.admissionState(runtime));
+    const admitted = runtime_mod.Testing.admit(runtime, address, 0);
+    var credit = switch (admitted) {
+        .expected => |value| value,
+        else => return error.MissingExpectedCredit,
+    };
+    defer credit.rollback(runtime_mod.Testing.admissionState(runtime));
+    try runtime_mod.Testing.enqueueInbound(runtime, address, &.{0xff}, credit.move());
+
+    runtime_mod.Testing.closeCommandsAndDrain(runtime);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        runtime_mod.Testing.admissionState(runtime).snapshot().processed_total,
+    );
+    const retried = runtime_mod.Testing.admit(runtime, address, 0);
+    var restored = switch (retried) {
+        .expected => |value| value,
+        else => return error.ShutdownDrainDidNotRestoreCredit,
+    };
+    restored.rollback(runtime_mod.Testing.admissionState(runtime));
+}
+
 test "persistent receive errors use bounded backoff" {
     const expected = [_]u64{ 1, 2, 4, 8, 16, 32, 64, 100 };
     for (expected, 1..) |delay_ms, consecutive_errors| {

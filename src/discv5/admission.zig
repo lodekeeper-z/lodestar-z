@@ -35,6 +35,37 @@ pub const AdmissionPermit = struct {
     }
 };
 
+pub const ExpectedCredit = struct {
+    slot: SlotIndex,
+    generation: u64,
+    armed: bool = true,
+
+    pub fn commit(self: *ExpectedCredit, admission: *IngressAdmission) void {
+        if (!self.armed) return;
+        admission.resolveExpected(self.slot, self.generation, false);
+        self.armed = false;
+    }
+
+    pub fn rollback(self: *ExpectedCredit, admission: *IngressAdmission) void {
+        if (!self.armed) return;
+        admission.resolveExpected(self.slot, self.generation, true);
+        self.armed = false;
+    }
+
+    pub fn move(self: *ExpectedCredit) ExpectedCredit {
+        std.debug.assert(self.armed);
+        const result = self.*;
+        self.armed = false;
+        return result;
+    }
+};
+
+pub const Admission = union(enum) {
+    filtered,
+    ordinary,
+    expected: ExpectedCredit,
+};
+
 const ExpectedEntry = struct {
     remaining: u32,
     head: ?SlotIndex,
@@ -43,8 +74,10 @@ const ExpectedEntry = struct {
 const PermitSlot = struct {
     ip: IpKey = undefined,
     remaining: u16 = 0,
+    reserved: u16 = 0,
     generation: u64 = 0,
     in_use: bool = false,
+    owner_live: bool = false,
     previous: ?SlotIndex = null,
     next: ?SlotIndex = null,
     free_next: ?SlotIndex = null,
@@ -59,6 +92,7 @@ pub const IngressAdmission = struct {
     permit_slots: []PermitSlot,
     free_head: ?SlotIndex,
     live_permits: usize = 0,
+    reserved_credits: usize = 0,
 
     pub fn init(alloc: Allocator, config: ?rate_limit.Config, max_permits: usize) !IngressAdmission {
         if (max_permits == 0 or max_permits > std.math.maxInt(SlotIndex)) return error.InvalidAdmissionCapacity;
@@ -83,28 +117,41 @@ pub const IngressAdmission = struct {
 
     pub fn deinit(self: *IngressAdmission) void {
         std.debug.assert(self.live_permits == 0);
+        std.debug.assert(self.reserved_credits == 0);
         std.debug.assert(self.expected_by_ip.count() == 0);
         if (self.limiter) |*limiter| limiter.deinit();
         self.expected_by_ip.deinit();
         self.alloc.free(self.permit_slots);
     }
 
-    pub fn accept(self: *IngressAdmission, from: types.Address, now_ms: u64) bool {
+    pub fn admit(self: *IngressAdmission, from: types.Address, now_ms: u64) Admission {
         self.lock();
         defer self.mutex.unlock();
         self.stats.received_total +|= 1;
         const ip = IpKey.fromAddress(from);
-        if (self.consumeExpected(ip)) return true;
         if (self.limiter) |*limiter| {
-            if (!limiter.allowEncodedPacket(from, now_ms)) {
-                self.stats.filtered_total +|= 1;
-                const rate_stats = limiter.statsSnapshot();
-                self.stats.rate_limit_hit_ip_total = rate_stats.rate_limit_hit_ip_total;
-                self.stats.rate_limit_hit_total = rate_stats.rate_limit_hit_total;
-                return false;
-            }
+            if (limiter.allowEncodedPacket(from, now_ms)) return .ordinary;
+            const rate_stats = limiter.statsSnapshot();
+            self.stats.rate_limit_hit_ip_total = rate_stats.rate_limit_hit_ip_total;
+            self.stats.rate_limit_hit_total = rate_stats.rate_limit_hit_total;
+            if (self.reserveExpected(ip)) |credit| return .{ .expected = credit };
+            self.stats.filtered_total +|= 1;
+            return .filtered;
         }
-        return true;
+        return .ordinary;
+    }
+
+    pub fn acceptForTesting(self: *IngressAdmission, from: types.Address, now_ms: u64) bool {
+        std.debug.assert(@import("builtin").is_test);
+        var admitted = self.admit(from, now_ms);
+        return switch (admitted) {
+            .filtered => false,
+            .ordinary => true,
+            .expected => |*credit| blk: {
+                credit.commit(self);
+                break :blk true;
+            },
+        };
     }
 
     /// Capacity is reserved at initialization, so acquiring a permit is
@@ -131,6 +178,7 @@ pub const IngressAdmission = struct {
             .remaining = packet_budget,
             .generation = generation,
             .in_use = true,
+            .owner_live = true,
             .next = entry.value_ptr.head,
         };
         if (slot.next) |next| self.permit_slots[next].previous = slot_index;
@@ -165,17 +213,44 @@ pub const IngressAdmission = struct {
         return self.live_permits;
     }
 
-    fn consumeExpected(self: *IngressAdmission, ip: IpKey) bool {
-        const entry = self.expected_by_ip.getPtr(ip) orelse return false;
+    fn reserveExpected(self: *IngressAdmission, ip: IpKey) ?ExpectedCredit {
+        const entry = self.expected_by_ip.getPtr(ip) orelse return null;
         const slot_index = entry.head orelse unreachable;
         const slot = &self.permit_slots[slot_index];
-        std.debug.assert(slot.in_use and slot.remaining > 0);
+        std.debug.assert(slot.in_use and slot.owner_live and slot.remaining > 0);
         std.debug.assert(entry.remaining > 0);
         slot.remaining -= 1;
+        slot.reserved = std.math.add(u16, slot.reserved, 1) catch unreachable;
+        self.reserved_credits += 1;
         entry.remaining -= 1;
         if (slot.remaining == 0) self.unlinkExpected(entry, slot_index);
         if (entry.remaining == 0) std.debug.assert(self.expected_by_ip.remove(ip));
-        return true;
+        return .{ .slot = slot_index, .generation = slot.generation };
+    }
+
+    fn resolveExpected(self: *IngressAdmission, slot_index: SlotIndex, generation: u64, restore: bool) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(slot_index < self.permit_slots.len);
+        const slot = &self.permit_slots[slot_index];
+        std.debug.assert(slot.in_use and slot.generation == generation and slot.reserved > 0);
+        std.debug.assert(self.reserved_credits > 0);
+        slot.reserved -= 1;
+        self.reserved_credits -= 1;
+        if (restore and slot.owner_live) {
+            const was_empty = slot.remaining == 0;
+            const entry = self.expected_by_ip.getOrPutAssumeCapacity(slot.ip);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .remaining = 0, .head = null };
+            slot.remaining = std.math.add(u16, slot.remaining, 1) catch unreachable;
+            entry.value_ptr.remaining = std.math.add(u32, entry.value_ptr.remaining, 1) catch unreachable;
+            if (was_empty) {
+                slot.previous = null;
+                slot.next = entry.value_ptr.head;
+                if (slot.next) |next| self.permit_slots[next].previous = slot_index;
+                entry.value_ptr.head = slot_index;
+            }
+        }
+        if (!slot.owner_live and slot.reserved == 0) self.recycleSlot(slot_index);
     }
 
     fn release(self: *IngressAdmission, slot_index: SlotIndex, generation: u64) void {
@@ -183,7 +258,7 @@ pub const IngressAdmission = struct {
         defer self.mutex.unlock();
         std.debug.assert(slot_index < self.permit_slots.len);
         const slot = &self.permit_slots[slot_index];
-        std.debug.assert(slot.in_use and slot.generation == generation);
+        std.debug.assert(slot.in_use and slot.owner_live and slot.generation == generation);
         std.debug.assert(self.live_permits > 0);
         if (slot.remaining > 0) {
             const ip = slot.ip;
@@ -192,11 +267,19 @@ pub const IngressAdmission = struct {
             entry.remaining -= slot.remaining;
             self.unlinkExpected(entry, slot_index);
             if (entry.remaining == 0) std.debug.assert(self.expected_by_ip.remove(ip));
+            slot.remaining = 0;
         }
-        const next_generation = slot.generation;
-        slot.* = .{ .generation = next_generation, .free_next = self.free_head };
-        self.free_head = slot_index;
+        slot.owner_live = false;
         self.live_permits -= 1;
+        if (slot.reserved == 0) self.recycleSlot(slot_index);
+    }
+
+    fn recycleSlot(self: *IngressAdmission, slot_index: SlotIndex) void {
+        const slot = &self.permit_slots[slot_index];
+        std.debug.assert(slot.in_use and !slot.owner_live and slot.remaining == 0 and slot.reserved == 0);
+        const generation = slot.generation;
+        slot.* = .{ .generation = generation, .free_next = self.free_head };
+        self.free_head = slot_index;
     }
 
     fn unlinkExpected(self: *IngressAdmission, entry: *ExpectedEntry, slot_index: SlotIndex) void {
@@ -279,14 +362,14 @@ test "same-IP permit release removes only its own unconsumed packet budget" {
     }, 2);
     defer admission.deinit();
     const address: types.Address = .{ .ip4 = .{ .bytes = .{ 203, 0, 113, 20 }, .port = 9_000 } };
-    try std.testing.expect(admission.accept(address, 0));
-    try std.testing.expect(!admission.accept(address, 0));
+    try std.testing.expect(admission.acceptForTesting(address, 0));
+    try std.testing.expect(!admission.acceptForTesting(address, 0));
     var first = try admission.acquire(address, 1);
     var second = try admission.acquire(address, 2);
-    try std.testing.expect(admission.accept(address, 1));
+    try std.testing.expect(admission.acceptForTesting(address, 1));
     first.release(&admission);
-    try std.testing.expect(admission.accept(address, 1));
-    try std.testing.expect(!admission.accept(address, 1));
+    try std.testing.expect(admission.acceptForTesting(address, 1));
+    try std.testing.expect(!admission.acceptForTesting(address, 1));
     second.release(&admission);
     try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
 }
@@ -304,14 +387,14 @@ test "challenge budget admits every bounded retry probe plus the handshake" {
     }, 1);
     defer admission.deinit();
     const address: types.Address = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 21 }, .port = 9_000 } };
-    try std.testing.expect(admission.accept(address, 0));
-    try std.testing.expect(!admission.accept(address, 0));
+    try std.testing.expect(admission.acceptForTesting(address, 0));
+    try std.testing.expect(!admission.acceptForTesting(address, 0));
 
     var permit = try admission.acquire(address, challengePacketBudget(1));
     defer permit.release(&admission);
-    try std.testing.expect(admission.accept(address, 1)); // exact retry probe
-    try std.testing.expect(admission.accept(address, 1)); // resulting HANDSHAKE
-    try std.testing.expect(!admission.accept(address, 1));
+    try std.testing.expect(admission.acceptForTesting(address, 1)); // exact retry probe
+    try std.testing.expect(admission.acceptForTesting(address, 1)); // resulting HANDSHAKE
+    try std.testing.expect(!admission.acceptForTesting(address, 1));
 }
 
 test "admission capacity includes one transactional preparation permit" {
@@ -354,12 +437,12 @@ test "expected response IP bypasses an exhausted per-IP quota" {
     }, 1);
     defer admission.deinit();
     const address: types.Address = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 9000 } };
-    try std.testing.expect(admission.accept(address, 0));
-    try std.testing.expect(!admission.accept(address, 0));
+    try std.testing.expect(admission.acceptForTesting(address, 0));
+    try std.testing.expect(!admission.acceptForTesting(address, 0));
     var permit = try admission.acquire(.{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 9001 } }, 1);
-    try std.testing.expect(admission.accept(address, 1));
+    try std.testing.expect(admission.acceptForTesting(address, 1));
     permit.release(&admission);
-    try std.testing.expect(!admission.accept(address, 1));
+    try std.testing.expect(!admission.acceptForTesting(address, 1));
 }
 
 test "expected admission is packet bounded and preserves unrelated peer progress" {
@@ -371,20 +454,105 @@ test "expected admission is packet bounded and preserves unrelated peer progress
     const first: types.Address = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 10 }, .port = 9000 } };
     const second: types.Address = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 11 }, .port = 9000 } };
 
-    try std.testing.expect(admission.accept(first, 0));
-    try std.testing.expect(!admission.accept(first, 0));
-    try std.testing.expect(admission.accept(second, 0));
-    try std.testing.expect(!admission.accept(second, 0));
+    try std.testing.expect(admission.acceptForTesting(first, 0));
+    try std.testing.expect(!admission.acceptForTesting(first, 0));
+    try std.testing.expect(admission.acceptForTesting(second, 0));
+    try std.testing.expect(!admission.acceptForTesting(second, 0));
 
     var first_permit = try admission.acquire(first, 1);
     defer first_permit.release(&admission);
     var second_permit = try admission.acquire(second, 1);
     defer second_permit.release(&admission);
 
-    const expected = admission.accept(first, 1);
-    const unrelated_over_budget = admission.accept(first, 1);
-    const unrelated_peer_expected = admission.accept(second, 1);
+    const expected = admission.acceptForTesting(first, 1);
+    const unrelated_over_budget = admission.acceptForTesting(first, 1);
+    const unrelated_peer_expected = admission.acceptForTesting(second, 1);
     try std.testing.expect(expected);
     try std.testing.expect(!unrelated_over_budget);
     try std.testing.expect(unrelated_peer_expected);
+}
+
+test "expected credit is reserved only when ordinary admission rejects" {
+    var admission = try IngressAdmission.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+    }, 1);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 30 }, .port = 9000 } };
+    var permit = try admission.acquire(address, 1);
+    defer permit.release(&admission);
+
+    const first = admission.admit(address, 0);
+    switch (first) {
+        .ordinary => {},
+        .expected => |value| {
+            var premature = value;
+            premature.rollback(&admission);
+            return error.ExpectedCreditConsumedBeforeQuotaExhaustion;
+        },
+        .filtered => return error.UnexpectedFilter,
+    }
+    const second = admission.admit(address, 0);
+    var credit = switch (second) {
+        .expected => |value| value,
+        else => return error.ExpectedCreditConsumedBeforeQuotaExhaustion,
+    };
+    credit.rollback(&admission);
+}
+
+test "expected admission reservation is bounded and rollback restores credit" {
+    var admission = try IngressAdmission.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 10 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+    }, 1);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 30 }, .port = 9000 } };
+    try std.testing.expect(admission.acceptForTesting(address, 0));
+    try std.testing.expect(!admission.acceptForTesting(address, 0));
+    var permit = try admission.acquire(address, 1);
+    defer permit.release(&admission);
+
+    const first = admission.admit(address, 1);
+    var credit = switch (first) {
+        .expected => |value| value,
+        else => return error.MissingExpectedCredit,
+    };
+    try std.testing.expect(admission.admit(address, 1) == .filtered);
+    credit.rollback(&admission);
+
+    const retried = admission.admit(address, 1);
+    var committed = switch (retried) {
+        .expected => |value| value,
+        else => return error.MissingRestoredCredit,
+    };
+    committed.commit(&admission);
+    try std.testing.expect(admission.admit(address, 1) == .filtered);
+}
+
+test "outstanding expected credit pins a released permit slot" {
+    var admission = try IngressAdmission.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+    }, 1);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 31 }, .port = 9000 } };
+    try std.testing.expect(admission.admit(address, 0) == .ordinary);
+    var permit = try admission.acquire(address, 1);
+    const admitted = admission.admit(address, 0);
+    var credit = switch (admitted) {
+        .expected => |value| value,
+        else => return error.MissingExpectedCredit,
+    };
+
+    permit.release(&admission);
+    if (admission.acquire(address, 1)) |unexpected| {
+        var leaked = unexpected;
+        leaked.release(&admission);
+        credit.rollback(&admission);
+        return error.ExpectedPinnedPermitSlot;
+    } else |err| try std.testing.expectEqual(error.TooManyAdmissionPermits, err);
+    credit.rollback(&admission);
+
+    var replacement = try admission.acquire(address, 1);
+    replacement.release(&admission);
 }
