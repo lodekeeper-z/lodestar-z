@@ -46,19 +46,6 @@ pub fn emitPrepared(
     }
 }
 
-pub fn executePrepared(actor: *Actor, env: Env, action: actor_mod.OutboundRequestAction) !void {
-    switch (action) {
-        .queued => {},
-        .send => |effect| {
-            env.sender.send(effect.destination(), effect.packetBytes()) catch |err| {
-                actor.applySendCompletion(env, effect, .failed);
-                return err;
-            };
-            actor.applySendCompletion(env, effect, .sent);
-        },
-    }
-}
-
 pub fn drainEndpoint(actor: *Actor, env: Env, endpoint: types.Endpoint) void {
     const queued = actor.requests.firstQueued(endpoint) orelse return;
     const effect = prepareDispatch(

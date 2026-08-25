@@ -270,6 +270,34 @@ test "queued drain emits one FIFO effect per sent completion" {
     try std.testing.expectEqual(@as(usize, 2), harness.ingress.permitCount());
 }
 
+test "Actor tracked send helpers emit without executing transport" {
+    var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xbf, 0xc0, 87, 9287);
+    defer context.deinit();
+
+    _ = try context.harness.actor.sendPing(
+        context.harness.env(),
+        context.endpoint,
+        &context.remote_pubkey,
+        0,
+        .api,
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
+    context.harness.failRequestEffects();
+
+    _ = try context.harness.actor.sendTalkRequest(
+        context.harness.env(),
+        context.endpoint,
+        &context.remote_pubkey,
+        "contract",
+        "payload",
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
+    context.harness.failRequestEffects();
+    try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
+}
+
 test "prepared TALKREQ effect commits the talk response state" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb7, 0xb8, 84, 9284);
     defer context.deinit();

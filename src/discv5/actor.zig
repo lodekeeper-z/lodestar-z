@@ -347,7 +347,7 @@ pub const Actor = struct {
     ) !message.ReqId {
         var action = try self.preparePing(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, enr_seq, origin);
         const req_id = action.requestId();
-        try outbound.executePrepared(self, env, action);
+        try outbound.emitPrepared(env, action);
         return req_id;
     }
 
@@ -422,7 +422,7 @@ pub const Actor = struct {
     ) !message.ReqId {
         var action = try self.prepareTalkRequest(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, protocol_name, request, origin);
         const req_id = action.requestId();
-        try outbound.executePrepared(self, env, action);
+        try outbound.emitPrepared(env, action);
         return req_id;
     }
 
@@ -1165,6 +1165,13 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     try std.testing.expect(actor.addNode(lookup_peer_id, &lookup_pubkey, lookup_address, null, 0));
 
     const blocker_req_id = try actor.sendPing(env, blocker_endpoint, &blocker_pubkey, 0, .api);
+    while (effects.pop()) |effect| {
+        recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+            actor.applySendCompletion(env, effect, .failed);
+            return err;
+        };
+        actor.applySendCompletion(env, effect, .sent);
+    }
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);

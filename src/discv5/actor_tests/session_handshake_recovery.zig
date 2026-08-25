@@ -18,6 +18,21 @@ const PacketLink = @import("../test_support/packet_link.zig").PacketLink;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
 const deliverEncrypted = @import("../test_support/encrypted_delivery.zig").deliverEncrypted;
 
+fn drainRequestEffects(
+    actor: *actor_mod.Actor,
+    env: actor_mod.Env,
+    effects: *actor_mod.RequestEffectQueue,
+    sender: *RecordingSender,
+) !void {
+    while (effects.pop()) |effect| {
+        sender.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+            actor.applySendCompletion(env, effect, .failed);
+            return err;
+        };
+        actor.applySendCompletion(env, effect, .sent);
+    }
+}
+
 test "oversized sessionless TALKREQ handshake fails once without waiting for timeout" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -57,6 +72,7 @@ test "oversized sessionless TALKREQ handshake fails once without waiting for tim
 
     const request = [_]u8{0x5a} ** 1_100;
     const req_id = try harness.actor.sendTalkRequestWithOrigin(env, endpoint, &remote_pubkey, "utp", &request, .reliable_api);
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
     try std.testing.expect(harness.recording.datagrams.items[0].bytes.len <= packet.MAX_PACKET_SIZE);
     const key = types.RequestKey.init(endpoint, req_id);
@@ -117,6 +133,7 @@ test "smaller sessionless TALKREQ still recovers with one handshake packet" {
     var harness = try ActorHarness.init(alloc, io, cfg);
     defer harness.deinit();
     const req_id = try harness.actor.sendTalkRequest(harness.env(), endpoint, &remote_pubkey, "utp", "small request");
+    try harness.drainRequestEffects();
     var initial = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(initial.bytes[0..initial.len], &remote_id)).static_header.nonce;
     var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
@@ -189,8 +206,11 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var effect_storage_a: [2]actor_mod.SendDatagramEffect = undefined;
+    var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
+    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
     var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -206,12 +226,13 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     }, now_ns);
 
     const req_id = try actor_a.sendPing(
-        .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a },
+        env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
         0,
         .api,
     );
+    try drainRequestEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
     try link_b_to_a.dropNext();
@@ -220,7 +241,6 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
 
     const request_key = types.RequestKey.init(.{ .node_id = id_b, .addr = address_b }, req_id);
     const deadline_ns = actor_a.requests.get(request_key).?.deadline_ns;
-    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a };
     actor_a.maintenanceAt(env_a, deadline_ns - 1);
     try std.testing.expectEqual(@as(usize, 1), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), ingress_a.permitCount());
@@ -289,19 +309,23 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var effect_storage_a: [2]actor_mod.SendDatagramEffect = undefined;
+    var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
+    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
     var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
 
     const req_id = try actor_a.sendPing(
-        .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a },
+        env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
         0,
         .api,
     );
+    try drainRequestEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
@@ -375,8 +399,11 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var effect_storage_a: [2]actor_mod.SendDatagramEffect = undefined;
+    var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
+    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
     var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -386,12 +413,13 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     actor_b.sessions.put(endpoint_a, .{ .initiator_key = b_to_a, .recipient_key = a_to_b }, now_ns);
 
     _ = try actor_a.sendPing(
-        .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a },
+        env_a,
         endpoint_b,
         &pubkey_b,
         0,
         .api,
     );
+    try drainRequestEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
     try std.testing.expect(actor_a.sessions.remove(endpoint_b));
@@ -502,6 +530,7 @@ test "failed retry datagram does not increment sent message metrics" {
     const actor = &harness.actor;
     actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 }, outbound.nowNs(io));
     const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try harness.drainRequestEffects();
     var initial = harness.recording.datagrams.items[0].bytes;
     const initial_nonce = (try packet.decode(initial.bytes[0..initial.len], &endpoint.node_id)).static_header.nonce;
 
@@ -741,7 +770,9 @@ test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
     actor.sessions.put(endpoint, stable, now_ns);
 
     const req_a = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    try harness.drainRequestEffects();
     const req_b = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    try harness.drainRequestEffects();
     var sent_a = harness.recording.datagrams.items[0].bytes;
     var sent_b = harness.recording.datagrams.items[1].bytes;
     const nonce_a = (try packet.decode(sent_a.bytes[0..sent_a.len], &remote_id)).static_header.nonce;
@@ -798,6 +829,7 @@ test "HANDSHAKE send failure leaves WHOAREYOU request state unchanged" {
     defer harness.deinit();
     const actor = &harness.actor;
     const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try harness.drainRequestEffects();
     var probe = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(probe.bytes[0..probe.len], &remote_id)).static_header.nonce;
     var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
@@ -912,6 +944,7 @@ test "expired stable outbound paths recover without access-time removal" {
     try std.testing.expectEqual(@as(usize, 1), actor.sessions.count());
 
     const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(@as(usize, 1), actor.sessions.count());
     const active = actor.requests.get(.init(endpoint, req_id)) orelse return error.MissingExpiredSessionRequest;
     try std.testing.expect(active.phase == .awaiting_whoareyou);
@@ -1161,18 +1194,22 @@ test "successful handshake records initial probe nonce and replay is inert" {
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    var effect_storage_a: [2]actor_mod.SendDatagramEffect = undefined;
+    var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
+    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
     var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, outbound.nowNs(io)));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, outbound.nowNs(io)));
 
     _ = try actor_a.sendPing(
-        .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a },
+        env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
         0,
         .api,
     );
+    try drainRequestEffects(&actor_a, env_a, &effects_a, &sender_a);
     const original_probe_index = try link_a_to_b.snapshotNext();
     var original_probe = sender_a.datagrams.items[original_probe_index].bytes;
     const probe_nonce = (try packet.decode(original_probe.bytes[0..original_probe.len], &id_b)).static_header.nonce;
@@ -1286,6 +1323,7 @@ test "old key remains accepted without promotion until candidate response" {
     const old = session_book.StableSession{ .initiator_key = [_]u8{0x71} ** 16, .recipient_key = [_]u8{0x72} ** 16 };
     actor.sessions.put(endpoint, old, outbound.nowNs(io));
     const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try harness.drainRequestEffects();
     var sent = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id)).static_header.nonce;
     var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
@@ -1366,6 +1404,7 @@ test "rekey lane queues stable-key requests and drains FIFO after candidate proo
     actor.sessions.put(endpoint, old, outbound.nowNs(io));
 
     _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    try harness.drainRequestEffects();
     var sent = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id)).static_header.nonce;
     var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
