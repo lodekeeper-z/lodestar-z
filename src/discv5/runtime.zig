@@ -493,7 +493,7 @@ const RuntimeImpl = struct {
 
     fn abortRequestEffects(self: *RuntimeImpl) void {
         while (self.request_effects.pop()) |effect| {
-            self.actor.applySendCompletion(self.actorEnv(), effect, .failed);
+            self.actor.applySendCompletion(self.actorEnv(), effect, .runtime_stopped);
         }
     }
 
@@ -663,7 +663,7 @@ fn executeRequestEffect(runtime: *RuntimeImpl, action_value: actor_mod.OutboundR
 
 fn executeSendEffect(runtime: *RuntimeImpl, effect: actor_mod.SendDatagramEffect) !void {
     runtime.transport.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-        runtime.actor.applySendCompletion(runtime.actorEnv(), effect, .failed);
+        runtime.actor.applySendCompletion(runtime.actorEnv(), effect, if (err == error.Canceled) .runtime_stopped else .failed);
         return err;
     };
     runtime.actor.applySendCompletion(runtime.actorEnv(), effect, .sent);

@@ -21,6 +21,21 @@ fn expectNoEvent(outbox: *events.EventOutbox, alloc: std.mem.Allocator) !void {
     return error.UnexpectedEvent;
 }
 
+fn drainRequestEffects(
+    actor: *actor_mod.Actor,
+    env: actor_mod.Env,
+    effects: *actor_mod.RequestEffectQueue,
+    sender: *RecordingSender,
+) !void {
+    while (effects.pop()) |effect| {
+        sender.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+            actor.applySendCompletion(env, effect, .failed);
+            return err;
+        };
+        actor.applySendCompletion(env, effect, .sent);
+    }
+}
+
 const ReliableRequestCleanup = struct {
     actor: *actor_mod.Actor,
     env: actor_mod.Env,
@@ -193,7 +208,9 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
-    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_results = &results_a };
+    var effect_storage_a: [4]actor_mod.SendDatagramEffect = undefined;
+    var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
+    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a, .request_results = &results_a };
     const env_b = actor_mod.Env{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b };
     var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, env_b);
     var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
@@ -295,12 +312,13 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     const distance_c: u16 = @as(u16, @import("../kbucket.zig").logDistance(&id_b, &id_c).?) + 1;
     const distance_d: u16 = @as(u16, @import("../kbucket.zig").logDistance(&id_b, &id_d).?) + 1;
     _ = try actor_a.sendFindNode(
-        .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a },
+        env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
         &.{ distance_c, distance_d },
         .api,
     );
+    try drainRequestEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();
     var discovered_event = outbox_a.pop() orelse return error.MissingDiscoveredEnr;

@@ -916,6 +916,7 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
         &.{ distance_a, distance_b },
         .api,
     );
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     var first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;

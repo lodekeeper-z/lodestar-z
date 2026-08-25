@@ -164,6 +164,7 @@ test "validated NODES boundary rejects invalid signatures and preserves reliable
     var env = harness.env();
     env.request_results = &results;
     const req_id = try actor.sendFindNode(env, endpoint, &responder_pubkey, &.{ distance_a, distance_b }, .reliable_api);
+    try harness.drainRequestEffects();
 
     var invalid_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const invalid_nodes = message.Nodes{ .req_id = req_id, .total = 3, .enrs = &.{invalid} };
@@ -237,6 +238,7 @@ test "expected NODES response accepts the 16-entry decode boundary" {
     var env = harness.env();
     env.request_results = &results;
     const req_id = try actor.sendFindNode(env, endpoint, &responder_pubkey, &.{1}, .reliable_api);
+    try harness.drainRequestEffects();
     switch (harness.ingress.admit(endpoint.addr, 0)) {
         .ordinary => {},
         else => return error.MissingOrdinaryAdmission,
@@ -302,6 +304,7 @@ test "validated NODES multipart values survive as lookup closer IDs" {
         &.{ distance_a, distance_b },
         .{ .lookup = lookup_id },
     );
+    try harness.drainRequestEffects();
 
     var first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const first = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{returned_a.raw} };
@@ -376,10 +379,12 @@ test "discv5 lookup duplicate uses newer routed ENR for dispatch and result" {
         &.{wireDistance(&older.node_id, &responder_id)},
         .{ .lookup = lookup_id },
     );
+    try harness.drainRequestEffects();
 
     var stale_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const stale_nodes = message.Nodes{ .req_id = responder_req_id, .total = 1, .enrs = &.{older.raw} };
     try deliverEncrypted(actor, env, responder_endpoint, &responder_session.recipient_key, try stale_nodes.encodeInto(&stale_buffer), 0xc8);
+    try harness.drainRequestEffects();
 
     const routed = actor.peers.routing.getEntry(&newer.node_id) orelse return error.MissingRoutedCandidate;
     try std.testing.expectEqual(@as(u64, 2), routed.enr_seq);
@@ -467,10 +472,12 @@ test "discv5 lookup-local contact dispatch replaces full untrusted fallback rete
         &.{wireDistance(&returned.node_id, &responder_id)},
         .{ .lookup = lookup_id },
     );
+    try harness.drainRequestEffects();
 
     var nodes_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const nodes = message.Nodes{ .req_id = req_id, .total = 1, .enrs = &.{returned.raw} };
     try deliverEncrypted(actor, harness.env(), endpoint, &stable.recipient_key, try nodes.encodeInto(&nodes_buffer), 0xa7);
+    try harness.drainRequestEffects();
 
     try std.testing.expect(actor.peers.known(&returned.node_id) != null);
     try std.testing.expect(actor.peers.known(&contact_id) == null);

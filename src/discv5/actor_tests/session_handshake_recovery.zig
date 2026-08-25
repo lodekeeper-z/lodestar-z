@@ -660,6 +660,7 @@ test "NODES total is exact bounded consistent and controls final permit release"
     const stable = session_book.StableSession{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
     const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{0}, .api);
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     var invalid_buffer: [128]u8 = undefined;
@@ -1439,10 +1440,8 @@ test "initial tracked send failure is caller-visible and fully unwinds" {
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9000 } },
     };
 
-    try std.testing.expectError(
-        error.TransportSendFailed,
-        actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{1}, .api),
-    );
+    _ = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{1}, .api);
+    try std.testing.expectError(error.TransportSendFailed, harness.drainRequestEffects());
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());

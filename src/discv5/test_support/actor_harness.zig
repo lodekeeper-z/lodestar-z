@@ -37,7 +37,7 @@ pub const ActorHarness = struct {
     }
 
     pub fn deinit(self: *ActorHarness) void {
-        self.failRequestEffects();
+        while (self.request_effects.pop()) |effect| effect.abortPreparation(&self.ingress);
         self.recording.deinit();
         self.actor.deinit(&self.ingress);
         self.outbox.deinit();

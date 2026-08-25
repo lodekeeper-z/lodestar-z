@@ -33,7 +33,6 @@ pub fn prepareTracked(
 }
 
 pub fn emitPrepared(
-    actor: *Actor,
     env: Env,
     action: actor_mod.OutboundRequestAction,
 ) !void {
@@ -41,7 +40,7 @@ pub fn emitPrepared(
     switch (action) {
         .queued => {},
         .send => |effect| effects.push(effect) catch {
-            actor.applySendCompletion(env, effect, .failed);
+            effect.abortPreparation(env.ingress);
             return error.TooManyActiveRequests;
         },
     }

@@ -16,6 +16,21 @@ const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
 const deliverEncrypted = @import("../test_support/encrypted_delivery.zig").deliverEncrypted;
 
+fn drainRequestEffects(
+    actor: *actor_mod.Actor,
+    env: actor_mod.Env,
+    effects: *actor_mod.RequestEffectQueue,
+    recording: *RecordingSender,
+) !void {
+    while (effects.pop()) |effect| {
+        recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+            actor.applySendCompletion(env, effect, .failed);
+            return err;
+        };
+        actor.applySendCompletion(env, effect, .sent);
+    }
+}
+
 test "addEnr treats an older ENR for a known newer node as usable without an event" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -270,6 +285,60 @@ test "LocalRecord replacement is atomic across allocator failure" {
     try std.testing.expect(updated == .local_enr_updated);
 }
 
+test "lookup transport failure completes through emitted effect ownership" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x93} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x94} ** 32));
+    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
+    remote_builder.ip = .{ 127, 0, 0, 144 };
+    remote_builder.udp = 9144;
+    const remote_enr = try remote_builder.encode();
+    defer alloc.free(remote_enr);
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 2,
+            .max_queued_requests = 2,
+            .event_capacity = 2,
+            .command_capacity = 2,
+            .lookup_result_capacity = 1,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    var result_outbox = try lookup_results.LookupResultOutbox.init(io, alloc, 1);
+    defer result_outbox.deinit();
+    try std.testing.expect(result_outbox.reserve());
+    try std.testing.expect(harness.actor.peers.learnEnr(remote_enr, 0) != null);
+    var env = harness.env();
+    env.lookup_results = &result_outbox;
+    var accepted_lookup: ?u32 = null;
+    defer if (accepted_lookup) |id| {
+        if (harness.actor.lookups.contains(id)) harness.actor.finishLookup(env, id, .runtime_stopped);
+    };
+
+    const lookup_id = try harness.actor.startLookup(env, remote_id);
+    accepted_lookup = lookup_id;
+    try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+
+    while (harness.request_effects.pop()) |effect| {
+        harness.actor.applySendCompletion(env, effect, .failed);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expect(!harness.actor.lookups.contains(lookup_id));
+    const result = result_outbox.pop() orelse return error.MissingLookupResult;
+    try std.testing.expectEqual(lookup_id, result.lookup_id);
+    try std.testing.expectEqual(lookup_results.LookupTerminalReason.completed, result.reason);
+}
+
 test "reliable lookup terminal payload needs no compatibility event allocation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
@@ -357,6 +426,7 @@ test "detached late multipart NODES still learns emits and releases final permit
     const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{}, 0, actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
     const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{distance}, .{ .lookup = lookup_id });
+    try harness.drainRequestEffects();
     actor.finishLookup(harness.env(), lookup_id, .completed);
     try std.testing.expect(harness.outbox.pop() == null);
     try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(.init(endpoint, req_id)).?.origin);
@@ -421,10 +491,20 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
+    var effect_storage: [2]actor_mod.SendDatagramEffect = undefined;
+    var effects = actor_mod.RequestEffectQueue.init(&effect_storage);
+    const env = actor_mod.Env{
+        .io = io,
+        .sender = recording.sender(),
+        .ingress = &ingress,
+        .outbox = &outbox,
+        .request_effects = &effects,
+    };
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x86} ** 16, .recipient_key = [_]u8{0x87} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
 
-    const first_req = try actor.sendFindNode(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
+    const first_req = try actor.sendFindNode(env, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
+    try drainRequestEffects(&actor, env, &effects, &recording);
     var first_chunk_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const first_chunk = message.Nodes{ .req_id = first_req, .total = 2, .enrs = &.{raw_a} };
     var fail_first = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -444,7 +524,8 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
     try std.testing.expect(outbox.pop() == null);
 
-    const final_req = try actor.sendFindNode(.{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox }, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
+    const final_req = try actor.sendFindNode(env, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
+    try drainRequestEffects(&actor, env, &effects, &recording);
     var successful_first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const successful_first = message.Nodes{ .req_id = final_req, .total = 2, .enrs = &.{raw_a} };
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try successful_first.encodeInto(&successful_first_buffer), 17);

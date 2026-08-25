@@ -60,6 +60,7 @@ pub const TransitionContext = struct {
 pub const SendCompletion = enum {
     sent,
     failed,
+    runtime_stopped,
 };
 
 /// Move-owned outbound transition. Until Runtime reports completion, this is
@@ -85,6 +86,11 @@ pub const SendDatagramEffect = struct {
             .retained => |value| value,
             .transient => |value| value.prepared,
         };
+    }
+
+    pub fn abortPreparation(self: SendDatagramEffect, ingress: *admission.IngressAdmission) void {
+        var pending = self.takePrepared();
+        pending.abort(ingress);
     }
 
     pub fn requestId(self: *const SendDatagramEffect) message.ReqId {
@@ -276,12 +282,23 @@ pub const Actor = struct {
                 outbound.noteSentRequest(self, kind);
                 self.onRequestSendSuccess(env, key, origin);
             },
-            .failed => {
+            .failed, .runtime_stopped => {
                 const key = pending.key;
                 const origin = pending.origin;
                 pending.abort(env.ingress);
-                self.onRequestSendFailure(key, origin);
+                if (completion_event == .runtime_stopped) {
+                    self.onRequestSendStopped(env, key, origin);
+                } else {
+                    self.onRequestSendFailure(env, key, origin);
+                }
             },
+        }
+    }
+
+    fn onRequestSendStopped(self: *Actor, env: Env, key: types.RequestKey, origin: types.RequestOrigin) void {
+        switch (origin) {
+            .lookup => |id| self.finishLookup(env, id, .runtime_stopped),
+            else => self.onRequestSendFailure(env, key, origin),
         }
     }
 
@@ -297,7 +314,7 @@ pub const Actor = struct {
         }
     }
 
-    fn onRequestSendFailure(self: *Actor, key: types.RequestKey, origin: types.RequestOrigin) void {
+    fn onRequestSendFailure(self: *Actor, env: Env, key: types.RequestKey, origin: types.RequestOrigin) void {
         switch (origin) {
             .maintenance => |reason| switch (reason) {
                 .health, .enr_propagation => _ = self.peers.cancelHealthRequest(key),
@@ -307,7 +324,13 @@ pub const Actor = struct {
                 .incumbent_id = key.endpoint.node_id,
                 .generation = generation,
             }, key),
-            .api, .reliable_api, .lookup, .detached_lookup => {},
+            .lookup => |id| {
+                if (self.lookups.getPtr(id)) |lookup| {
+                    lookup.onFailure(&key.endpoint.node_id, self.lookup_config);
+                } else return;
+                self.pumpLookup(env, id);
+            },
+            .api, .reliable_api, .detached_lookup => {},
         }
     }
 
@@ -353,7 +376,7 @@ pub const Actor = struct {
     ) !message.ReqId {
         var action = try self.prepareFindNode(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, distances, origin);
         const req_id = action.requestId();
-        try outbound.executePrepared(self, env, action);
+        try outbound.emitPrepared(env, action);
         return req_id;
     }
 
@@ -753,7 +776,10 @@ pub const Actor = struct {
             _ = self.peers.cancelEvictionRequest(probe.ticket, key);
             return err;
         };
-        try outbound.emitPrepared(self, env, action);
+        outbound.emitPrepared(env, action) catch |err| {
+            _ = self.peers.cancelEvictionRequest(probe.ticket, key);
+            return err;
+        };
     }
 
     /// Pre-send reservation transaction for health/eviction liveness probes:
@@ -792,7 +818,10 @@ pub const Actor = struct {
             _ = self.peers.cancelHealthRequest(key);
             return err;
         };
-        try outbound.emitPrepared(self, env, action);
+        outbound.emitPrepared(env, action) catch |err| {
+            _ = self.peers.cancelHealthRequest(key);
+            return err;
+        };
         return req_id;
     }
 
@@ -1127,7 +1156,9 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    var effect_storage: [1]SendDatagramEffect = undefined;
+    var effects = RequestEffectQueue.init(&effect_storage);
+    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox, .request_effects = &effects };
     try std.testing.expect(actor.addNode(lookup_peer_id, &lookup_pubkey, lookup_address, null, 0));
 
     const blocker_req_id = try actor.sendPing(env, blocker_endpoint, &blocker_pubkey, 0, .api);
@@ -1156,6 +1187,13 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
 
     actor.maintenance(env);
+    while (effects.pop()) |effect| {
+        recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+            actor.applySendCompletion(env, effect, .failed);
+            return err;
+        };
+        actor.applySendCompletion(env, effect, .sent);
+    }
     const dispatched = actor.lookups.getPtr(lookup_id) orelse return error.LookupFinishedBeforeDispatch;
     try std.testing.expectEqual(@as(usize, 1), dispatched.num_waiting);
     try std.testing.expect(!dispatched.deferred);
@@ -1200,13 +1238,22 @@ test "discv5 actor: lookup transport send failure remains terminal" {
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    var effect_storage: [1]SendDatagramEffect = undefined;
+    var effects = RequestEffectQueue.init(&effect_storage);
+    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox, .request_effects = &effects };
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, remote_address, null, 0));
     const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0x98} ** 32, &.{remote_id}, outbound.nowNs(io), actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(1, lookup);
     recording.fail_next = true;
 
     actor.pumpLookup(env, 1);
+    while (effects.pop()) |effect| {
+        recording.sender().send(effect.destination(), effect.packetBytes()) catch {
+            actor.applySendCompletion(env, effect, .failed);
+            continue;
+        };
+        actor.applySendCompletion(env, effect, .sent);
+    }
 
     try std.testing.expect(!actor.lookups.contains(1));
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
