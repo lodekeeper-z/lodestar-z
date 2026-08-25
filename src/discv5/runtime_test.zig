@@ -409,6 +409,94 @@ fn startRuntimeLookup(context: *RuntimeLookupContext) void {
     };
 }
 
+test "Runtime cancellation completes residual emitted effects before shutdown" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x6d} ** 32));
+    const runtime = try runtime_mod.Runtime.init(io, alloc, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .ping_interval_ms = 1,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 2,
+            .max_queued_requests = 2,
+            .event_capacity = 2,
+            .command_capacity = 4,
+        },
+    }, .{ .maintenance_interval_ms = 60_000 });
+    defer runtime.deinit();
+
+    var run_error: ?anyerror = null;
+    var runtime_group: std.Io.Group = .init;
+    var runtime_group_started = false;
+    var cancel_thread: ?std.Thread = null;
+    var cancel_thread_joined = false;
+    var gate = transport_mod.Testing.SendGate{ .cancelable = true };
+    const remote_key_a = try secp.keyPairFromSecret(&([_]u8{0x6e} ** 32));
+    const remote_pubkey_a = secp.compressedPubkey(&remote_key_a);
+    const remote_id_a = try enr.nodeIdFromCompressedPubkey(&remote_pubkey_a);
+    const remote_address_a: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 110 }, .port = 9310 } };
+    var remote_builder_a = enr.Builder.init(alloc, remote_key_a, 1);
+    remote_builder_a.ip = .{ 127, 0, 0, 110 };
+    remote_builder_a.udp = 9310;
+    const remote_enr_a = try remote_builder_a.encode();
+    defer alloc.free(remote_enr_a);
+    const remote_key_b = try secp.keyPairFromSecret(&([_]u8{0x6f} ** 32));
+    const remote_pubkey_b = secp.compressedPubkey(&remote_key_b);
+    const remote_id_b = try enr.nodeIdFromCompressedPubkey(&remote_pubkey_b);
+    const remote_address_b: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 111 }, .port = 9311 } };
+    var remote_builder_b = enr.Builder.init(alloc, remote_key_b, 1);
+    remote_builder_b.ip = .{ 127, 0, 0, 111 };
+    remote_builder_b.udp = 9311;
+    const remote_enr_b = try remote_builder_b.encode();
+    defer alloc.free(remote_enr_b);
+    try std.testing.expect(runtime_mod.Testing.addConnectedNode(runtime, remote_id_a, remote_pubkey_a, remote_address_a, remote_enr_a));
+    try std.testing.expect(runtime_mod.Testing.addConnectedNode(runtime, remote_id_b, remote_pubkey_b, remote_address_b, remote_enr_b));
+
+    try runtime_group.concurrent(io, runRuntime, .{ runtime, &run_error });
+    runtime_group_started = true;
+    defer {
+        gate.proceed.store(true, .release);
+        if (cancel_thread) |thread| {
+            if (!cancel_thread_joined) thread.join();
+        } else if (runtime_group_started) {
+            runtime_group.cancel(io);
+        }
+        if (runtime_group_started) runtime_group.await(io) catch {};
+    }
+    for (0..10_000) |_| {
+        if (runtime.isRunning()) break;
+        try std.Thread.yield();
+    } else return error.RuntimeDidNotStart;
+
+    runtime_mod.Testing.setSendGate(runtime, &gate);
+    try runtime_mod.Testing.putMaintenance(runtime);
+    try awaitFlag(&gate.entered, error.RuntimeDidNotEnter);
+
+    var cancel_context = CancelTransportContext{ .io = io, .group = &runtime_group };
+    cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
+    try awaitFlag(&gate.cancellation_observed, error.TransportCancellationWasNotObserved);
+    gate.proceed.store(true, .release);
+    try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
+    cancel_thread.?.join();
+    cancel_thread_joined = true;
+    try runtime_group.await(io);
+    runtime_group_started = false;
+
+    try std.testing.expectEqual(error.Canceled, run_error.?);
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    if (counts.permits != 0) {
+        runtime_mod.Testing.resetAdmissionAfterDetectedLeak(runtime);
+        return error.ResidualEffectPermitNotReleased;
+    }
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+}
+
 test "Runtime send cancellation closes drains joins and releases command state" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});

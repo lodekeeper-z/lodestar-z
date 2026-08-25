@@ -1465,20 +1465,24 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
 }
 
-test "discv5 actor: lookup transport send failure remains terminal" {
+test "discv5 actor: lookup transport failure continues with next candidate" {
     const test_secp = @import("secp256k1.zig");
     const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try test_secp.keyPairFromSecret(&([_]u8{0x96} ** 32));
-    const remote_key = try test_secp.keyPairFromSecret(&([_]u8{0x97} ** 32));
-    const remote_pubkey = test_secp.compressedPubkey(&remote_key);
-    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
-    const remote_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 97 }, .port = 9097 } };
+    const remote_key_a = try test_secp.keyPairFromSecret(&([_]u8{0x97} ** 32));
+    const remote_pubkey_a = test_secp.compressedPubkey(&remote_key_a);
+    const remote_id_a = try enr.nodeIdFromCompressedPubkey(&remote_pubkey_a);
+    const remote_key_b = try test_secp.keyPairFromSecret(&([_]u8{0x98} ** 32));
+    const remote_pubkey_b = test_secp.compressedPubkey(&remote_key_b);
+    const remote_id_b = try enr.nodeIdFromCompressedPubkey(&remote_pubkey_b);
+    const remote_address_a: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 97 }, .port = 9097 } };
+    const remote_address_b: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 98 }, .port = 9098 } };
     const cfg = config_mod.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .lookup_num_results = 1,
+        .lookup_num_results = 2,
         .lookup_parallelism = 1,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 2, .command_capacity = 2 },
@@ -1494,23 +1498,31 @@ test "discv5 actor: lookup transport send failure remains terminal" {
     var effect_storage: [1]ActorEffect = undefined;
     var effects = EffectQueue.init(&effect_storage);
     const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .effects = &effects };
-    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, remote_address, null, 0));
-    const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0x98} ** 32, &.{remote_id}, outbound.nowNs(io), actor.lookup_config);
+    try std.testing.expect(actor.addNode(remote_id_a, &remote_pubkey_a, remote_address_a, null, 0));
+    try std.testing.expect(actor.addNode(remote_id_b, &remote_pubkey_b, remote_address_b, null, 0));
+    const lookup = try lookup_mod.Lookup.init(
+        alloc,
+        [_]u8{0x99} ** 32,
+        &.{ remote_id_a, remote_id_b },
+        outbound.nowNs(io),
+        actor.lookup_config,
+    );
     actor.lookups.putAssumeCapacityNoClobber(1, lookup);
-    recording.fail_next = true;
+    defer if (actor.lookups.contains(1)) actor.finishLookup(env, 1, .runtime_stopped);
 
     actor.pumpLookup(env, 1);
-    while (effects.pop()) |effect| {
-        recording.sender().send(effect.destination(), effect.packetBytes()) catch {
-            actor.applyEffectCompletion(env, effect, .failed);
-            continue;
-        };
-        actor.applyEffectCompletion(env, effect, .sent);
-    }
+    const first = effects.pop() orelse return error.MissingFirstLookupEffect;
+    const failed_destination = first.destination();
+    actor.applyEffectCompletion(env, first, .failed);
 
-    try std.testing.expect(!actor.lookups.contains(1));
-    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
-    try std.testing.expectEqual(@as(usize, 0), recording.datagrams.items.len);
+    const second = effects.pop() orelse return error.MissingSecondLookupEffect;
+    try std.testing.expect(!std.meta.eql(failed_destination, second.destination()));
+    try recording.sender().send(second.destination(), second.packetBytes());
+    actor.applyEffectCompletion(env, second, .sent);
+
+    try std.testing.expect(actor.lookups.contains(1));
+    try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
     try std.testing.expect(outbox.pop() == null);
 }

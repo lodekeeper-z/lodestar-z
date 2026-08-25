@@ -79,6 +79,19 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             transport.Testing.setSendGate(&impl(runtime).transport, gate);
         }
 
+        pub fn addConnectedNode(
+            runtime: *Runtime,
+            node_id: types.NodeId,
+            pubkey: [33]u8,
+            address: types.Address,
+            raw_enr: []const u8,
+        ) bool {
+            const storage = impl(runtime);
+            if (!storage.actor.addNode(node_id, &pubkey, address, raw_enr, 0)) return false;
+            _ = storage.actor.peers.markResponsive(node_id, address, 0, null);
+            return true;
+        }
+
         pub fn activeAndPermitCount(runtime: *Runtime) struct { active: usize, permits: usize } {
             const counts = activeQueuedAndPermitCount(runtime);
             return .{ .active = counts.active, .permits = counts.permits };
@@ -91,6 +104,17 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
                 .queued = storage.actor.requests.queuedCount(),
                 .permits = storage.admission.permitCount(),
             };
+        }
+
+        pub fn resetAdmissionAfterDetectedLeak(runtime: *Runtime) void {
+            const state = &impl(runtime).admission;
+            state.expected_by_ip.clearRetainingCapacity();
+            state.live_permits = 0;
+            state.reserved_credits = 0;
+            for (state.permit_slots, 0..) |*slot, index| {
+                slot.* = .{ .free_next = if (index + 1 < state.permit_slots.len) @intCast(index + 1) else null };
+            }
+            state.free_head = 0;
         }
 
         pub fn requestResultReservationCount(runtime: *Runtime) struct { outstanding: usize, unclaimed: usize } {
