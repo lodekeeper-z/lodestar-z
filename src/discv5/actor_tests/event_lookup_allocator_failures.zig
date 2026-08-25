@@ -15,6 +15,7 @@ const types = @import("../types.zig");
 const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
 const deliverEncrypted = @import("../test_support/encrypted_delivery.zig").deliverEncrypted;
+const deliverEncryptedWithEnv = @import("../test_support/encrypted_delivery.zig").deliverEncryptedWithEnv;
 
 fn drainRequestEffects(
     actor: *actor_mod.Actor,
@@ -144,7 +145,8 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     actor.alloc = failing.allocator();
     defer actor.alloc = alloc;
-    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try response.encodeInto(&response_buffer), 11);
+    try deliverEncryptedWithEnv(actor, harness.env(), endpoint, &stable.recipient_key, try response.encodeInto(&response_buffer), 11);
+    try harness.drainRequestEffects();
     actor.alloc = alloc;
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());

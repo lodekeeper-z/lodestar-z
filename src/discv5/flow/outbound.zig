@@ -60,37 +60,19 @@ pub fn executePrepared(actor: *Actor, env: Env, action: actor_mod.OutboundReques
 }
 
 pub fn drainEndpoint(actor: *Actor, env: Env, endpoint: types.Endpoint) void {
-    var drained: usize = 0;
-    while (drained < actor.limits.max_queued_requests_per_endpoint) : (drained += 1) {
-        const queued = actor.requests.firstQueued(endpoint) orelse return;
-        dispatch(
-            actor,
-            env,
-            queued.endpoint,
-            &queued.dest_pubkey,
-            queued.req_id,
-            queued.kind,
-            &queued.requested_distances,
-            queued.plaintext.slice(),
-            queued.origin,
-        ) catch return;
-        if (actor.sessions.get(endpoint, nowNs(env.io)) == null) return;
-    }
-}
-
-fn dispatch(
-    actor: *Actor,
-    env: Env,
-    endpoint: types.Endpoint,
-    dest_pubkey: *const [33]u8,
-    req_id: message.ReqId,
-    kind: types.RequestKind,
-    requested_distances: *const request_book.RequestDistances,
-    plaintext: []const u8,
-    origin: types.RequestOrigin,
-) !void {
-    const effect = try prepareDispatch(actor, .{ .io = env.io, .ingress = env.ingress }, endpoint, dest_pubkey, req_id, kind, requested_distances, plaintext, origin);
-    try executePrepared(actor, env, .{ .send = effect });
+    const queued = actor.requests.firstQueued(endpoint) orelse return;
+    const effect = prepareDispatch(
+        actor,
+        .{ .io = env.io, .ingress = env.ingress },
+        queued.endpoint,
+        &queued.dest_pubkey,
+        queued.req_id,
+        queued.kind,
+        &queued.requested_distances,
+        queued.plaintext.slice(),
+        queued.origin,
+    ) catch return;
+    emitPrepared(env, .{ .send = effect }) catch return;
 }
 
 fn prepareDispatch(

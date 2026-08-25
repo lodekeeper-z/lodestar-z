@@ -281,6 +281,9 @@ pub const Actor = struct {
                 self.requests.commitSent(pending);
                 outbound.noteSentRequest(self, kind);
                 self.onRequestSendSuccess(env, key, origin);
+                if (self.sessions.get(key.endpoint, outbound.nowNs(env.io)) != null) {
+                    outbound.drainEndpoint(self, env, key.endpoint);
+                }
             },
             .failed, .runtime_stopped => {
                 const key = pending.key;

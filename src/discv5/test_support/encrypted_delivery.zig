@@ -17,6 +17,24 @@ pub fn deliverEncrypted(
     plaintext: []const u8,
     nonce_byte: u8,
 ) !void {
+    return deliverEncryptedWithEnv(
+        actor,
+        .{ .io = io, .sender = sender, .ingress = ingress, .outbox = outbox },
+        endpoint,
+        read_key,
+        plaintext,
+        nonce_byte,
+    );
+}
+
+pub fn deliverEncryptedWithEnv(
+    actor: *actor_mod.Actor,
+    env: actor_mod.Env,
+    endpoint: types.Endpoint,
+    read_key: *const [16]u8,
+    plaintext: []const u8,
+    nonce_byte: u8,
+) !void {
     var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     var masking_iv = [_]u8{0x61} ** packet.MASKING_IV_SIZE;
     masking_iv[0] = nonce_byte;
@@ -30,5 +48,5 @@ pub fn deliverEncrypted(
         .write_key = read_key,
         .plaintext = plaintext,
     });
-    actor.handlePacket(.{ .io = io, .sender = sender, .ingress = ingress, .outbox = outbox }, encoded, endpoint.addr);
+    actor.handlePacket(env, encoded, endpoint.addr);
 }

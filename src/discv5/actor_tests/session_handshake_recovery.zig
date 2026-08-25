@@ -1389,6 +1389,7 @@ test "rekey lane queues stable-key requests and drains FIFO after candidate proo
     var proof_buffer: [128]u8 = undefined;
     var proof = try encodeEncryptedPacket(actor, remote_id, &pending.keys.recipient_key, try proof_ping.encodeInto(&proof_buffer), 11);
     actor.handlePacket(harness.env(), proof.bytes[0..proof.len], endpoint.addr);
+    try harness.drainRequestEffects();
 
     try std.testing.expect(actor.requests.pendingKeys(endpoint) == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());

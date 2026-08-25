@@ -663,6 +663,7 @@ test "named cancellation conserves permits and queued FIFO across drain failure"
     harness.recording.fail_next = true;
     try std.testing.expect(actor.cancelRequest(harness.env(), .init(endpoint, first)));
     try std.testing.expect(!actor.cancelRequest(harness.env(), .init(endpoint, first)));
+    try std.testing.expectError(error.TransportSendFailed, harness.drainRequestEffects());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
@@ -674,6 +675,7 @@ test "named cancellation conserves permits and queued FIFO across drain failure"
     };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
     outbound.drainEndpoint(actor, harness.env(), endpoint);
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
@@ -724,11 +726,13 @@ test "maintenance automatically redrains a queued lane after one transient send 
         harness.env(),
         .init(endpoint, first),
     ));
+    try std.testing.expectError(error.TransportSendFailed, harness.drainRequestEffects());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 
     actor.maintenance(harness.env());
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());

@@ -3,6 +3,7 @@ const actor_mod = @import("../actor.zig");
 const config = @import("../config.zig");
 const enr = @import("../enr.zig");
 const outbound = @import("../flow/outbound.zig");
+const message = @import("../protocol/message.zig");
 const packet = @import("../protocol/packet.zig");
 const secp = @import("../secp256k1.zig");
 const request_book = @import("../state/request_book.zig");
@@ -180,6 +181,93 @@ test "full request effect output aborts the unaccepted preparation" {
     const effect = effects.pop() orelse return error.MissingEffect;
     context.harness.actor.applySendCompletion(context.harness.env(), effect, .failed);
     try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
+}
+
+test "queued drain emits one FIFO effect per sent completion" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xbb} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xbc} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 86 }, .port = 9286 } },
+    };
+    var harness = try ActorHarness.init(alloc, io, config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 3,
+            .max_queued_requests = 3,
+            .max_queued_requests_per_endpoint = 3,
+            .event_capacity = 2,
+            .command_capacity = 2,
+        },
+    });
+    defer harness.deinit();
+    harness.actor.sessions.put(endpoint, .{
+        .initiator_key = [_]u8{0xbd} ** 16,
+        .recipient_key = [_]u8{0xbe} ** 16,
+    }, outbound.nowNs(io));
+
+    const blocker_action = try harness.actor.preparePing(
+        .{ .io = io, .ingress = &harness.ingress },
+        endpoint,
+        &remote_pubkey,
+        0,
+        .api,
+    );
+    var blocker_effect = switch (blocker_action) {
+        .send => |effect| effect,
+        .queued => return error.UnexpectedQueuedRequest,
+    };
+    const blocker_key = types.RequestKey.init(endpoint, blocker_effect.requestId());
+    harness.actor.applySendCompletion(harness.env(), blocker_effect, .sent);
+
+    const first_id = try message.ReqId.fromSlice(&.{0x31});
+    const second_id = try message.ReqId.fromSlice(&.{0x32});
+    var first_buffer: [128]u8 = undefined;
+    var second_buffer: [128]u8 = undefined;
+    try harness.actor.requests.queue(try .init(
+        .api,
+        endpoint,
+        &remote_pubkey,
+        first_id,
+        .ping,
+        &.{},
+        try (message.Ping{ .req_id = first_id, .enr_seq = 0 }).encodeInto(&first_buffer),
+        std.math.maxInt(i64),
+    ));
+    try harness.actor.requests.queue(try .init(
+        .api,
+        endpoint,
+        &remote_pubkey,
+        second_id,
+        .ping,
+        &.{},
+        try (message.Ping{ .req_id = second_id, .enr_seq = 0 }).encodeInto(&second_buffer),
+        std.math.maxInt(i64),
+    ));
+
+    try std.testing.expect(harness.actor.cancelRequest(harness.env(), blocker_key));
+    try std.testing.expectEqual(@as(usize, 2), harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
+
+    var first_effect = harness.request_effects.pop() orelse return error.MissingFirstDrainEffect;
+    try std.testing.expectEqual(first_id, first_effect.requestId());
+    harness.actor.applySendCompletion(harness.env(), first_effect, .sent);
+    try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
+
+    var second_effect = harness.request_effects.pop() orelse return error.MissingSecondDrainEffect;
+    try std.testing.expectEqual(second_id, second_effect.requestId());
+    harness.actor.applySendCompletion(harness.env(), second_effect, .sent);
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 2), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.ingress.permitCount());
 }
 
 test "prepared TALKREQ effect commits the talk response state" {
