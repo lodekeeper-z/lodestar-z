@@ -20,14 +20,13 @@ test "authenticated 128-distance FINDNODE crosses packet ingress and returns NOD
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0xa1} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0xa2} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const endpoint = types.Endpoint{
         .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9002 } },
     };
-    var harness = try ActorHarness.init(alloc, io, testConfig(local_key, local_id, 4));
+    var harness = try ActorHarness.init(alloc, io, testConfig(local_key, 4));
     defer harness.deinit();
     const actor = &harness.actor;
     try std.testing.expect(actor.addNode(endpoint.node_id, &remote_pubkey, endpoint.addr, null, 0));
@@ -133,7 +132,6 @@ test "validated NODES boundary rejects invalid signatures and preserves reliable
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const responder_key = try secp.keyPairFromSecret(&([_]u8{0x93} ** 32));
     const responder_pubkey = secp.compressedPubkey(&responder_key);
     const responder_id = try enr.nodeIdFromCompressedPubkey(&responder_pubkey);
@@ -150,7 +148,7 @@ test "validated NODES boundary rejects invalid signatures and preserves reliable
     invalid[invalid.len - 1] ^= 0x01;
     const distance_a = wireDistance(&returned_a.node_id, &responder_id);
     const distance_b = wireDistance(&returned_b.node_id, &responder_id);
-    const cfg = testConfig(local_key, local_id, 8);
+    const cfg = testConfig(local_key, 8);
     var harness = try ActorHarness.init(alloc, io, cfg);
     defer harness.deinit();
     const actor = &harness.actor;
@@ -206,11 +204,71 @@ test "validated NODES boundary rejects invalid signatures and preserves reliable
     try std.testing.expect(harness.outbox.pop() == null);
 }
 
+test "expected NODES response accepts the 16-entry decode boundary" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x9e} ** 32));
+    const responder_key = try secp.keyPairFromSecret(&([_]u8{0x9f} ** 32));
+    const responder_pubkey = secp.compressedPubkey(&responder_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&responder_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 159 }, .port = 9159 } },
+    };
+    var cfg = testConfig(local_key, 4);
+    cfg.rate_limiter = .{
+        .global_quota = .{ .replenish_all_every_ms = 60_000, .max_tokens = 1 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 60_000, .max_tokens = 1 },
+        .by_ip_state_capacity = 1,
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xa0} ** 16,
+        .recipient_key = [_]u8{0xa1} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+    var results = try request_results.RequestResultOutbox.init(io, alloc, 1);
+    defer results.deinit();
+    try std.testing.expect(results.reserve());
+    try std.testing.expect(results.claim());
+    var result_pending = true;
+    errdefer if (result_pending) results.release();
+    var env = harness.env();
+    env.request_results = &results;
+    const req_id = try actor.sendFindNode(env, endpoint, &responder_pubkey, &.{1}, .reliable_api);
+    switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .ordinary => {},
+        else => return error.MissingOrdinaryAdmission,
+    }
+    var expected_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |value| value,
+        else => return error.MissingExpectedCredit,
+    };
+    defer expected_credit.rollback(&harness.ingress);
+    env.expected_credit = &expected_credit;
+
+    const invalid_enr = [_]u8{0x80};
+    var response_enrs: [config.MAX_NODES_RESPONSE][]const u8 = undefined;
+    for (&response_enrs) |*raw| raw.* = &invalid_enr;
+    var nodes_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const nodes = message.Nodes{ .req_id = req_id, .total = 1, .enrs = &response_enrs };
+    try deliverEncrypted(actor, env, endpoint, &stable.recipient_key, try nodes.encodeInto(&nodes_buffer), 0xa2);
+
+    try std.testing.expect(!expected_credit.armed);
+    try std.testing.expect(actor.requests.get(.init(endpoint, req_id)) == null);
+    const result = results.pop() orelse return error.MissingRequestResult;
+    result_pending = false;
+    try std.testing.expectEqual(types.RequestKey.init(endpoint, req_id), result.key);
+    try std.testing.expectEqual(types.RequestKind.findnode, result.kind);
+    try std.testing.expect(result.terminal == .nodes);
+    try std.testing.expectEqual(@as(usize, 0), result.terminal.nodes.slice().len);
+}
+
 test "validated NODES multipart values survive as lookup closer IDs" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x98} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const responder_key = try secp.keyPairFromSecret(&([_]u8{0x99} ** 32));
     const responder_pubkey = secp.compressedPubkey(&responder_key);
     const responder_id = try enr.nodeIdFromCompressedPubkey(&responder_pubkey);
@@ -222,7 +280,7 @@ test "validated NODES multipart values survive as lookup closer IDs" {
     defer alloc.free(returned_a.raw);
     const returned_b = try makeEnr(alloc, 0x9b, 2, .{ 127, 0, 0, 101 }, 9101);
     defer alloc.free(returned_b.raw);
-    const cfg = testConfig(local_key, local_id, 8);
+    const cfg = testConfig(local_key, 8);
     var harness = try ActorHarness.init(alloc, io, cfg);
     defer harness.deinit();
     const actor = &harness.actor;
@@ -263,7 +321,6 @@ test "discv5 lookup duplicate uses newer routed ENR for dispatch and result" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0xc1} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const responder_key = try secp.keyPairFromSecret(&([_]u8{0xc2} ** 32));
     const responder_pubkey = secp.compressedPubkey(&responder_key);
     const responder_id = try enr.nodeIdFromCompressedPubkey(&responder_pubkey);
@@ -277,7 +334,7 @@ test "discv5 lookup duplicate uses newer routed ENR for dispatch and result" {
     defer alloc.free(newer.raw);
     try std.testing.expectEqual(older.node_id, newer.node_id);
     const newer_validated = try enr.ValidatedEnr.init(newer.raw);
-    var cfg = testConfig(local_key, local_id, 8);
+    var cfg = testConfig(local_key, 8);
     cfg.lookup_num_results = 2;
     cfg.lookup_parallelism = 1;
     cfg.limits.lookup_result_capacity = 1;
@@ -369,7 +426,7 @@ test "discv5 lookup-local contact dispatch replaces full untrusted fallback rete
     const returned = try makeEnr(alloc, 0xa3, 3, .{ 127, 0, 0, 163 }, 9163);
     defer alloc.free(returned.raw);
     const validated = try enr.ValidatedEnr.init(returned.raw);
-    var cfg = testConfig(local_key, local_id, 8);
+    var cfg = testConfig(local_key, 8);
     cfg.lookup_num_results = 1;
     cfg.lookup_parallelism = 1;
     cfg.limits.contact_capacity = 1;
@@ -437,12 +494,11 @@ test "discv5 lookup-local successful result retains raw ENR without PeerBook" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0xa8} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const returned = try makeEnr(alloc, 0xa9, 9, .{ 127, 0, 0, 169 }, 9169);
     defer alloc.free(returned.raw);
     const validated = try enr.ValidatedEnr.init(returned.raw);
     const candidate = lookup_mod.Candidate.fromValidated(&validated, returned.address);
-    var cfg = testConfig(local_key, local_id, 8);
+    var cfg = testConfig(local_key, 8);
     cfg.lookup_num_results = 1;
     cfg.lookup_parallelism = 1;
     cfg.limits.lookup_result_capacity = 1;
@@ -614,11 +670,10 @@ fn makeEnr(alloc: std.mem.Allocator, secret_byte: u8, seq: u64, ip: [4]u8, port:
     };
 }
 
-fn testConfig(local_key: secp.KeyPair, local_id: types.NodeId, event_capacity: usize) config.Config {
+fn testConfig(local_key: secp.KeyPair, event_capacity: usize) config.Config {
     return .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{
             .max_active_requests = 8,

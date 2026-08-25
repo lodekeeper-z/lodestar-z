@@ -275,13 +275,11 @@ pub const SessionBook = struct {
 test "session book stores stable keys independently from challenges" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
     });
     defer book.deinit(std.testing.allocator, &admission);
     const endpoint = types.Endpoint{
@@ -299,13 +297,11 @@ test "session book stores stable keys independently from challenges" {
 test "expired stable session reads leave stored state for maintenance" {
     const secp = @import("../secp256k1.zig");
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x11} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .session_timeout_ms = 10,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });
@@ -333,13 +329,11 @@ test "expired stable session reads leave stored state for maintenance" {
 test "put replaces an expired stable session before maintenance" {
     const secp = @import("../secp256k1.zig");
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x12} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 1);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .session_timeout_ms = 10,
         .limits = .{ .session_capacity = 1, .challenge_capacity = 1, .whoareyou_rate_capacity = 1 },
     });
@@ -365,13 +359,11 @@ test "put replaces an expired stable session before maintenance" {
 test "put reuses a promoted expired stable session before evicting live LRU" {
     const secp = @import("../secp256k1.zig");
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x14} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .session_timeout_ms = 10,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });
@@ -399,13 +391,11 @@ test "put reuses a promoted expired stable session before evicting live LRU" {
 test "session book enforces TTL LRU and non-evicting nonce epochs" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .session_timeout_ms = 10,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });
@@ -442,13 +432,11 @@ test "session book enforces TTL LRU and non-evicting nonce epochs" {
 test "session book accepts authenticated nonces in place without refreshing rejected state" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .session_timeout_ms = 10,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });
@@ -489,13 +477,11 @@ test "session book accepts authenticated nonces in place without refreshing reje
 test "stable session metrics count churn and authentication decisions exactly" {
     const secp = @import("../secp256k1.zig");
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x18} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .session_timeout_ms = 10,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });
@@ -544,13 +530,11 @@ test "stable session metrics count churn and authentication decisions exactly" {
 test "replay and exhausted authentication do not promote stable sessions" {
     const secp = @import("../secp256k1.zig");
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x13} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .session_timeout_ms = 100,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });
@@ -591,13 +575,11 @@ test "replay and exhausted authentication do not promote stable sessions" {
 test "session challenge cache moves permit ownership through TTL and LRU cleanup" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 3);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .challenge_timeout_ms = 10,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });
@@ -621,13 +603,11 @@ test "session challenge cache moves permit ownership through TTL and LRU cleanup
 test "WHOAREYOU rate is per source IP and capacity bounded" {
     const secp = @import("../secp256k1.zig");
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
     defer admission.deinit();
     var book = try SessionBook.init(std.testing.allocator, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .whoareyou_rate_ttl_ms = 10,
         .limits = .{ .session_capacity = 2, .challenge_capacity = 2, .whoareyou_rate_capacity = 2 },
     });

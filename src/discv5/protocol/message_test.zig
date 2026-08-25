@@ -73,10 +73,10 @@ test "discv5 messages: FINDNODE encode/decode" {
     const encoded = try msg.encode(alloc);
     defer alloc.free(encoded);
 
-    const result = try FindNode.decode(alloc, encoded);
-    defer alloc.free(result.distances);
-    try std.testing.expectEqual(@as(usize, 3), result.distances.len);
-    try std.testing.expectEqual(@as(u16, 256), result.distances[0]);
+    var distances_out: [3]u16 = undefined;
+    const decoded = try FindNode.decodeInto(encoded, &distances_out);
+    try std.testing.expectEqual(@as(usize, 3), decoded.distances.len);
+    try std.testing.expectEqual(@as(u16, 256), decoded.distances[0]);
 }
 
 test "discv5 messages: fitting 128-distance FINDNODE round-trips through public codecs" {
@@ -90,13 +90,9 @@ test "discv5 messages: fitting 128-distance FINDNODE round-trips through public 
     const encoded = try msg.encode(alloc);
     defer alloc.free(encoded);
 
-    const decoded = try FindNode.decode(alloc, encoded);
-    defer alloc.free(decoded.distances);
-    try std.testing.expectEqualSlices(u16, &distances, decoded.msg.distances);
-
     var distances_out: [128]u16 = undefined;
-    const decoded_into = try FindNode.decodeInto(encoded, &distances_out);
-    try std.testing.expectEqualSlices(u16, &distances, decoded_into.distances);
+    const decoded = try FindNode.decodeInto(encoded, &distances_out);
+    try std.testing.expectEqualSlices(u16, &distances, decoded.distances);
 }
 
 fn encodeFindNodeWireUnchecked(out: []u8, distances: []const u16) ![]const u8 {
@@ -122,9 +118,6 @@ test "discv5 messages: FINDNODE rejects distance 257 through public codecs" {
     try std.testing.expectError(Error.InvalidMessage, invalid.encodeInto(&encoded_buffer));
 
     const encoded = try encodeFindNodeWireUnchecked(&encoded_buffer, &.{257});
-    var no_allocation_storage: [0]u8 = .{};
-    var no_allocation = std.heap.FixedBufferAllocator.init(&no_allocation_storage);
-    try std.testing.expectError(Error.InvalidMessage, FindNode.decode(no_allocation.allocator(), encoded));
     var distance_out: [1]u16 = undefined;
     try std.testing.expectError(Error.InvalidMessage, FindNode.decodeInto(encoded, &distance_out));
 }
@@ -197,13 +190,9 @@ test "discv5 messages: FINDNODE wire cardinality accepts 1185 and rejects 1186" 
     const encoded_into = try accepted.encodeInto(&encoded_into_buffer);
     try std.testing.expectEqualSlices(u8, encoded, encoded_into);
 
-    const decoded = try FindNode.decode(alloc, encoded);
-    defer alloc.free(decoded.distances);
-    try std.testing.expectEqualSlices(u16, &maximum, decoded.distances);
-
     var maximum_out: [1185]u16 = undefined;
-    const decoded_into = try FindNode.decodeInto(encoded, &maximum_out);
-    try std.testing.expectEqualSlices(u16, &maximum, decoded_into.distances);
+    const decoded = try FindNode.decodeInto(encoded, &maximum_out);
+    try std.testing.expectEqualSlices(u16, &maximum, decoded.distances);
 
     const excessive = [_]u16{0} ** 1186;
     const rejected = FindNode{
@@ -215,9 +204,6 @@ test "discv5 messages: FINDNODE wire cardinality accepts 1185 and rejects 1186" 
 
     var oversized_buffer: [message.MAX_ENCODED_SIZE + 1]u8 = undefined;
     const oversized = try encodeFindNodeWireUnchecked(&oversized_buffer, &excessive);
-    var no_allocation_storage: [0]u8 = .{};
-    var no_allocation = std.heap.FixedBufferAllocator.init(&no_allocation_storage);
-    try std.testing.expectError(Error.InvalidMessage, FindNode.decode(no_allocation.allocator(), oversized));
     var excessive_out: [1186]u16 = undefined;
     try std.testing.expectError(Error.InvalidMessage, FindNode.decodeInto(oversized, &excessive_out));
 }
@@ -262,47 +248,12 @@ test "discv5 messages: NODES encode/decode" {
     const encoded = try msg.encode(alloc);
     defer alloc.free(encoded);
 
-    const decoded = try Nodes.decode(alloc, encoded);
-    defer {
-        for (decoded.enrs) |enr| alloc.free(enr);
-        alloc.free(decoded.enrs);
-    }
-
-    try std.testing.expectEqual(@as(u64, 2), decoded.msg.total);
+    var enrs_out: [2][]const u8 = undefined;
+    const decoded = try Nodes.decodeInto(encoded, &enrs_out);
+    try std.testing.expectEqual(@as(u64, 2), decoded.total);
     try std.testing.expectEqual(@as(usize, 2), decoded.enrs.len);
     try std.testing.expectEqualSlices(u8, enr_a, decoded.enrs[0]);
     try std.testing.expectEqualSlices(u8, enr_b, decoded.enrs[1]);
-}
-
-fn nodesDecodeLifecycle(alloc: std.mem.Allocator, encoded: []const u8) !void {
-    const decoded = try Nodes.decode(alloc, encoded);
-    for (decoded.enrs) |enr| alloc.free(enr);
-    alloc.free(decoded.enrs);
-}
-
-test "discv5 messages: NODES decode survives every allocation failure without leaking" {
-    const alloc = std.testing.allocator;
-    const req_id = try ReqId.fromSlice("id");
-    var enr_a_buf: [32]u8 = undefined;
-    var w_a = rlp.Writer.initBuffer(&enr_a_buf);
-    try w_a.writeBytesBounded("enr-alloc-a");
-    var enr_b_buf: [32]u8 = undefined;
-    var w_b = rlp.Writer.initBuffer(&enr_b_buf);
-    const list_start = try w_b.beginListBounded();
-    try w_b.writeBytesBounded("enr-alloc-b");
-    try w_b.finishList(list_start);
-    var enr_c_buf: [32]u8 = undefined;
-    var w_c = rlp.Writer.initBuffer(&enr_c_buf);
-    try w_c.writeBytesBounded("enr-alloc-c");
-    const msg = Nodes{
-        .req_id = req_id,
-        .total = 1,
-        .enrs = &.{ w_a.bytes(), w_b.bytes(), w_c.bytes() },
-    };
-    const encoded = try msg.encode(alloc);
-    defer alloc.free(encoded);
-
-    try std.testing.checkAllAllocationFailures(alloc, nodesDecodeLifecycle, .{encoded});
 }
 
 test "discv5 messages: NODES decode returns encoded ENR bytes" {
@@ -329,11 +280,8 @@ test "discv5 messages: NODES decode returns encoded ENR bytes" {
     const encoded = try msg.encode(alloc);
     defer alloc.free(encoded);
 
-    const decoded = try Nodes.decode(alloc, encoded);
-    defer {
-        for (decoded.enrs) |enr| alloc.free(enr);
-        alloc.free(decoded.enrs);
-    }
+    var enrs_out: [1][]const u8 = undefined;
+    const decoded = try Nodes.decodeInto(encoded, &enrs_out);
 
     try std.testing.expectEqual(@as(usize, 1), decoded.enrs.len);
     try std.testing.expectEqualSlices(u8, enr_bytes, decoded.enrs[0]);

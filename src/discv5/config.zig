@@ -2,6 +2,7 @@ const std = @import("std");
 const addr_votes = @import("service/addr_votes.zig");
 const kbucket = @import("kbucket.zig");
 const lookup = @import("service/lookup.zig");
+const enr = @import("enr.zig");
 const rate_limit = @import("rate_limit.zig");
 const secp = @import("secp256k1.zig");
 const types = @import("types.zig");
@@ -48,7 +49,6 @@ pub const Limits = struct {
 pub const Config = struct {
     bind_addresses: BindAddresses,
     local_key_pair: secp.KeyPair,
-    local_node_id: types.NodeId,
     local_enr: ?[]const u8 = null,
     request_timeout_ms: u64 = 1_000,
     request_retries: u32 = 1,
@@ -69,6 +69,10 @@ pub const Config = struct {
         .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 64 },
     },
     limits: Limits = .{},
+
+    pub fn localNodeId(self: *const Config) types.NodeId {
+        return enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&self.local_key_pair)) catch unreachable;
+    }
 
     pub fn validate(self: Config) !void {
         if (self.bind_addresses.count() == 0) return error.NoBindAddresses;
@@ -96,19 +100,16 @@ pub const Config = struct {
             return error.InvalidLookupRequestLimit;
         if (self.addr_votes_to_update_enr == 0 or
             self.addr_votes_to_update_enr > addr_votes.MAX_ADDR_VOTES) return error.InvalidVoteThreshold;
-        const local_pubkey = secp.compressedPubkey(&self.local_key_pair);
-        const derived_node_id = @import("enr.zig").nodeIdFromCompressedPubkey(&local_pubkey) catch
-            return error.InvalidLocalIdentity;
-        if (!std.mem.eql(u8, &derived_node_id, &self.local_node_id)) return error.InvalidLocalIdentity;
+        const local_node_id = self.localNodeId();
         if (self.rate_limiter) |limiter| {
             if (limiter.by_ip_state_capacity == 0 or limiter.by_ip_state_capacity > MAX_WHOAREYOU_SOURCES)
                 return error.InvalidRateLimiterCapacity;
         }
         if (self.local_enr) |bytes| {
-            if (bytes.len > @import("enr.zig").MAX_ENR_SIZE) return error.InvalidEnr;
-            const parsed = @import("enr.zig").decode(bytes) catch return error.InvalidEnr;
+            if (bytes.len > enr.MAX_ENR_SIZE) return error.InvalidEnr;
+            const parsed = enr.decode(bytes) catch return error.InvalidEnr;
             const node_id = (parsed.nodeId() catch return error.InvalidEnr) orelse return error.InvalidEnr;
-            if (!std.mem.eql(u8, &node_id, &self.local_node_id)) return error.InvalidLocalIdentity;
+            if (!std.mem.eql(u8, &node_id, &local_node_id)) return error.InvalidLocalIdentity;
         }
     }
 };
@@ -123,11 +124,9 @@ pub const Options = struct {
 
 test "config keeps protocol capacities bounded" {
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = try @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var config = Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
     };
     try config.validate();
     config.limits.session_capacity = MAX_SESSIONS + 1;
@@ -150,11 +149,9 @@ test "config keeps protocol capacities bounded" {
 
 test "config rejects address vote thresholds above the bounded voter capacity" {
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = try @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const config = Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .addr_votes_to_update_enr = 201,
     };
     try std.testing.expectError(error.InvalidVoteThreshold, config.validate());
@@ -162,15 +159,44 @@ test "config rejects address vote thresholds above the bounded voter capacity" {
 
 test "config rejects rate limiter source-state capacities outside the bound" {
     const key_pair = secp.KeyPair.generate(std.Options.debug_io);
-    const node_id = try @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     var config = Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
     };
 
     config.rate_limiter.?.by_ip_state_capacity = 0;
     try std.testing.expectError(error.InvalidRateLimiterCapacity, config.validate());
     config.rate_limiter.?.by_ip_state_capacity = MAX_WHOAREYOU_SOURCES + 1;
     try std.testing.expectError(error.InvalidRateLimiterCapacity, config.validate());
+}
+
+test "config derives its local node ID from the key pair" {
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x31} ** 32));
+    const config = Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+    };
+
+    try config.validate();
+    try std.testing.expectEqualSlices(
+        u8,
+        &(try @import("enr.zig").nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair))),
+        &config.localNodeId(),
+    );
+}
+
+test "config rejects a local ENR signed by another key" {
+    const alloc = std.testing.allocator;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x32} ** 32));
+    const other_key = try secp.keyPairFromSecret(&([_]u8{0x33} ** 32));
+    var builder = @import("enr.zig").Builder.init(alloc, other_key, 1);
+    const other_enr = try builder.encode();
+    defer alloc.free(other_enr);
+    const config = Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .local_enr = other_enr,
+    };
+
+    try std.testing.expectError(error.InvalidLocalIdentity, config.validate());
 }

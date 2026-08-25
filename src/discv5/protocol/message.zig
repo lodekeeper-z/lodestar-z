@@ -236,15 +236,6 @@ pub const FindNode = struct {
         };
     }
 
-    pub fn decode(alloc: Allocator, data: []const u8) Error!struct { msg: FindNode, distances: []u16 } {
-        const validated = try validate(data);
-        const distances = try alloc.alloc(u16, validated.distances_len);
-        return .{
-            .msg = publish(validated, distances),
-            .distances = distances,
-        };
-    }
-
     pub fn decodeInto(data: []const u8, distances_out: []u16) Error!FindNode {
         const validated = try validate(data);
         if (distances_out.len < validated.distances_len) return Error.BufferTooSmall;
@@ -278,30 +269,6 @@ pub const Nodes = struct {
         const rlp_bytes = w.bytes();
         out[0] = MSG_NODES;
         return out[0 .. 1 + rlp_bytes.len];
-    }
-
-    pub fn decode(alloc: Allocator, data: []const u8) Error!struct { msg: Nodes, enrs: [][]u8 } {
-        var stack_enrs: [16][]const u8 = undefined;
-        const msg = try decodeInto(data, &stack_enrs);
-        var enrs: std.ArrayListUnmanaged([]u8) = .empty;
-        errdefer {
-            for (enrs.items) |enr| alloc.free(enr);
-            enrs.deinit(alloc);
-        }
-        for (msg.enrs) |enr| {
-            const copy = try alloc.dupe(u8, enr);
-
-            // Separate duplication from append: if append growth fails the
-            // copy is not yet owned by the list and must be freed here.
-            errdefer alloc.free(copy);
-
-            try enrs.append(alloc, copy);
-        }
-        const owned = try enrs.toOwnedSlice(alloc);
-        return .{
-            .msg = .{ .req_id = msg.req_id, .total = msg.total, .enrs = owned },
-            .enrs = owned,
-        };
     }
 
     pub fn decodeInto(data: []const u8, enrs_out: [][]const u8) Error!Nodes {

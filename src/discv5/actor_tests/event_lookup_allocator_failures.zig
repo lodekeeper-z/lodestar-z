@@ -20,7 +20,6 @@ test "addEnr treats an older ENR for a known newer node as usable without an eve
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x2b} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x2c} ** 32));
     const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
     var older_builder = enr.Builder.init(alloc, remote_key, 1);
@@ -36,7 +35,6 @@ test "addEnr treats an older ENR for a known newer node as usable without an eve
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 },
     };
@@ -65,7 +63,6 @@ test "event payload allocation failure preserves Actor state and counts one drop
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x73} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x74} ** 32));
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
     remote_builder.ip = .{ 127, 0, 0, 2 };
@@ -75,7 +72,6 @@ test "event payload allocation failure preserves Actor state and counts one drop
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -103,7 +99,6 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x64} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x65} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -114,7 +109,6 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 3, .max_queued_requests = 3, .event_capacity = 1, .command_capacity = 2 },
     };
@@ -154,11 +148,9 @@ test "maintenance removes every expired lookup and retains live lookups" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x7c} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .lookup_timeout_ms = 10,
         .ping_interval_ms = 0,
@@ -190,7 +182,6 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x6a} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x6b} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
@@ -206,7 +197,6 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 1, .command_capacity = 2 },
     };
@@ -235,7 +225,6 @@ test "LocalRecord replacement is atomic across allocator failure" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x75} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip = .{ 127, 0, 0, 1 };
     local_builder.udp = 9000;
@@ -244,7 +233,6 @@ test "LocalRecord replacement is atomic across allocator failure" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .local_enr = local_enr,
         .addr_votes_to_update_enr = 1,
         .rate_limiter = null,
@@ -287,7 +275,6 @@ test "reliable lookup terminal payload needs no compatibility event allocation" 
     const alloc = failing.allocator();
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x8e} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x8f} ** 32));
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
     remote_builder.ip = .{ 127, 0, 0, 143 };
@@ -298,7 +285,6 @@ test "reliable lookup terminal payload needs no compatibility event allocation" 
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{
             .max_active_requests = 2,
@@ -341,7 +327,6 @@ test "detached late multipart NODES still learns emits and releases final permit
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x6e} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x6f} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -360,7 +345,6 @@ test "detached late multipart NODES still learns emits and releases final permit
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 },
     };
@@ -400,7 +384,6 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x82} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x83} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -427,7 +410,6 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 8, .command_capacity = 2 },
     };
@@ -486,11 +468,9 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
 
 fn actorInitializationLifecycle(alloc: std.mem.Allocator) !void {
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x77} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };

@@ -24,7 +24,6 @@ test "Actor address votes count one voter per native IPv6 source prefix" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x91} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const local_address = ip6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1 }, 1, 9000);
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip6 = local_address.ip6.bytes;
@@ -34,7 +33,6 @@ test "Actor address votes count one voter per native IPv6 source prefix" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip6 = local_address },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .local_enr = local_enr,
         .addr_votes_to_update_enr = 10,
         .rate_limiter = null,
@@ -64,7 +62,6 @@ test "Actor address vote window expires old observations deterministically" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x95} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip = .{ 127, 0, 0, 1 };
     local_builder.udp = 9000;
@@ -73,7 +70,6 @@ test "Actor address vote window expires old observations deterministically" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = ip4(.{ 127, 0, 0, 1 }, 9000) },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .local_enr = local_enr,
         .addr_votes_to_update_enr = 2,
         .rate_limiter = null,
@@ -105,7 +101,6 @@ test "Actor rejects invalid observed endpoints but accepts private unicast" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip = .{ 127, 0, 0, 1 };
     local_builder.udp = 9000;
@@ -114,7 +109,6 @@ test "Actor rejects invalid observed endpoints but accepts private unicast" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .local_enr = local_enr,
         .addr_votes_to_update_enr = 1,
         .rate_limiter = null,
@@ -155,7 +149,6 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x93} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var local_builder = enr.Builder.init(alloc, local_key, 1);
     local_builder.ip = .{ 127, 0, 0, 1 };
     local_builder.udp = 9000;
@@ -164,7 +157,6 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = ip4(.{ 127, 0, 0, 1 }, 9000) },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .local_enr = local_enr,
         .addr_votes_to_update_enr = 1,
         .rate_limiter = null,

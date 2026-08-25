@@ -78,14 +78,12 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an exhausted source quot
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = address_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .rate_limiter = null,
         .limits = limits,
     };
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = .{
             .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 8 },
             .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
@@ -164,14 +162,12 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = address_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .rate_limiter = null,
         .limits = limits,
     };
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = null,
         .limits = limits,
     };
@@ -358,7 +354,6 @@ test "known contact rejects a matching claimed ENR whose key differs from the st
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = limiter,
         .limits = limits,
     };
@@ -475,7 +470,6 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = address_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .rate_limiter = null,
         .limits = limits,
     };
@@ -486,7 +480,6 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = limiter,
         .limits = limits,
     };
@@ -698,7 +691,6 @@ fn signedEnrHandshake(kind: SignedEnrKind, later_evidence: LaterEndpointEvidence
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = observed_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .local_enr = advertised_enr,
         .rate_limiter = null,
         .limits = limits,
@@ -706,7 +698,6 @@ fn signedEnrHandshake(kind: SignedEnrKind, later_evidence: LaterEndpointEvidence
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = null,
         .limits = limits,
     };
@@ -797,14 +788,12 @@ fn contactHandshake(runtime_contact_trusted: bool) !ContactHandshakeResult {
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = address_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .rate_limiter = null,
         .limits = limits,
     };
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = null,
         .limits = limits,
     };

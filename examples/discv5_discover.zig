@@ -138,8 +138,6 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
     };
 
     const key_pair = discv5.secp256k1.KeyPair.generate(io);
-    const pubkey = discv5.secp256k1.compressedPubkey(&key_pair);
-    const local_node_id = try discv5.enr.nodeIdFromCompressedPubkey(&pubkey);
 
     const setup_started_at = std.Io.Timestamp.now(io, .awake);
     const runtime_config = discv5.Config{
@@ -147,7 +145,6 @@ fn runDiscovery(alloc: Allocator, io: std.Io, output_io: std.Io, options: *const
             .ip4 = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
         },
         .local_key_pair = key_pair,
-        .local_node_id = local_node_id,
         .request_timeout_ms = request_timeout_ms,
         .request_retries = request_retries,
         // Keep the protocol's final K-closest result independent from the

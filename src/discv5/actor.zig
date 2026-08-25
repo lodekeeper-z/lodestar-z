@@ -80,6 +80,7 @@ pub const Actor = struct {
 
     pub fn init(alloc: Allocator, config: config_mod.Config) !Actor {
         try config.validate();
+        const local_node_id = config.localNodeId();
         const local = if (config.local_enr) |raw| blk: {
             const parsed = try enr.decode(raw);
             break :blk LocalRecord{ .raw = try .init(raw), .seq = parsed.seq };
@@ -92,7 +93,7 @@ pub const Actor = struct {
         errdefer responses.deinitEmpty(alloc);
         var peers = try peer_book.PeerBook.init(
             alloc,
-            config.local_node_id,
+            local_node_id,
             config.limits.contact_capacity,
             config.bind_addresses.ip4 != null,
             config.bind_addresses.ip6 != null,
@@ -104,7 +105,7 @@ pub const Actor = struct {
         return .{
             .alloc = alloc,
             .local_key_pair = config.local_key_pair,
-            .local_node_id = config.local_node_id,
+            .local_node_id = local_node_id,
             .local = local,
             .sessions = sessions,
             .requests = requests,
@@ -802,17 +803,32 @@ fn isLookupBackpressure(err: anyerror) bool {
     };
 }
 
+test "discv5 actor: local node ID is derived from the configured key pair" {
+    const test_secp = @import("secp256k1.zig");
+    const alloc = std.testing.allocator;
+    const local_key = try test_secp.keyPairFromSecret(&([_]u8{0x90} ** 32));
+    const cfg = config_mod.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+    };
+    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
+    defer ingress.deinit();
+    var actor = try Actor.init(alloc, cfg);
+    defer actor.deinit(&ingress);
+
+    try std.testing.expectEqualSlices(u8, &cfg.localNodeId(), &actor.local_node_id);
+}
+
 test "discv5 actor: lookup pump exhausts bounded synchronous candidate failures" {
     const test_secp = @import("secp256k1.zig");
     const RecordingSender = @import("test_support/recording_sender.zig").RecordingSender;
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try test_secp.keyPairFromSecret(&([_]u8{0x91} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&test_secp.compressedPubkey(&local_key));
     const cfg = config_mod.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .event_capacity = 4, .command_capacity = 4 },
     };
@@ -852,7 +868,6 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try test_secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&test_secp.compressedPubkey(&local_key));
     const blocker_key = try test_secp.keyPairFromSecret(&([_]u8{0x93} ** 32));
     const blocker_pubkey = test_secp.compressedPubkey(&blocker_key);
     const blocker_id = try enr.nodeIdFromCompressedPubkey(&blocker_pubkey);
@@ -867,7 +882,6 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     const cfg = config_mod.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_retries = 0,
         .lookup_num_results = 1,
         .lookup_parallelism = 1,
@@ -940,7 +954,6 @@ test "discv5 actor: lookup transport send failure remains terminal" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try test_secp.keyPairFromSecret(&([_]u8{0x96} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&test_secp.compressedPubkey(&local_key));
     const remote_key = try test_secp.keyPairFromSecret(&([_]u8{0x97} ** 32));
     const remote_pubkey = test_secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -948,7 +961,6 @@ test "discv5 actor: lookup transport send failure remains terminal" {
     const cfg = config_mod.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .lookup_num_results = 1,
         .lookup_parallelism = 1,
         .rate_limiter = null,

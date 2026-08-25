@@ -155,7 +155,6 @@ fn initTestRuntime(io: std.Io, alloc: std.mem.Allocator, secret_byte: u8, limits
     return runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair)),
         .rate_limiter = null,
         .limits = limits,
     }, options);
@@ -416,14 +415,12 @@ test "Runtime send cancellation closes drains joins and releases command state" 
     defer threaded.deinit();
     const io = threaded.io();
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x6d} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x6e} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const runtime = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     }, .{});
@@ -764,11 +761,9 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
     defer threaded.deinit();
     const io = threaded.io();
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const runtime = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 0,
         .request_retries = 0,
         .rate_limiter = null,
@@ -866,7 +861,6 @@ test "failed maintenance enqueue rolls back pending state for retry" {
     const runtime = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key)),
         .request_timeout_ms = 0,
         .request_retries = 0,
         .rate_limiter = null,
@@ -1089,7 +1083,6 @@ test "lookup timeout publishes a reliable timed out terminal result" {
     const runtime = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key)),
         .lookup_timeout_ms = 0,
         .rate_limiter = null,
         .limits = .{
@@ -1287,7 +1280,6 @@ test "request timeout publishes one reliable terminal result" {
     const runtime = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key)),
         .request_timeout_ms = 0,
         .request_retries = 0,
         .rate_limiter = null,
@@ -1622,11 +1614,9 @@ test "malformed inbound packet rolls back tentative expected credit" {
     defer threaded.deinit();
     const io = threaded.io();
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0xa8} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const runtime = try runtime_mod.Runtime.init(io, alloc, config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .rate_limiter = .{
             .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
             .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
@@ -1685,11 +1675,9 @@ test "shutdown drain rolls back queued expected credit without processing packet
     defer threaded.deinit();
     const io = threaded.io();
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0xa9} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const runtime = try runtime_mod.Runtime.init(io, alloc, config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .rate_limiter = .{
             .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
             .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
@@ -1736,14 +1724,12 @@ test "Runtime exposes named request cancellation" {
     defer threaded.deinit();
     const io = threaded.io();
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x74} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x75} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const runtime = try runtime_mod.Runtime.init(io, alloc, config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 },
     }, .{});
@@ -1767,7 +1753,6 @@ test "Runtime actor queries return authoritative local and peer ENR snapshots" {
     defer threaded.deinit();
     const io = threaded.io();
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x66} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     var initial_builder = enr.Builder.init(alloc, local_key, 1);
     initial_builder.ip = .{ 127, 0, 0, 1 };
     initial_builder.udp = 19066;
@@ -1776,7 +1761,6 @@ test "Runtime actor queries return authoritative local and peer ENR snapshots" {
     const runtime = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .local_enr = initial_enr,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 4 },
@@ -1823,11 +1807,9 @@ test "Runtime follows run stop caller-await deinit lifecycle" {
     defer threaded.deinit();
     const io = threaded.io();
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x71} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const runtime = try runtime_mod.Runtime.init(io, alloc, config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 },
     }, .{ .maintenance_interval_ms = 1 });
@@ -1857,11 +1839,9 @@ fn runtimeInitializationLifecycle(alloc: std.mem.Allocator) !void {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x6f} ** 32));
-    const node_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
     const runtime = try runtime_mod.Runtime.init(threaded.io(), alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     }, .{});
@@ -1900,7 +1880,6 @@ test "full or empty EventOutbox never duplicates reliable TALK response terminal
     const runtime_a = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .rate_limiter = null,
         .limits = limits_a,
     }, .{ .maintenance_interval_ms = 60_000 });
@@ -1910,7 +1889,6 @@ test "full or empty EventOutbox never duplicates reliable TALK response terminal
     const runtime_b = try runtime_mod.Runtime.init(io, alloc, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = null,
         .limits = limits_b,
     }, .{ .maintenance_interval_ms = 60_000 });

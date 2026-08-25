@@ -166,12 +166,9 @@ test "response recovery LRU expiry explicit removal and shutdown release each pe
     var admission = try admission_mod.IngressAdmission.init(alloc, null, 4);
     defer admission.deinit();
     const key_pair = @import("../secp256k1.zig").KeyPair.generate(std.Options.debug_io);
-    const pubkey = @import("../secp256k1.zig").compressedPubkey(&key_pair);
-    const node_id = try @import("../enr.zig").nodeIdFromCompressedPubkey(&pubkey);
     var book = try ResponseBook.init(alloc, .{
         .bind_addresses = .{ .ip4 = testAddress(1) },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .response_recovery_timeout_ms = 1,
         .limits = .{ .response_recovery_capacity = 2 },
     });
@@ -194,12 +191,9 @@ test "response candidates are key-only bounded expiring and shutdown-clean" {
     var admission = try admission_mod.IngressAdmission.init(alloc, null, 1);
     defer admission.deinit();
     const key_pair = @import("../secp256k1.zig").KeyPair.generate(std.Options.debug_io);
-    const pubkey = @import("../secp256k1.zig").compressedPubkey(&key_pair);
-    const node_id = try @import("../enr.zig").nodeIdFromCompressedPubkey(&pubkey);
     var book = try ResponseBook.init(alloc, .{
         .bind_addresses = .{ .ip4 = testAddress(1) },
         .local_key_pair = key_pair,
-        .local_node_id = node_id,
         .response_recovery_timeout_ms = 1,
         .limits = .{ .response_recovery_capacity = 2 },
     });

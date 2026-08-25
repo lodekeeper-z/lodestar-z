@@ -33,7 +33,6 @@ test "oversized sessionless TALKREQ handshake fails once without waiting for tim
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 1,
         .request_retries = 0,
         .rate_limiter = null,
@@ -112,7 +111,6 @@ test "smaller sessionless TALKREQ still recovers with one handshake packet" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 1, .command_capacity = 1 },
     };
@@ -164,7 +162,6 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = address_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .request_timeout_ms = 1,
         .request_retries = 1,
         .rate_limiter = null,
@@ -173,7 +170,6 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = null,
         .limits = limits,
     };
@@ -266,7 +262,6 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = address_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .request_timeout_ms = 1,
         .request_retries = 1,
         .rate_limiter = null,
@@ -275,7 +270,6 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = null,
         .limits = limits,
     };
@@ -356,14 +350,12 @@ test "response recovery keeps stable keys until candidate proof then promotes an
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = address_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .rate_limiter = null,
         .limits = limits,
     };
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = null,
         .limits = limits,
     };
@@ -491,7 +483,6 @@ test "failed retry datagram does not increment sent message metrics" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x53} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x54} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const endpoint = types.Endpoint{
@@ -501,7 +492,6 @@ test "failed retry datagram does not increment sent message metrics" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 1,
         .request_retries = 1,
         .rate_limiter = null,
@@ -546,7 +536,6 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = local_address },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .local_enr = initial_enr,
         .ping_interval_ms = 0,
         .rate_limiter = null,
@@ -602,12 +591,10 @@ test "maintenance schedules the next health probe only after a successful send" 
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x59} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const local_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9059 } };
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = local_address },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .ping_interval_ms = 60_000,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 4, .command_capacity = 2 },
@@ -650,7 +637,6 @@ test "NODES total is exact bounded consistent and controls final permit release"
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x47} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x48} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -661,7 +647,6 @@ test "NODES total is exact bounded consistent and controls final permit release"
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -735,7 +720,6 @@ test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 8 },
     };
@@ -802,7 +786,6 @@ test "HANDSHAKE send failure leaves WHOAREYOU request state unchanged" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -835,11 +818,9 @@ test "failed ciphertext does not refresh stable session LRU recency" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x21} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{
             .max_active_requests = 2,
@@ -884,7 +865,6 @@ test "expired stable outbound paths recover without access-time removal" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x22} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x23} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -895,7 +875,6 @@ test "expired stable outbound paths recover without access-time removal" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 1,
         .request_retries = 1,
         .session_timeout_ms = 1,
@@ -945,11 +924,9 @@ test "metrics snapshots preserve session count and recency until maintenance" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x26} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .session_timeout_ms = 10,
         .ping_interval_ms = 0,
         .rate_limiter = null,
@@ -1009,7 +986,6 @@ test "authenticated packets reject stale nonce and wrong source address" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x57} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x58} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -1021,7 +997,6 @@ test "authenticated packets reject stale nonce and wrong source address" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -1055,7 +1030,6 @@ test "session nonce epoch retires at capacity and never redispatches its first r
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x5d} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x5e} ** 32));
     const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
     const endpoint = types.Endpoint{
@@ -1065,7 +1039,6 @@ test "session nonce epoch retires at capacity and never redispatches its first r
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{
             .max_active_requests = 1,
@@ -1158,14 +1131,12 @@ test "successful handshake records initial probe nonce and replay is inert" {
     const config_a = config.Config{
         .bind_addresses = .{ .ip4 = address_a },
         .local_key_pair = key_a,
-        .local_node_id = id_a,
         .rate_limiter = null,
         .limits = limits,
     };
     const config_b = config.Config{
         .bind_addresses = .{ .ip4 = address_b },
         .local_key_pair = key_b,
-        .local_node_id = id_b,
         .rate_limiter = null,
         .limits = limits,
     };
@@ -1233,7 +1204,6 @@ test "stable session wins a same-read-key candidate collision" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x55} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x56} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -1244,7 +1214,6 @@ test "stable session wins a same-read-key candidate collision" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .response_recovery_capacity = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -1302,7 +1271,6 @@ test "old key remains accepted without promotion until candidate response" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -1376,7 +1344,6 @@ test "rekey lane queues stable-key requests and drains FIFO after candidate proo
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{
             .max_active_requests = 4,
@@ -1450,14 +1417,12 @@ test "initial tracked send failure is caller-visible and fully unwinds" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x61} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x62} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -1485,7 +1450,6 @@ test "WHOAREYOU and response send failures release prepared permits and retained
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x9b} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9c} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -1496,7 +1460,6 @@ test "WHOAREYOU and response send failures release prepared permits and retained
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{
             .max_active_requests = 2,
@@ -1543,7 +1506,6 @@ test "transactional capacity-one challenge replacement send failure preserves or
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x2c} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key_a = try secp.keyPairFromSecret(&([_]u8{0x2d} ** 32));
     const remote_id_a = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key_a));
     const remote_key_b = try secp.keyPairFromSecret(&([_]u8{0x2e} ** 32));
@@ -1559,7 +1521,6 @@ test "transactional capacity-one challenge replacement send failure preserves or
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{
             .max_active_requests = 1,
@@ -1601,7 +1562,6 @@ test "transactional capacity-one response replacement send failure preserves ori
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x2f} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key_a = try secp.keyPairFromSecret(&([_]u8{0x30} ** 32));
     const remote_pubkey_a = secp.compressedPubkey(&remote_key_a);
     const remote_id_a = try enr.nodeIdFromCompressedPubkey(&remote_pubkey_a);
@@ -1619,7 +1579,6 @@ test "transactional capacity-one response replacement send failure preserves ori
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{
             .max_active_requests = 1,

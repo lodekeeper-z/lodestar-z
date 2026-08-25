@@ -20,7 +20,6 @@ test "Actor isolates health request identity" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x41} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x42} ** 32));
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
     remote_builder.ip = .{ 127, 0, 0, 2 };
@@ -33,7 +32,6 @@ test "Actor isolates health request identity" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 8, .command_capacity = 4 },
     };
@@ -65,7 +63,6 @@ test "stale eviction candidate fails reservation before any send or permit" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x34} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x35} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -74,7 +71,6 @@ test "stale eviction candidate fails reservation before any send or permit" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -126,7 +122,6 @@ const EvictionHarness = struct {
         const cfg = config.Config{
             .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
             .local_key_pair = local_key,
-            .local_node_id = local_id,
             .request_timeout_ms = 60_000,
             .request_retries = 0,
             .bucket_pending_timeout_ms = 1,
@@ -499,7 +494,6 @@ test "health and eviction probes never queue behind endpoint establishment" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x36} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x37} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     var remote_builder = enr.Builder.init(alloc, remote_key, 1);
@@ -515,7 +509,6 @@ test "health and eviction probes never queue behind endpoint establishment" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 1,
         .request_retries = 0,
         .ping_interval_ms = 0,
@@ -557,7 +550,6 @@ test "named cancellation conserves permits and queued FIFO across drain failure"
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x43} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x44} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -568,7 +560,6 @@ test "named cancellation conserves permits and queued FIFO across drain failure"
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 4, .max_queued_requests = 4, .event_capacity = 4, .command_capacity = 4 },
     };
@@ -611,7 +602,6 @@ test "maintenance automatically redrains a queued lane after one transient send 
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x99} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9a} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -622,7 +612,6 @@ test "maintenance automatically redrains a queued lane after one transient send 
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 60_000,
         .rate_limiter = null,
         .limits = .{
@@ -687,7 +676,6 @@ test "queued request expires exactly at its actor maintenance deadline" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0xa1} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0xa2} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const endpoint = types.Endpoint{
@@ -697,7 +685,6 @@ test "queued request expires exactly at its actor maintenance deadline" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 60_000,
         .request_retries = 1,
         .rate_limiter = null,
@@ -753,7 +740,6 @@ test "AdmissionPermit survives retry and releases on final timeout" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x45} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x46} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const endpoint = types.Endpoint{
@@ -763,7 +749,6 @@ test "AdmissionPermit survives retry and releases on final timeout" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 1,
         .request_retries = 1,
         .rate_limiter = null,
@@ -795,7 +780,6 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x18} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x19} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -822,7 +806,6 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .request_timeout_ms = 1,
         .request_retries = 1,
         .rate_limiter = null,
@@ -899,7 +882,6 @@ test "Actor rejects invalid FINDNODE distance before request or send state" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x7a} ** 32));
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
@@ -910,7 +892,6 @@ test "Actor rejects invalid FINDNODE distance before request or send state" {
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .local_node_id = local_id,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };

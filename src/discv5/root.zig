@@ -1,16 +1,13 @@
 //! Standalone Discovery v5 runtime.
 
 pub const enr = @import("enr.zig");
-pub const rlp = @import("rlp.zig");
-pub const packet = @import("protocol/packet.zig");
-pub const session = @import("protocol/session.zig");
-pub const message = @import("protocol/message.zig");
-pub const rate_limit = @import("rate_limit.zig");
-pub const metrics = @import("metrics.zig");
 pub const secp256k1 = @import("secp256k1.zig");
 pub const hex = @import("hex");
 
 const runtime = @import("runtime.zig");
+const message = @import("protocol/message.zig");
+const metrics = @import("metrics.zig");
+const rate_limit = @import("rate_limit.zig");
 pub const Runtime = runtime.Runtime;
 pub const RuntimeError = runtime.Error;
 pub const Config = @import("config.zig").Config;
@@ -20,6 +17,8 @@ pub const BindAddresses = @import("config.zig").BindAddresses;
 pub const Event = @import("events.zig").Event;
 pub const EventKind = @import("events.zig").EventKind;
 pub const event_kind_count = @import("events.zig").event_kind_count;
+pub const ReqId = message.ReqId;
+pub const RateLimitConfig = rate_limit.Config;
 pub const MetricsSnapshot = metrics.MetricsSnapshot;
 pub const ContactMetricsSnapshot = @import("contact_book.zig").ContactMetricsSnapshot;
 pub const SessionMetricsSnapshot = @import("state/session_book.zig").SessionMetricsSnapshot;
