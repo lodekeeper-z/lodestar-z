@@ -85,7 +85,7 @@ const PermitSlot = struct {
 
 pub const IngressAdmission = struct {
     alloc: Allocator,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
     limiter: ?rate_limit.RateLimiter,
     stats: Stats = .{},
     expected_by_ip: std.AutoHashMap(IpKey, ExpectedEntry),
@@ -126,7 +126,7 @@ pub const IngressAdmission = struct {
 
     pub fn admit(self: *IngressAdmission, from: types.Address, now_ms: u64) Admission {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         self.stats.received_total +|= 1;
         const ip = IpKey.fromAddress(from);
         if (self.limiter) |*limiter| {
@@ -163,7 +163,7 @@ pub const IngressAdmission = struct {
     ) error{ TooManyAdmissionPermits, InvalidPacketBudget, AdmissionBudgetOverflow, PermitGenerationExhausted }!AdmissionPermit {
         if (packet_budget == 0) return error.InvalidPacketBudget;
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         const slot_index = self.free_head orelse return error.TooManyAdmissionPermits;
         const ip = IpKey.fromAddress(address);
         const previous_budget = if (self.expected_by_ip.get(ip)) |entry| entry.remaining else 0;
@@ -190,26 +190,26 @@ pub const IngressAdmission = struct {
 
     pub fn noteProcessed(self: *IngressAdmission) void {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         self.stats.processed_total +|= 1;
     }
 
     pub fn noteTruncated(self: *IngressAdmission) void {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         self.stats.received_total +|= 1;
         self.stats.filtered_total +|= 1;
     }
 
     pub fn snapshot(self: *IngressAdmission) Stats {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.stats;
     }
 
     pub fn permitCount(self: *IngressAdmission) usize {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         return self.live_permits;
     }
 
@@ -230,7 +230,7 @@ pub const IngressAdmission = struct {
 
     fn resolveExpected(self: *IngressAdmission, slot_index: SlotIndex, generation: u64, restore: bool) void {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         std.debug.assert(slot_index < self.permit_slots.len);
         const slot = &self.permit_slots[slot_index];
         std.debug.assert(slot.in_use and slot.generation == generation and slot.reserved > 0);
@@ -255,7 +255,7 @@ pub const IngressAdmission = struct {
 
     fn release(self: *IngressAdmission, slot_index: SlotIndex, generation: u64) void {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.unlock();
         std.debug.assert(slot_index < self.permit_slots.len);
         const slot = &self.permit_slots[slot_index];
         std.debug.assert(slot.in_use and slot.owner_live and slot.generation == generation);
@@ -296,7 +296,11 @@ pub const IngressAdmission = struct {
     }
 
     fn lock(self: *IngressAdmission) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        std.Io.Threaded.mutexLock(&self.mutex);
+    }
+
+    fn unlock(self: *IngressAdmission) void {
+        std.Io.Threaded.mutexUnlock(&self.mutex);
     }
 };
 
@@ -555,4 +559,165 @@ test "outstanding expected credit pins a released permit slot" {
 
     var replacement = try admission.acquire(address, 1);
     replacement.release(&admission);
+}
+
+const CONCURRENCY_WAIT_LIMIT: usize = 10_000_000;
+
+fn waitForAtLeast(value: *const std.atomic.Value(u32), expected: u32) bool {
+    for (0..CONCURRENCY_WAIT_LIMIT) |_| {
+        if (value.load(.acquire) >= expected) return true;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    return false;
+}
+
+fn waitForContended(mutex: *const std.Io.Mutex) bool {
+    for (0..CONCURRENCY_WAIT_LIMIT) |_| {
+        if (mutex.state.load(.acquire) == .contended) return true;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    return false;
+}
+
+const HeldLockWaiter = struct {
+    admission: *IngressAdmission,
+    completed: std.atomic.Value(u32) = .init(0),
+
+    fn run(self: *HeldLockWaiter) void {
+        self.admission.noteProcessed();
+        self.completed.store(1, .release);
+    }
+};
+
+test "admission waiter progresses after explicitly held lock is released" {
+    var admission = try IngressAdmission.init(std.testing.allocator, null, 1);
+    defer admission.deinit();
+    admission.lock();
+    var lock_held = true;
+    defer if (lock_held) admission.unlock();
+
+    var waiter_state = HeldLockWaiter{ .admission = &admission };
+    const waiter = try std.Thread.spawn(.{}, HeldLockWaiter.run, .{&waiter_state});
+    var waiter_joined = false;
+    defer if (!waiter_joined) {
+        if (lock_held) {
+            admission.unlock();
+            lock_held = false;
+        }
+        waiter.join();
+    };
+
+    try std.testing.expect(waitForContended(&admission.mutex));
+    try std.testing.expectEqual(@as(u32, 0), waiter_state.completed.load(.acquire));
+    admission.unlock();
+    lock_held = false;
+    try std.testing.expect(waitForAtLeast(&waiter_state.completed, 1));
+    waiter.join();
+    waiter_joined = true;
+    try std.testing.expectEqual(@as(u64, 1), admission.snapshot().processed_total);
+}
+
+const AdmissionStress = struct {
+    const worker_count: u32 = 4;
+    const iterations: u32 = 128;
+
+    admission: *IngressAdmission,
+    start: std.atomic.Value(bool) = .init(false),
+    acquired: std.atomic.Value(u32) = .init(0),
+    release_epoch: std.atomic.Value(u32) = .init(0),
+    completed: std.atomic.Value(u32) = .init(0),
+    occupied_slots: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn address(worker: u8) types.Address {
+        return .{ .ip4 = .{ .bytes = .{ 198, 51, 100, worker + 1 }, .port = 9_000 } };
+    }
+
+    fn run(self: *AdmissionStress, worker: u8) void {
+        while (!self.start.load(.acquire)) std.Thread.yield() catch std.atomic.spinLoopHint();
+        for (0..iterations) |iteration| {
+            var permit = self.admission.acquire(address(worker), 1) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            const slot_bit = @as(u32, 1) << @intCast(permit.slot);
+            if (self.occupied_slots.fetchOr(slot_bit, .acq_rel) & slot_bit != 0) self.failed.store(true, .release);
+            _ = self.acquired.fetchAdd(1, .acq_rel);
+            while (self.release_epoch.load(.acquire) <= iteration) std.Thread.yield() catch std.atomic.spinLoopHint();
+
+            var credit = switch (self.admission.admit(address(worker), 0)) {
+                .expected => |value| value,
+                else => {
+                    self.failed.store(true, .release);
+                    permit.release(self.admission);
+                    return;
+                },
+            };
+            if (iteration % 2 == 0) credit.commit(self.admission) else credit.rollback(self.admission);
+            self.admission.noteProcessed();
+            if (self.occupied_slots.fetchAnd(~slot_bit, .acq_rel) & slot_bit == 0) self.failed.store(true, .release);
+            permit.release(self.admission);
+            _ = self.completed.fetchAdd(1, .acq_rel);
+        }
+    }
+};
+
+test "concurrent public admission methods conserve stats permits and expected credits" {
+    var admission = try IngressAdmission.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000_000, .max_tokens = AdmissionStress.worker_count },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000_000, .max_tokens = 1 },
+    }, AdmissionStress.worker_count);
+    defer admission.deinit();
+    for (0..AdmissionStress.worker_count) |worker| {
+        try std.testing.expect(admission.admit(AdmissionStress.address(@intCast(worker)), 0) == .ordinary);
+    }
+
+    var stress = AdmissionStress{ .admission = &admission };
+    var threads: [AdmissionStress.worker_count]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        stress.start.store(true, .release);
+        stress.release_epoch.store(AdmissionStress.iterations, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&threads, 0..) |*thread, worker| {
+        thread.* = try std.Thread.spawn(.{}, AdmissionStress.run, .{ &stress, @as(u8, @intCast(worker)) });
+        spawned += 1;
+    }
+    stress.start.store(true, .release);
+
+    for (0..AdmissionStress.iterations) |iteration| {
+        try std.testing.expect(waitForAtLeast(&stress.acquired, AdmissionStress.worker_count));
+        try std.testing.expectEqual(@as(usize, AdmissionStress.worker_count), admission.permitCount());
+        try std.testing.expectEqual((@as(u32, 1) << @intCast(AdmissionStress.worker_count)) - 1, stress.occupied_slots.load(.acquire));
+        stress.acquired.store(0, .release);
+        stress.release_epoch.store(@intCast(iteration + 1), .release);
+        try std.testing.expect(waitForAtLeast(&stress.completed, @intCast((iteration + 1) * AdmissionStress.worker_count)));
+    }
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+
+    try std.testing.expect(!stress.failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
+    try std.testing.expectEqual(@as(u32, 0), stress.occupied_slots.load(.acquire));
+    const before_probe = admission.snapshot();
+    try std.testing.expectEqual(@as(u64, AdmissionStress.worker_count * (AdmissionStress.iterations + 1)), before_probe.received_total);
+    try std.testing.expectEqual(@as(u64, AdmissionStress.worker_count * AdmissionStress.iterations), before_probe.processed_total);
+    try std.testing.expectEqual(@as(u64, 0), before_probe.filtered_total);
+
+    for (0..AdmissionStress.worker_count) |worker| {
+        const address = AdmissionStress.address(@intCast(worker));
+        var permit = try admission.acquire(address, 1);
+        var credit = switch (admission.admit(address, 0)) {
+            .expected => |value| value,
+            else => return error.ExpectedCreditCorrupted,
+        };
+        credit.commit(&admission);
+        permit.release(&admission);
+        try std.testing.expect(admission.admit(address, 0) == .filtered);
+    }
+    const after_probe = admission.snapshot();
+    try std.testing.expectEqual(@as(u64, AdmissionStress.worker_count * (AdmissionStress.iterations + 3)), after_probe.received_total);
+    try std.testing.expectEqual(@as(u64, AdmissionStress.worker_count), after_probe.filtered_total);
+    try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
 }
