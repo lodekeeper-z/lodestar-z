@@ -676,8 +676,18 @@ fn executeRequestEffect(runtime: *RuntimeImpl, action_value: actor_mod.OutboundR
     var action = action_value;
     const req_id = action.requestId();
     switch (action) {
-        .queued => {},
-        .send => |effect| try executeSendEffect(runtime, .{ .request = effect }),
+        .queued => return req_id,
+        .send => |effect| {
+            const target_index = runtime.effects.count();
+            runtime.effects.push(.{ .request = effect }) catch unreachable;
+            for (0..target_index + 1) |index| {
+                const queued = runtime.effects.pop() orelse unreachable;
+                executeSendEffect(runtime, queued) catch |err| {
+                    if (index == target_index or err == error.Canceled) return err;
+                    continue;
+                };
+            }
+        },
     }
     return req_id;
 }

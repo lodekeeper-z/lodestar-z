@@ -79,6 +79,27 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             transport.Testing.setSendGate(&impl(runtime).transport, gate);
         }
 
+        pub fn enqueuePingEffect(
+            runtime: *Runtime,
+            endpoint: types.Endpoint,
+            pubkey: [33]u8,
+        ) !message.ReqId {
+            const storage = impl(runtime);
+            var action = try storage.actor.preparePing(
+                .{ .io = storage.io, .ingress = &storage.admission },
+                endpoint,
+                &pubkey,
+                0,
+                .api,
+            );
+            const req_id = action.requestId();
+            switch (action) {
+                .send => |effect| try storage.effects.push(.{ .request = effect }),
+                .queued => unreachable,
+            }
+            return req_id;
+        }
+
         pub fn addConnectedNode(
             runtime: *Runtime,
             node_id: types.NodeId,

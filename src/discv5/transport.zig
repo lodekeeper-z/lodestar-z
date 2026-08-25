@@ -81,6 +81,7 @@ pub const Transport = struct {
     fn sendErased(context: *anyopaque, address: types.Address, bytes: []const u8) SendError!void {
         const self: *Transport = @ptrCast(@alignCast(context));
         if (builtin.is_test) if (self.test_send_gate) |gate| {
+            if (!gate.entered.load(.acquire)) gate.first_destination = address;
             gate.entered.store(true, .release);
             if (gate.cancelable) {
                 while (!gate.proceed.load(.acquire)) {
@@ -124,6 +125,7 @@ pub const Testing = if (builtin.is_test) struct {
         proceed: std.atomic.Value(bool) = .init(false),
         cancellation_observed: std.atomic.Value(bool) = .init(false),
         cancelable: bool = false,
+        first_destination: ?types.Address = null,
     };
 
     pub fn setSendGate(transport: *Transport, gate: ?*SendGate) void {

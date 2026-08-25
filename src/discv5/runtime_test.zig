@@ -409,6 +409,54 @@ fn startRuntimeLookup(context: *RuntimeLookupContext) void {
     };
 }
 
+test "Runtime public request effects preserve the shared effect FIFO" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x68, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var runner = RunningRuntime.init(io);
+    defer runner.deinit();
+
+    const queued_key = try secp.keyPairFromSecret(&([_]u8{0x69} ** 32));
+    const queued_pubkey = secp.compressedPubkey(&queued_key);
+    const queued_endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&queued_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 105 }, .port = 9305 } },
+    };
+    const queued_req_id = try runtime_mod.Testing.enqueuePingEffect(runtime, queued_endpoint, queued_pubkey);
+
+    var gate = transport_mod.Testing.SendGate{};
+    gate.proceed.store(true, .release);
+    runtime_mod.Testing.setSendGate(runtime, &gate);
+    try runner.start(runtime);
+    try runner.awaitStarted();
+
+    const public_key = try secp.keyPairFromSecret(&([_]u8{0x6a} ** 32));
+    const public_pubkey = secp.compressedPubkey(&public_key);
+    const public_endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&public_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 106 }, .port = 9306 } },
+    };
+    const public_req_id = try runtime.sendPing(public_endpoint.node_id, &public_pubkey, public_endpoint.addr, 0);
+
+    const first_destination = gate.first_destination orelse return error.MissingFirstEffectDestination;
+    try std.testing.expect(first_destination.eql(&queued_endpoint.addr));
+
+    try std.testing.expect(try runtime.cancelRequest(queued_endpoint.node_id, queued_endpoint.addr, queued_req_id));
+    try std.testing.expect(try runtime.cancelRequest(public_endpoint.node_id, public_endpoint.addr, public_req_id));
+    const canceled = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+    try expectRequestIdentity(&canceled, public_endpoint, public_req_id, .ping);
+    try std.testing.expect(canceled.terminal == .canceled);
+    runner.stop();
+    try runner.await();
+}
+
 test "Runtime cancellation completes residual emitted effects before shutdown" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
