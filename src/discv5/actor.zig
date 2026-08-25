@@ -733,10 +733,13 @@ pub const Actor = struct {
         const req_id = randomReqId(env.io);
         const key = types.RequestKey.init(endpoint, req_id);
         if (!self.peers.armHealthRequest(key, .{ .allow_eviction_candidate = probe.ticket })) return error.ProbeUnavailable;
-        errdefer _ = self.peers.cancelEvictionRequest(probe.ticket, key);
         const ping = message.Ping{ .req_id = req_id, .enr_seq = self.local.seq };
         var buffer: [128]u8 = undefined;
-        const action = try outbound.prepareTracked(
+        const plaintext = ping.encodeInto(&buffer) catch |err| {
+            _ = self.peers.cancelEvictionRequest(probe.ticket, key);
+            return err;
+        };
+        const action = outbound.prepareTracked(
             self,
             .{ .io = env.io, .ingress = env.ingress },
             endpoint,
@@ -744,10 +747,13 @@ pub const Actor = struct {
             req_id,
             .ping,
             &.{},
-            try ping.encodeInto(&buffer),
+            plaintext,
             .{ .eviction = probe.ticket.generation },
-        );
-        try outbound.executePrepared(self, env, action);
+        ) catch |err| {
+            _ = self.peers.cancelEvictionRequest(probe.ticket, key);
+            return err;
+        };
+        try outbound.emitPrepared(self, env, action);
     }
 
     /// Pre-send reservation transaction for health/eviction liveness probes:

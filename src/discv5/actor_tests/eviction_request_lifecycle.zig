@@ -95,10 +95,13 @@ test "stale eviction candidate fails reservation before any send or permit" {
 }
 
 const EvictionHarness = struct {
+    allocator: std.mem.Allocator,
     ingress: admission.IngressAdmission,
     outbox: events.EventOutbox,
     actor: actor_mod.Actor,
     recording: RecordingSender,
+    request_effect_storage: []actor_mod.SendDatagramEffect,
+    request_effects: actor_mod.RequestEffectQueue,
     candidate: @import("../kbucket.zig").EvictionProbe,
     candidate_key: secp.KeyPair,
     candidate_id: types.NodeId,
@@ -135,6 +138,8 @@ const EvictionHarness = struct {
         errdefer outbox.deinit();
         var actor = try actor_mod.Actor.init(alloc, cfg);
         errdefer actor.deinit(&ingress);
+        const request_effect_storage = try alloc.alloc(actor_mod.SendDatagramEffect, cfg.limits.max_active_requests);
+        errdefer alloc.free(request_effect_storage);
 
         // Fill the candidate's bucket: the real candidate first (learned via
         // a valid ENR like production peers), then K - 1 fabricated
@@ -175,10 +180,13 @@ const EvictionHarness = struct {
         try std.testing.expectEqual(kbucket_mod.EntryStatus.disconnected, candidate.entry.status);
 
         return .{
+            .allocator = alloc,
             .ingress = ingress,
             .outbox = outbox,
             .actor = actor,
             .recording = RecordingSender.init(alloc),
+            .request_effect_storage = request_effect_storage,
+            .request_effects = .init(request_effect_storage),
             .candidate = candidate,
             .candidate_key = candidate_key,
             .candidate_id = candidate_id,
@@ -189,10 +197,12 @@ const EvictionHarness = struct {
     }
 
     fn deinit(self: *EvictionHarness) void {
+        self.failRequestEffects();
         self.recording.deinit();
         self.actor.deinit(&self.ingress);
         self.outbox.deinit();
         self.ingress.deinit();
+        self.allocator.free(self.request_effect_storage);
     }
 
     fn env(self: *EvictionHarness) actor_mod.Env {
@@ -201,7 +211,22 @@ const EvictionHarness = struct {
             .sender = self.recording.sender(),
             .ingress = &self.ingress,
             .outbox = &self.outbox,
+            .request_effects = &self.request_effects,
         };
+    }
+
+    fn drainRequestEffects(self: *EvictionHarness) !void {
+        while (self.request_effects.pop()) |effect| {
+            self.recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+                self.actor.applySendCompletion(self.env(), effect, .failed);
+                return err;
+            };
+            self.actor.applySendCompletion(self.env(), effect, .sent);
+        }
+    }
+
+    fn failRequestEffects(self: *EvictionHarness) void {
+        while (self.request_effects.pop()) |effect| self.actor.applySendCompletion(self.env(), effect, .failed);
     }
 
     fn bucket(self: *EvictionHarness) *kbucket_mod.KBucket {
@@ -233,7 +258,8 @@ test "real full-bucket eviction probe stays active with a live permit after send
     var harness = try EvictionHarness.init(alloc, io);
     defer harness.deinit();
 
-    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    harness.actor.probeEviction(harness.env(), harness.candidate);
+    try harness.drainRequestEffects();
     _ = try harness.expectProbeRequest();
     try std.testing.expect(harness.bucket().pending != null);
     try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.disconnected, harness.actor.peers.routing.getEntry(&harness.candidate_id).?.status);
@@ -247,7 +273,8 @@ test "real eviction probe PONG keeps the candidate and clears the pending replac
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x27} ** 16, .recipient_key = [_]u8{0x28} ** 16 };
     harness.actor.sessions.put(harness.candidate_endpoint, stable, outbound.nowNs(io));
 
-    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    harness.actor.probeEviction(harness.env(), harness.candidate);
+    try harness.drainRequestEffects();
     const key = try harness.expectProbeRequest();
     const pong = message.Pong{ .req_id = key.req_id, .enr_seq = 0, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 };
     var pong_buffer: [128]u8 = undefined;
@@ -272,7 +299,8 @@ test "real eviction probe WHOAREYOU recovery preserves reservation and completes
     var harness = try EvictionHarness.init(alloc, io);
     defer harness.deinit();
 
-    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    harness.actor.probeEviction(harness.env(), harness.candidate);
+    try harness.drainRequestEffects();
     const key = try harness.expectProbeRequest();
     var probe = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(probe.bytes[0..probe.len], &harness.candidate_id)).static_header.nonce;
@@ -310,7 +338,8 @@ test "real eviction probe timeout removes the exact candidate and promotes pendi
     var harness = try EvictionHarness.init(alloc, io);
     defer harness.deinit();
 
-    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    harness.actor.probeEviction(harness.env(), harness.candidate);
+    try harness.drainRequestEffects();
     const key = try harness.expectProbeRequest();
 
     const deadline_ns = harness.actor.requests.get(key).?.deadline_ns;
@@ -338,6 +367,7 @@ test "bucket expiry resolves a live eviction generation before request timeout" 
     defer harness.deinit();
 
     harness.actor.probeEviction(harness.env(), harness.candidate);
+    try harness.drainRequestEffects();
     const key = try harness.expectProbeRequest();
     const active_deadline = harness.actor.requests.get(key).?.deadline_ns;
     const pending = harness.bucket().pending orelse return error.MissingPending;
@@ -384,6 +414,7 @@ test "real eviction probe cancellation releases only its ticketed reservation" {
     defer harness.deinit();
 
     harness.actor.probeEviction(harness.env(), harness.candidate);
+    try harness.drainRequestEffects();
     const key = try harness.expectProbeRequest();
     try std.testing.expect(harness.actor.cancelRequest(harness.env(), key));
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
@@ -400,6 +431,7 @@ test "stale P1 eviction success preserves P2 reservation when RequestKey is reus
     defer harness.deinit();
 
     harness.actor.probeEviction(harness.env(), harness.candidate);
+    try harness.drainRequestEffects();
     const reused_key = try harness.expectProbeRequest();
     var p1_request = harness.actor.requests.take(reused_key) orelse return error.MissingP1Request;
     p1_request.admission.release(&harness.ingress);
@@ -479,7 +511,16 @@ test "real eviction probe send failure rolls back reservation and bucket state" 
     defer harness.deinit();
 
     harness.recording.fail_next = true;
-    harness.actor.probeEviction(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, harness.candidate);
+    harness.actor.probeEviction(harness.env(), harness.candidate);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id).?.health_request != null);
+    try std.testing.expect(harness.bucket().pending.?.request_key != null);
+
+    try std.testing.expectError(error.TransportSendFailed, harness.drainRequestEffects());
 
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
