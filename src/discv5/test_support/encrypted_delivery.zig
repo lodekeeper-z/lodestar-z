@@ -18,8 +18,8 @@ pub fn deliverEncrypted(
     nonce_byte: u8,
 ) !void {
     var storage: [32]actor_mod.ActorEffect = undefined;
-    var effects = actor_mod.RequestEffectQueue.init(&storage);
-    const env = actor_mod.Env{ .io = io, .ingress = ingress, .outbox = outbox, .request_effects = &effects };
+    var effects = actor_mod.EffectQueue.init(&storage);
+    const env = actor_mod.Env{ .io = io, .ingress = ingress, .outbox = outbox, .effects = &effects };
     try deliverEncryptedWithEnv(
         actor,
         env,

@@ -54,8 +54,8 @@ const RuntimeImpl = struct {
     options: config_mod.Options,
     command_queue: Io.Queue(Command),
     command_buffer: []Command,
-    request_effect_storage: []actor_mod.ActorEffect,
-    request_effects: actor_mod.RequestEffectQueue,
+    effect_storage: []actor_mod.ActorEffect,
+    effects: actor_mod.EffectQueue,
     group: Io.Group = .init,
     lifecycle: std.atomic.Value(Lifecycle) = .init(.ready),
     terminalized: std.atomic.Value(bool) = .init(false),
@@ -203,7 +203,7 @@ const RuntimeImpl = struct {
         errdefer actor.deinit(&admission);
         const commands = try allocator.alloc(Command, config.limits.command_capacity);
         errdefer allocator.free(commands);
-        const request_effect_storage = try allocator.alloc(actor_mod.ActorEffect, try @import("admission.zig").permitCapacity(config.limits) + 1);
+        const effect_storage = try allocator.alloc(actor_mod.ActorEffect, try @import("admission.zig").permitCapacity(config.limits) + 1);
         return .{
             .io = io,
             .allocator = allocator,
@@ -216,8 +216,8 @@ const RuntimeImpl = struct {
             .options = options,
             .command_queue = .init(commands),
             .command_buffer = commands,
-            .request_effect_storage = request_effect_storage,
-            .request_effects = .init(request_effect_storage),
+            .effect_storage = effect_storage,
+            .effects = .init(effect_storage),
         };
     }
 
@@ -230,7 +230,7 @@ const RuntimeImpl = struct {
         self.actor.deinit(&self.admission);
         self.admission.deinit();
         self.transport.deinit();
-        self.allocator.free(self.request_effect_storage);
+        self.allocator.free(self.effect_storage);
         self.allocator.free(self.command_buffer);
     }
 
@@ -283,7 +283,7 @@ const RuntimeImpl = struct {
 
     fn terminalize(self: *RuntimeImpl) void {
         if (self.terminalized.swap(true, .acq_rel)) return;
-        self.abortRequestEffects();
+        self.abortEffects();
         const env = self.actorEnv();
         self.actor.finishAllReliableRequests(env);
         self.actor.finishAllLookups(env, .runtime_stopped);
@@ -388,14 +388,14 @@ const RuntimeImpl = struct {
             .io = self.io,
             .ingress = &self.admission,
             .outbox = &self.outbox,
-            .request_effects = &self.request_effects,
+            .effects = &self.effects,
             .lookup_results = &self.lookup_result_outbox,
             .request_results = &self.request_result_outbox,
         };
     }
 
     fn handleCommand(self: *RuntimeImpl, command: Command) Io.Cancelable!void {
-        defer self.abortRequestEffects();
+        defer self.abortEffects();
         var expected = switch (command) {
             .inbound => |value| value.expected,
             else => null,
@@ -478,11 +478,11 @@ const RuntimeImpl = struct {
             .peer_enr => |value| value.reply.putOneUncancelable(self.io, self.actor.peerEnr(&value.node_id)) catch {},
             .local_enr_seq => |reply| reply.putOneUncancelable(self.io, self.actor.localEnrSeq()) catch {},
         }
-        try self.drainRequestEffects();
+        try self.drainEffects();
     }
 
-    fn drainRequestEffects(self: *RuntimeImpl) Io.Cancelable!void {
-        while (self.request_effects.pop()) |effect| {
+    fn drainEffects(self: *RuntimeImpl) Io.Cancelable!void {
+        while (self.effects.pop()) |effect| {
             executeSendEffect(self, effect) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => continue,
@@ -490,8 +490,8 @@ const RuntimeImpl = struct {
         }
     }
 
-    fn abortRequestEffects(self: *RuntimeImpl) void {
-        while (self.request_effects.pop()) |effect| {
+    fn abortEffects(self: *RuntimeImpl) void {
+        while (self.effects.pop()) |effect| {
             self.actor.applyEffectCompletion(self.actorEnv(), effect, .runtime_stopped);
         }
     }
@@ -533,7 +533,7 @@ const RuntimeImpl = struct {
             try replyResult(self.io, value.reply, @as(TalkResponseError!void, err));
             return;
         }
-        const effect = self.request_effects.pop() orelse unreachable;
+        const effect = self.effects.pop() orelse unreachable;
         executeSendEffect(self, effect) catch |err| {
             const result: TalkResponseError!void = switch (err) {
                 error.Canceled => error.Canceled,

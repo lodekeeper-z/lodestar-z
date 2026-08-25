@@ -39,8 +39,8 @@ pub const PacketLink = struct {
         var env = self.destination_env;
         env.expected_credit = credit;
         var fallback_storage: [32]actor_mod.ActorEffect = undefined;
-        var fallback_effects = actor_mod.RequestEffectQueue.init(&fallback_storage);
-        if (env.request_effects == null) env.request_effects = &fallback_effects;
+        var fallback_effects = actor_mod.EffectQueue.init(&fallback_storage);
+        if (env.effects == null) env.effects = &fallback_effects;
         var bytes = (try self.packetBytes(index)).*;
         self.destination.handlePacket(env, bytes.bytes[0..bytes.len], self.source_address);
         try self.drainEffects(env);
@@ -71,8 +71,8 @@ pub const PacketLink = struct {
         var bytes = (try self.packetBytes(index)).*;
         var env = self.destination_env;
         var fallback_storage: [32]actor_mod.ActorEffect = undefined;
-        var fallback_effects = actor_mod.RequestEffectQueue.init(&fallback_storage);
-        if (env.request_effects == null) env.request_effects = &fallback_effects;
+        var fallback_effects = actor_mod.EffectQueue.init(&fallback_storage);
+        if (env.effects == null) env.effects = &fallback_effects;
         self.destination.handlePacket(
             env,
             bytes.bytes[0..bytes.len],
@@ -82,7 +82,7 @@ pub const PacketLink = struct {
     }
 
     fn drainEffects(self: *const PacketLink, env: actor_mod.Env) !void {
-        const effects = env.request_effects orelse return;
+        const effects = env.effects orelse return;
         while (effects.pop()) |effect| {
             self.executor.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
                 self.destination.applyEffectCompletion(env, effect, .failed);

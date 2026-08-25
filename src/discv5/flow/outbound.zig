@@ -36,7 +36,7 @@ pub fn emitPrepared(
     env: Env,
     action: actor_mod.OutboundRequestAction,
 ) !void {
-    const effects = env.request_effects orelse unreachable;
+    const effects = env.effects orelse unreachable;
     switch (action) {
         .queued => {},
         .send => |effect| effects.push(.{ .request = effect }) catch {
@@ -136,7 +136,7 @@ pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext
         .admission = permit.move(),
         .prepared_at_ns = now_ns,
     } };
-    const effects = env.request_effects orelse unreachable;
+    const effects = env.effects orelse unreachable;
     effects.push(effect) catch {
         effect.abortPreparation(env.ingress);
         return error.TooManyActiveRequests;

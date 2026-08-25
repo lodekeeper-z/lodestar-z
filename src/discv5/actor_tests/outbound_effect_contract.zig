@@ -127,7 +127,7 @@ test "bounded request effect output owns preparation without executing transport
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb9, 0xba, 85, 9285);
     defer context.deinit();
     var storage: [1]actor_mod.ActorEffect = undefined;
-    var effects = actor_mod.RequestEffectQueue.init(&storage);
+    var effects = actor_mod.EffectQueue.init(&storage);
     const action = try context.harness.actor.preparePing(
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
@@ -137,7 +137,7 @@ test "bounded request effect output owns preparation without executing transport
     );
 
     var env = context.harness.env();
-    env.request_effects = &effects;
+    env.effects = &effects;
     try outbound.emitPrepared(env, action);
 
     try std.testing.expectEqual(@as(usize, 1), effects.count());
@@ -151,7 +151,7 @@ test "full request effect output aborts the unaccepted preparation" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xbb, 0xbc, 86, 9286);
     defer context.deinit();
     var storage: [1]actor_mod.ActorEffect = undefined;
-    var effects = actor_mod.RequestEffectQueue.init(&storage);
+    var effects = actor_mod.EffectQueue.init(&storage);
 
     const first = try context.harness.actor.preparePing(
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
@@ -161,7 +161,7 @@ test "full request effect output aborts the unaccepted preparation" {
         .reliable_api,
     );
     var env = context.harness.env();
-    env.request_effects = &effects;
+    env.effects = &effects;
     try outbound.emitPrepared(env, first);
     const second = try context.harness.actor.preparePing(
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
@@ -252,20 +252,20 @@ test "queued drain emits one FIFO effect per sent completion" {
 
     try std.testing.expect(harness.actor.cancelRequest(harness.env(), blocker_key));
     try std.testing.expectEqual(@as(usize, 2), harness.actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.effects.count());
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
 
-    var first_effect = harness.request_effects.pop() orelse return error.MissingFirstDrainEffect;
+    var first_effect = harness.effects.pop() orelse return error.MissingFirstDrainEffect;
     try std.testing.expectEqual(first_id, first_effect.requestId());
     harness.actor.applyEffectCompletion(harness.env(), first_effect, .sent);
     try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.effects.count());
 
-    var second_effect = harness.request_effects.pop() orelse return error.MissingSecondDrainEffect;
+    var second_effect = harness.effects.pop() orelse return error.MissingSecondDrainEffect;
     try std.testing.expectEqual(second_id, second_effect.requestId());
     harness.actor.applyEffectCompletion(harness.env(), second_effect, .sent);
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.queuedCount());
-    try std.testing.expectEqual(@as(usize, 0), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 0), harness.effects.count());
     try std.testing.expectEqual(@as(usize, 2), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 2), harness.ingress.permitCount());
 }
@@ -281,9 +281,9 @@ test "Actor tracked send helpers emit without executing transport" {
         0,
         .api,
     );
-    try std.testing.expectEqual(@as(usize, 1), context.harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.effects.count());
     try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
-    context.harness.failRequestEffects();
+    context.harness.failEffects();
 
     _ = try context.harness.actor.sendTalkRequest(
         context.harness.env(),
@@ -292,9 +292,9 @@ test "Actor tracked send helpers emit without executing transport" {
         "contract",
         "payload",
     );
-    try std.testing.expectEqual(@as(usize, 1), context.harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.effects.count());
     try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
-    context.harness.failRequestEffects();
+    context.harness.failEffects();
     try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
 }
 

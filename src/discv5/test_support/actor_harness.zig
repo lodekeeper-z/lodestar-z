@@ -12,8 +12,8 @@ pub const ActorHarness = struct {
     outbox: events.EventOutbox,
     actor: actor_mod.Actor,
     recording: RecordingSender,
-    request_effect_storage: []actor_mod.ActorEffect,
-    request_effects: actor_mod.RequestEffectQueue,
+    effect_storage: []actor_mod.ActorEffect,
+    effects: actor_mod.EffectQueue,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !ActorHarness {
         try cfg.validate();
@@ -23,7 +23,7 @@ pub const ActorHarness = struct {
         errdefer outbox.deinit();
         var actor = try actor_mod.Actor.init(allocator, cfg);
         errdefer actor.deinit(&ingress);
-        const request_effect_storage = try allocator.alloc(actor_mod.ActorEffect, try admission.permitCapacity(cfg.limits) + 1);
+        const effect_storage = try allocator.alloc(actor_mod.ActorEffect, try admission.permitCapacity(cfg.limits) + 1);
         return .{
             .allocator = allocator,
             .io = io,
@@ -31,18 +31,18 @@ pub const ActorHarness = struct {
             .outbox = outbox,
             .actor = actor,
             .recording = .init(allocator),
-            .request_effect_storage = request_effect_storage,
-            .request_effects = .init(request_effect_storage),
+            .effect_storage = effect_storage,
+            .effects = .init(effect_storage),
         };
     }
 
     pub fn deinit(self: *ActorHarness) void {
-        while (self.request_effects.pop()) |effect| effect.abortPreparation(&self.ingress);
+        while (self.effects.pop()) |effect| effect.abortPreparation(&self.ingress);
         self.recording.deinit();
         self.actor.deinit(&self.ingress);
         self.outbox.deinit();
         self.ingress.deinit();
-        self.allocator.free(self.request_effect_storage);
+        self.allocator.free(self.effect_storage);
     }
 
     pub fn env(self: *ActorHarness) actor_mod.Env {
@@ -50,12 +50,12 @@ pub const ActorHarness = struct {
             .io = self.io,
             .ingress = &self.ingress,
             .outbox = &self.outbox,
-            .request_effects = &self.request_effects,
+            .effects = &self.effects,
         };
     }
 
-    pub fn drainRequestEffects(self: *ActorHarness) !void {
-        while (self.request_effects.pop()) |effect| {
+    pub fn drainEffects(self: *ActorHarness) !void {
+        while (self.effects.pop()) |effect| {
             self.recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
                 self.actor.applyEffectCompletion(self.env(), effect, .failed);
                 return err;
@@ -64,8 +64,8 @@ pub const ActorHarness = struct {
         }
     }
 
-    pub fn drainRequestEffectsIgnoringFailures(self: *ActorHarness) void {
-        while (self.request_effects.pop()) |effect| {
+    pub fn drainEffectsIgnoringFailures(self: *ActorHarness) void {
+        while (self.effects.pop()) |effect| {
             self.recording.sender().send(effect.destination(), effect.packetBytes()) catch {
                 self.actor.applyEffectCompletion(self.env(), effect, .failed);
                 continue;
@@ -74,8 +74,8 @@ pub const ActorHarness = struct {
         }
     }
 
-    pub fn failRequestEffects(self: *ActorHarness) void {
-        while (self.request_effects.pop()) |effect| {
+    pub fn failEffects(self: *ActorHarness) void {
+        while (self.effects.pop()) |effect| {
             self.actor.applyEffectCompletion(self.env(), effect, .failed);
         }
     }

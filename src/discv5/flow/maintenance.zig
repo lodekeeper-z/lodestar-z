@@ -76,7 +76,7 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
                 .deadline_ns = deadline_ns,
                 .kind = retry.kind,
             } } };
-            const effects = env.request_effects orelse unreachable;
+            const effects = env.effects orelse unreachable;
             effects.push(effect) catch {
                 actor.applyEffectCompletion(env, effect, .failed);
                 return;
@@ -139,7 +139,7 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
                 .transition = transition,
                 .admission = next_admission.move(),
             } } };
-            const effects = env.request_effects orelse unreachable;
+            const effects = env.effects orelse unreachable;
             effects.push(effect) catch {
                 actor.applyEffectCompletion(env, effect, .failed);
                 return;

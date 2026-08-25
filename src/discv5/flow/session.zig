@@ -213,7 +213,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         .prepared_at_ns = now_ns,
         .plaintext = recovery.plaintext,
     } };
-    const effects = env.request_effects orelse unreachable;
+    const effects = env.effects orelse unreachable;
     effects.push(effect) catch return;
 }
 
@@ -332,7 +332,7 @@ fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonc
             .destination = endpoint.addr,
             .packet = challenge.datagram,
         } } };
-        const effects = env.request_effects orelse unreachable;
+        const effects = env.effects orelse unreachable;
         effects.push(effect) catch return false;
         return true;
     }
@@ -371,7 +371,7 @@ fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonc
         .remote_enr = remote_enr,
         .prepared_at_ns = now_ns,
     } } };
-    const effects = env.request_effects orelse unreachable;
+    const effects = env.effects orelse unreachable;
     effects.push(effect) catch {
         actor.applyEffectCompletion(env, effect, .failed);
         return false;

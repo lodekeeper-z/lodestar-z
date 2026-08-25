@@ -17,10 +17,10 @@ const RecordingSender = @import("../test_support/recording_sender.zig").Recordin
 const deliverEncrypted = @import("../test_support/encrypted_delivery.zig").deliverEncrypted;
 const deliverEncryptedWithEnv = @import("../test_support/encrypted_delivery.zig").deliverEncryptedWithEnv;
 
-fn drainRequestEffects(
+fn drainEffects(
     actor: *actor_mod.Actor,
     env: actor_mod.Env,
-    effects: *actor_mod.RequestEffectQueue,
+    effects: *actor_mod.EffectQueue,
     recording: *RecordingSender,
 ) !void {
     while (effects.pop()) |effect| {
@@ -134,7 +134,7 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x66} ** 16, .recipient_key = [_]u8{0x67} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
     const talk_id = try actor.sendTalkRequest(harness.env(), endpoint, &remote_pubkey, "test", "request");
-    try harness.drainRequestEffects();
+    try harness.drainEffects();
     const queued_id = try message.ReqId.fromSlice(&.{9});
     const queued_ping = message.Ping{ .req_id = queued_id, .enr_seq = 0 };
     var queued_buffer: [128]u8 = undefined;
@@ -147,7 +147,7 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     actor.alloc = failing.allocator();
     defer actor.alloc = alloc;
     try deliverEncryptedWithEnv(actor, harness.env(), endpoint, &stable.recipient_key, try response.encodeInto(&response_buffer), 11);
-    try harness.drainRequestEffects();
+    try harness.drainEffects();
     actor.alloc = alloc;
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
@@ -188,7 +188,7 @@ test "maintenance removes every expired lookup and retains live lookups" {
     }
 
     actor.maintenanceAt(harness.env(), now_ns);
-    harness.drainRequestEffectsIgnoringFailures();
+    harness.drainEffectsIgnoringFailures();
 
     for (1..7) |lookup_id| {
         try std.testing.expect(!actor.lookups.contains(@intCast(lookup_id)));
@@ -227,7 +227,7 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x6c} ** 16, .recipient_key = [_]u8{0x6d} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
     const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .{ .maintenance = .health });
-    try harness.drainRequestEffects();
+    try harness.drainEffects();
     const key = types.RequestKey.init(endpoint, req_id);
     try std.testing.expect(actor.peers.armHealthRequest(key, .connected_only));
     harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
@@ -328,12 +328,12 @@ test "lookup transport failure completes through emitted effect ownership" {
 
     const lookup_id = try harness.actor.startLookup(env, remote_id);
     accepted_lookup = lookup_id;
-    try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.effects.count());
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
-    while (harness.request_effects.pop()) |effect| {
+    while (harness.effects.pop()) |effect| {
         harness.actor.applyEffectCompletion(env, effect, .failed);
     }
 
@@ -431,7 +431,7 @@ test "detached late multipart NODES still learns emits and releases final permit
     const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{}, 0, actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
     const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{distance}, .{ .lookup = lookup_id });
-    try harness.drainRequestEffects();
+    try harness.drainEffects();
     actor.finishLookup(harness.env(), lookup_id, .completed);
     try std.testing.expect(harness.outbox.pop() == null);
     try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(.init(endpoint, req_id)).?.origin);
@@ -497,19 +497,19 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     var effect_storage: [2]actor_mod.ActorEffect = undefined;
-    var effects = actor_mod.RequestEffectQueue.init(&effect_storage);
+    var effects = actor_mod.EffectQueue.init(&effect_storage);
     const env = actor_mod.Env{
         .io = io,
 
         .ingress = &ingress,
         .outbox = &outbox,
-        .request_effects = &effects,
+        .effects = &effects,
     };
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x86} ** 16, .recipient_key = [_]u8{0x87} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
 
     const first_req = try actor.sendFindNode(env, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
-    try drainRequestEffects(&actor, env, &effects, &recording);
+    try drainEffects(&actor, env, &effects, &recording);
     var first_chunk_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const first_chunk = message.Nodes{ .req_id = first_req, .total = 2, .enrs = &.{raw_a} };
     var fail_first = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -530,7 +530,7 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     try std.testing.expect(outbox.pop() == null);
 
     const final_req = try actor.sendFindNode(env, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
-    try drainRequestEffects(&actor, env, &effects, &recording);
+    try drainEffects(&actor, env, &effects, &recording);
     var successful_first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const successful_first = message.Nodes{ .req_id = final_req, .total = 2, .enrs = &.{raw_a} };
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try successful_first.encodeInto(&successful_first_buffer), 17);

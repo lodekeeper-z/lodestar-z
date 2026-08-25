@@ -20,10 +20,10 @@ fn ip4(bytes: [4]u8, port: u16) types.Address {
     return .{ .ip4 = .{ .bytes = bytes, .port = port } };
 }
 
-fn drainRequestEffects(
+fn drainEffects(
     actor: *actor_mod.Actor,
     env: actor_mod.Env,
-    effects: *actor_mod.RequestEffectQueue,
+    effects: *actor_mod.EffectQueue,
     recording: *RecordingSender,
 ) !void {
     while (effects.pop()) |effect| {
@@ -186,13 +186,13 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     var effect_storage: [4]actor_mod.ActorEffect = undefined;
-    var effects = actor_mod.RequestEffectQueue.init(&effect_storage);
+    var effects = actor_mod.EffectQueue.init(&effect_storage);
     const env = actor_mod.Env{
         .io = io,
 
         .ingress = &ingress,
         .outbox = &outbox,
-        .request_effects = &effects,
+        .effects = &effects,
     };
 
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x94} ** 32));
@@ -209,7 +209,7 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     const observed_a = ip4(.{ 198, 51, 100, 10 }, 9100);
     const observed_b = ip4(.{ 198, 51, 100, 11 }, 9101);
     actor.observeAddressVoteAt(env, remote_address, observed_a, 100);
-    try drainRequestEffects(&actor, env, &effects, &recording);
+    try drainEffects(&actor, env, &effects, &recording);
     try std.testing.expectEqual(@as(u64, 2), actor.localEnrSeq());
     try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
     const propagation = actor.peers.routing.getEntry(&remote_id).?.health_request orelse return error.MissingPropagationPing;
@@ -224,7 +224,7 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
 
     const cooldown_ns: i64 = addr_votes.ENR_UPDATE_COOLDOWN_MS * std.time.ns_per_ms;
     actor.observeAddressVoteAt(env, remote_address, observed_b, 100 + cooldown_ns);
-    try drainRequestEffects(&actor, env, &effects, &recording);
+    try drainEffects(&actor, env, &effects, &recording);
     try std.testing.expectEqual(@as(u64, 3), actor.localEnrSeq());
     try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
 }

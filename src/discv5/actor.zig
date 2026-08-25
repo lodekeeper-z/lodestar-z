@@ -38,7 +38,7 @@ pub const Env = struct {
     io: std.Io,
     ingress: *admission.IngressAdmission,
     outbox: *events.EventOutbox,
-    request_effects: ?*RequestEffectQueue = null,
+    effects: ?*EffectQueue = null,
     lookup_results: ?*lookup_results.LookupResultOutbox = null,
     request_results: ?*request_results.RequestResultOutbox = null,
     expected_credit: ?*admission.ExpectedCredit = null,
@@ -279,28 +279,28 @@ pub const WhoareyouSendEffect = union(enum) {
 
 /// Runtime-owned bounded output for Actor effects. Actor transitions may
 /// append move-owned effects but never execute transport through this queue.
-pub const RequestEffectQueue = struct {
+pub const EffectQueue = struct {
     storage: []ActorEffect,
     head: usize = 0,
     len: usize = 0,
 
-    pub fn init(storage: []ActorEffect) RequestEffectQueue {
+    pub fn init(storage: []ActorEffect) EffectQueue {
         std.debug.assert(storage.len > 0);
         return .{ .storage = storage };
     }
 
-    pub fn count(self: *const RequestEffectQueue) usize {
+    pub fn count(self: *const EffectQueue) usize {
         return self.len;
     }
 
-    pub fn push(self: *RequestEffectQueue, effect: ActorEffect) error{Full}!void {
+    pub fn push(self: *EffectQueue, effect: ActorEffect) error{Full}!void {
         if (self.len == self.storage.len) return error.Full;
         const index = (self.head + self.len) % self.storage.len;
         self.storage[index] = effect;
         self.len += 1;
     }
 
-    pub fn pop(self: *RequestEffectQueue) ?ActorEffect {
+    pub fn pop(self: *EffectQueue) ?ActorEffect {
         if (self.len == 0) return null;
         const effect = self.storage[self.head];
         self.head = (self.head + 1) % self.storage.len;
@@ -1403,8 +1403,8 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     var effect_storage: [1]ActorEffect = undefined;
-    var effects = RequestEffectQueue.init(&effect_storage);
-    const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .request_effects = &effects };
+    var effects = EffectQueue.init(&effect_storage);
+    const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .effects = &effects };
     try std.testing.expect(actor.addNode(lookup_peer_id, &lookup_pubkey, lookup_address, null, 0));
 
     const blocker_req_id = try actor.sendPing(env, blocker_endpoint, &blocker_pubkey, 0, .api);
@@ -1492,8 +1492,8 @@ test "discv5 actor: lookup transport send failure remains terminal" {
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
     var effect_storage: [1]ActorEffect = undefined;
-    var effects = RequestEffectQueue.init(&effect_storage);
-    const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .request_effects = &effects };
+    var effects = EffectQueue.init(&effect_storage);
+    const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .effects = &effects };
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, remote_address, null, 0));
     const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0x98} ** 32, &.{remote_id}, outbound.nowNs(io), actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(1, lookup);
