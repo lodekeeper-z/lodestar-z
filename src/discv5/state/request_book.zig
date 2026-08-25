@@ -135,6 +135,30 @@ pub const Response = union(enum) {
     }
 };
 
+/// Compact response fact owned while an outbound request is prepared but not
+/// yet sent. The large NODES accumulator only becomes real at send commit.
+pub const ResponseExpectation = union(enum) {
+    pong,
+    nodes: RequestDistances,
+    talkresp,
+
+    pub fn kind(self: ResponseExpectation) types.RequestKind {
+        return switch (self) {
+            .pong => .ping,
+            .nodes => .findnode,
+            .talkresp => .talkreq,
+        };
+    }
+
+    fn activate(self: ResponseExpectation) Response {
+        return switch (self) {
+            .pong => .pong,
+            .nodes => |distances| .{ .nodes = .init(&distances) },
+            .talkresp => .talkresp,
+        };
+    }
+};
+
 pub const ActiveRequest = struct {
     origin: types.RequestOrigin,
     response: Response,
@@ -152,12 +176,16 @@ const LaneMap = std.HashMap(types.Endpoint, EndpointLane, types.EndpointContext,
 
 pub const PreparedRequest = struct {
     key: types.RequestKey,
-    request: ActiveRequest,
+    origin: types.RequestOrigin,
+    response: ResponseExpectation,
+    phase: Phase,
+    admission: AdmissionPermit,
+    deadline_ns: i64,
     index_challenge: ?types.ChallengeKey,
     establish: bool,
 
     pub fn abort(self: *PreparedRequest, admission: *admission_mod.IngressAdmission) void {
-        self.request.admission.release(admission);
+        self.admission.release(admission);
     }
 };
 
@@ -217,11 +245,15 @@ pub const RequestBook = struct {
         self.challenge_by_nonce.deinit();
     }
 
-    pub fn makeResponse(_: *RequestBook, kind: types.RequestKind, requested_distances: *const RequestDistances) Response {
+    pub fn makeResponse(self: *RequestBook, kind: types.RequestKind, requested_distances: *const RequestDistances) Response {
+        return self.makeExpectation(kind, requested_distances).activate();
+    }
+
+    pub fn makeExpectation(_: *RequestBook, kind: types.RequestKind, requested_distances: *const RequestDistances) ResponseExpectation {
         return switch (kind) {
             .ping => .pong,
             .talkreq => .talkresp,
-            .findnode => .{ .nodes = .init(requested_distances) },
+            .findnode => .{ .nodes = requested_distances.* },
         };
     }
 
@@ -230,7 +262,7 @@ pub const RequestBook = struct {
         admission: *admission_mod.IngressAdmission,
         key: types.RequestKey,
         origin: types.RequestOrigin,
-        response: Response,
+        response: ResponseExpectation,
         phase: Phase,
         deadline_ns: i64,
         establish: bool,
@@ -245,13 +277,11 @@ pub const RequestBook = struct {
         const permit = try admission.acquire(key.endpoint.addr, admission_mod.requestPacketBudget(response.kind()));
         return .{
             .key = key,
-            .request = .{
-                .origin = origin,
-                .response = response,
-                .phase = phase,
-                .admission = permit,
-                .deadline_ns = deadline_ns,
-            },
+            .origin = origin,
+            .response = response,
+            .phase = phase,
+            .admission = permit,
+            .deadline_ns = deadline_ns,
             .index_challenge = challenge_index,
             .establish = establish,
         };
@@ -259,7 +289,13 @@ pub const RequestBook = struct {
 
     pub fn commitPrepared(self: *RequestBook, prepared: PreparedRequest) void {
         std.debug.assert(!self.active.contains(prepared.key));
-        self.active.putAssumeCapacityNoClobber(prepared.key, prepared.request);
+        self.active.putAssumeCapacityNoClobber(prepared.key, .{
+            .origin = prepared.origin,
+            .response = prepared.response.activate(),
+            .phase = prepared.phase,
+            .admission = prepared.admission,
+            .deadline_ns = prepared.deadline_ns,
+        });
         if (prepared.index_challenge) |index| self.challenge_by_nonce.putAssumeCapacityNoClobber(index, prepared.key);
         if (prepared.establish) self.setEstablishing(prepared.key);
     }
@@ -368,6 +404,14 @@ pub const RequestBook = struct {
         const lane = self.lanes.getPtr(endpoint) orelse return null;
         if (lane.establishing != null) return null;
         return lane.queued.first();
+    }
+
+    pub fn commitSent(self: *RequestBook, prepared: PreparedRequest) void {
+        if (self.containsQueued(prepared.key)) {
+            self.commitQueued(prepared);
+        } else {
+            self.commitPrepared(prepared);
+        }
     }
 
     pub fn commitQueued(self: *RequestBook, prepared: PreparedRequest) void {

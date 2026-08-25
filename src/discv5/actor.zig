@@ -49,6 +49,74 @@ pub const Env = struct {
     }
 };
 
+/// Capabilities available to a synchronous Actor transition. Cancelable
+/// transport execution is intentionally absent and remains Runtime-owned.
+pub const TransitionContext = struct {
+    io: std.Io,
+    ingress: *admission.IngressAdmission,
+};
+
+pub const SendCompletion = enum {
+    sent,
+    failed,
+};
+
+/// Move-owned outbound transition. Until Runtime reports completion, this is
+/// the sole owner of the bounded datagram and prepared request admission.
+pub const SendDatagramEffect = struct {
+    storage: union(enum) {
+        retained: request_book.PreparedRequest,
+        transient: struct {
+            prepared: request_book.PreparedRequest,
+            packet: types.PacketBytes,
+        },
+    },
+
+    fn prepared(self: *const SendDatagramEffect) *const request_book.PreparedRequest {
+        return switch (self.storage) {
+            .retained => |*value| value,
+            .transient => |*value| &value.prepared,
+        };
+    }
+
+    fn takePrepared(self: SendDatagramEffect) request_book.PreparedRequest {
+        return switch (self.storage) {
+            .retained => |value| value,
+            .transient => |value| value.prepared,
+        };
+    }
+
+    pub fn requestId(self: *const SendDatagramEffect) message.ReqId {
+        return self.prepared().key.req_id;
+    }
+
+    pub fn destination(self: *const SendDatagramEffect) types.Address {
+        return self.prepared().key.endpoint.addr;
+    }
+
+    pub fn packetBytes(self: *const SendDatagramEffect) []const u8 {
+        return switch (self.storage) {
+            .retained => |*value| switch (value.phase) {
+                .awaiting_whoareyou => |*phase| phase.retry_packet.slice(),
+                .awaiting_response => unreachable,
+            },
+            .transient => |*value| value.packet.slice(),
+        };
+    }
+};
+
+pub const OutboundRequestAction = union(enum) {
+    queued: message.ReqId,
+    send: SendDatagramEffect,
+
+    pub fn requestId(self: *const OutboundRequestAction) message.ReqId {
+        return switch (self.*) {
+            .queued => |req_id| req_id,
+            .send => |*effect| effect.requestId(),
+        };
+    }
+};
+
 pub const ProbeSnapshot = struct {
     endpoint: types.Endpoint,
     pubkey: [33]u8,
@@ -145,6 +213,37 @@ pub const Actor = struct {
         session_flow.handlePacket(self, env, raw, from);
     }
 
+    pub fn preparePing(
+        self: *Actor,
+        context: TransitionContext,
+        endpoint: types.Endpoint,
+        pubkey: *const [33]u8,
+        enr_seq: u64,
+        origin: types.RequestOrigin,
+    ) !OutboundRequestAction {
+        const req_id = randomReqId(context.io);
+        const ping = message.Ping{ .req_id = req_id, .enr_seq = enr_seq };
+        var buffer: [128]u8 = undefined;
+        return outbound.prepareTracked(self, context, endpoint, pubkey, req_id, .ping, &.{}, try ping.encodeInto(&buffer), origin);
+    }
+
+    pub fn applySendCompletion(
+        self: *Actor,
+        ingress: *admission.IngressAdmission,
+        effect: SendDatagramEffect,
+        completion_event: SendCompletion,
+    ) void {
+        var pending = effect.takePrepared();
+        switch (completion_event) {
+            .sent => {
+                const kind = pending.response.kind();
+                self.requests.commitSent(pending);
+                outbound.noteSentRequest(self, kind);
+            },
+            .failed => pending.abort(ingress),
+        }
+    }
+
     pub fn sendPing(
         self: *Actor,
         env: Env,
@@ -153,11 +252,28 @@ pub const Actor = struct {
         enr_seq: u64,
         origin: types.RequestOrigin,
     ) !message.ReqId {
-        const req_id = randomReqId(env.io);
-        const ping = message.Ping{ .req_id = req_id, .enr_seq = enr_seq };
-        var buffer: [128]u8 = undefined;
-        try outbound.sendTracked(self, env, endpoint, pubkey, req_id, .ping, &.{}, try ping.encodeInto(&buffer), origin);
+        var action = try self.preparePing(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, enr_seq, origin);
+        const req_id = action.requestId();
+        try outbound.executePrepared(self, env, action);
         return req_id;
+    }
+
+    pub fn prepareFindNode(
+        self: *Actor,
+        context: TransitionContext,
+        endpoint: types.Endpoint,
+        pubkey: *const [33]u8,
+        distances: []const u16,
+        origin: types.RequestOrigin,
+    ) !OutboundRequestAction {
+        if (distances.len > types.MAX_OUTBOUND_FINDNODE_DISTANCES) return error.TooManyDistances;
+        for (distances) |distance| {
+            if (distance > 256) return error.InvalidDistance;
+        }
+        const req_id = randomReqId(context.io);
+        const findnode = message.FindNode{ .req_id = req_id, .distances = distances };
+        var buffer: [512]u8 = undefined;
+        return outbound.prepareTracked(self, context, endpoint, pubkey, req_id, .findnode, distances, try findnode.encodeInto(&buffer), origin);
     }
 
     pub fn sendFindNode(
@@ -168,14 +284,9 @@ pub const Actor = struct {
         distances: []const u16,
         origin: types.RequestOrigin,
     ) !message.ReqId {
-        if (distances.len > types.MAX_OUTBOUND_FINDNODE_DISTANCES) return error.TooManyDistances;
-        for (distances) |distance| {
-            if (distance > 256) return error.InvalidDistance;
-        }
-        const req_id = randomReqId(env.io);
-        const findnode = message.FindNode{ .req_id = req_id, .distances = distances };
-        var buffer: [512]u8 = undefined;
-        try outbound.sendTracked(self, env, endpoint, pubkey, req_id, .findnode, distances, try findnode.encodeInto(&buffer), origin);
+        var action = try self.prepareFindNode(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, distances, origin);
+        const req_id = action.requestId();
+        try outbound.executePrepared(self, env, action);
         return req_id;
     }
 
@@ -190,6 +301,23 @@ pub const Actor = struct {
         return self.sendTalkRequestWithOrigin(env, endpoint, pubkey, protocol_name, request, .api);
     }
 
+    pub fn prepareTalkRequest(
+        self: *Actor,
+        context: TransitionContext,
+        endpoint: types.Endpoint,
+        pubkey: *const [33]u8,
+        protocol_name: []const u8,
+        request: []const u8,
+        origin: types.RequestOrigin,
+    ) !OutboundRequestAction {
+        const req_id = randomReqId(context.io);
+        const talk = message.TalkReq{ .req_id = req_id, .protocol = protocol_name, .request = request };
+        var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+        const plaintext = try talk.encodeInto(&buffer);
+        if (!packet.ordinaryMessageFits(plaintext.len)) return error.MessageTooLarge;
+        return outbound.prepareTracked(self, context, endpoint, pubkey, req_id, .talkreq, &.{}, plaintext, origin);
+    }
+
     pub fn sendTalkRequestWithOrigin(
         self: *Actor,
         env: Env,
@@ -199,12 +327,9 @@ pub const Actor = struct {
         request: []const u8,
         origin: types.RequestOrigin,
     ) !message.ReqId {
-        const req_id = randomReqId(env.io);
-        const talk = message.TalkReq{ .req_id = req_id, .protocol = protocol_name, .request = request };
-        var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-        const plaintext = try talk.encodeInto(&buffer);
-        if (!packet.ordinaryMessageFits(plaintext.len)) return error.MessageTooLarge;
-        try outbound.sendTracked(self, env, endpoint, pubkey, req_id, .talkreq, &.{}, plaintext, origin);
+        var action = try self.prepareTalkRequest(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, protocol_name, request, origin);
+        const req_id = action.requestId();
+        try outbound.executePrepared(self, env, action);
         return req_id;
     }
 
@@ -544,7 +669,18 @@ pub const Actor = struct {
         errdefer _ = self.peers.cancelEvictionRequest(probe.ticket, key);
         const ping = message.Ping{ .req_id = req_id, .enr_seq = self.local.seq };
         var buffer: [128]u8 = undefined;
-        try outbound.sendTracked(self, env, endpoint, &known.pubkey, req_id, .ping, &.{}, try ping.encodeInto(&buffer), .{ .eviction = probe.ticket.generation });
+        const action = try outbound.prepareTracked(
+            self,
+            .{ .io = env.io, .ingress = env.ingress },
+            endpoint,
+            &known.pubkey,
+            req_id,
+            .ping,
+            &.{},
+            try ping.encodeInto(&buffer),
+            .{ .eviction = probe.ticket.generation },
+        );
+        try outbound.executePrepared(self, env, action);
     }
 
     /// Pre-send reservation transaction for health/eviction liveness probes:
@@ -566,7 +702,18 @@ pub const Actor = struct {
         errdefer _ = self.peers.cancelHealthRequest(key);
         const ping = message.Ping{ .req_id = req_id, .enr_seq = self.local.seq };
         var buffer: [128]u8 = undefined;
-        try outbound.sendTracked(self, env, endpoint, pubkey, req_id, .ping, &.{}, try ping.encodeInto(&buffer), .{ .maintenance = reason });
+        const action = try outbound.prepareTracked(
+            self,
+            .{ .io = env.io, .ingress = env.ingress },
+            endpoint,
+            pubkey,
+            req_id,
+            .ping,
+            &.{},
+            try ping.encodeInto(&buffer),
+            .{ .maintenance = reason },
+        );
+        try outbound.executePrepared(self, env, action);
         return req_id;
     }
 

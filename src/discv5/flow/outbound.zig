@@ -10,9 +10,9 @@ const util = @import("../util.zig");
 const Actor = actor_mod.Actor;
 const Env = actor_mod.Env;
 
-pub fn sendTracked(
+pub fn prepareTracked(
     actor: *Actor,
-    env: Env,
+    context: actor_mod.TransitionContext,
     endpoint: types.Endpoint,
     dest_pubkey: *const [33]u8,
     req_id: message.ReqId,
@@ -20,16 +20,29 @@ pub fn sendTracked(
     distances: []const u16,
     plaintext: []const u8,
     origin: types.RequestOrigin,
-) !void {
-    const now_ns = nowNs(env.io);
+) !actor_mod.OutboundRequestAction {
+    const now_ns = nowNs(context.io);
     if (actor.requests.shouldQueue(endpoint)) {
         // RequestBook.queue is the canonical policy point for which origins
         // may wait behind endpoint establishment (health/eviction never do).
         try actor.requests.queue(try .init(origin, endpoint, dest_pubkey, req_id, kind, distances, plaintext, deadlineNs(now_ns, actor.request_timeout_ms)));
-        return;
+        return .{ .queued = req_id };
     }
     const requested_distances = request_book.RequestDistances.fromSlice(distances);
-    try dispatch(actor, env, endpoint, dest_pubkey, req_id, kind, &requested_distances, plaintext, origin, false);
+    return .{ .send = try prepareDispatch(actor, context, endpoint, dest_pubkey, req_id, kind, &requested_distances, plaintext, origin) };
+}
+
+pub fn executePrepared(actor: *Actor, env: Env, action: actor_mod.OutboundRequestAction) !void {
+    switch (action) {
+        .queued => {},
+        .send => |effect| {
+            env.sender.send(effect.destination(), effect.packetBytes()) catch |err| {
+                actor.applySendCompletion(env.ingress, effect, .failed);
+                return err;
+            };
+            actor.applySendCompletion(env.ingress, effect, .sent);
+        },
+    }
 }
 
 pub fn drainEndpoint(actor: *Actor, env: Env, endpoint: types.Endpoint) void {
@@ -46,7 +59,6 @@ pub fn drainEndpoint(actor: *Actor, env: Env, endpoint: types.Endpoint) void {
             &queued.requested_distances,
             queued.plaintext.slice(),
             queued.origin,
-            true,
         ) catch return;
         if (actor.sessions.get(endpoint, nowNs(env.io)) == null) return;
     }
@@ -62,16 +74,30 @@ fn dispatch(
     requested_distances: *const request_book.RequestDistances,
     plaintext: []const u8,
     origin: types.RequestOrigin,
-    from_queue: bool,
 ) !void {
-    const now_ns = nowNs(env.io);
+    const effect = try prepareDispatch(actor, .{ .io = env.io, .ingress = env.ingress }, endpoint, dest_pubkey, req_id, kind, requested_distances, plaintext, origin);
+    try executePrepared(actor, env, .{ .send = effect });
+}
+
+fn prepareDispatch(
+    actor: *Actor,
+    context: actor_mod.TransitionContext,
+    endpoint: types.Endpoint,
+    dest_pubkey: *const [33]u8,
+    req_id: message.ReqId,
+    kind: types.RequestKind,
+    requested_distances: *const request_book.RequestDistances,
+    plaintext: []const u8,
+    origin: types.RequestOrigin,
+) !actor_mod.SendDatagramEffect {
+    const now_ns = nowNs(context.io);
     var packet_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const stable = actor.sessions.get(endpoint, now_ns);
     const encoded = if (stable) |session_value|
-        try encodeMessage(actor, env.io, &packet_buffer, endpoint.node_id, &session_value.initiator_key, plaintext)
+        try encodeMessage(actor, context.io, &packet_buffer, endpoint.node_id, &session_value.initiator_key, plaintext)
     else
-        try encodeProbe(actor, env.io, &packet_buffer, endpoint.node_id, plaintext);
-    actor.responses.removeExpired(endpoint.addr, &encoded.nonce, now_ns, env.ingress);
+        try encodeProbe(actor, context.io, &packet_buffer, endpoint.node_id, plaintext);
+    actor.responses.removeExpired(endpoint.addr, &encoded.nonce, now_ns, context.ingress);
     if (actor.responses.hasLive(endpoint.addr, &encoded.nonce, now_ns)) return error.DuplicateChallenge;
 
     const recovery = request_book.RecoveryState{
@@ -83,9 +109,10 @@ fn dispatch(
         .{ .awaiting_whoareyou = .{ .retry_packet = try .init(encoded.bytes), .recovery = recovery } }
     else
         .{ .awaiting_response = .{ .recovery = recovery, .wait = .session_request } };
-    const response = actor.requests.makeResponse(kind, requested_distances);
-    var prepared = try actor.requests.prepareActive(
-        env.ingress,
+    const response = actor.requests.makeExpectation(kind, requested_distances);
+    const transient_packet = if (stable == null) null else try types.PacketBytes.init(encoded.bytes);
+    const prepared = try actor.requests.prepareActive(
+        context.ingress,
         .init(endpoint, req_id),
         origin,
         response,
@@ -93,15 +120,12 @@ fn dispatch(
         deadlineNs(now_ns, actor.request_timeout_ms),
         stable == null,
     );
-    errdefer prepared.abort(env.ingress);
-
-    try env.sender.send(endpoint.addr, encoded.bytes);
-    if (from_queue) {
-        actor.requests.commitQueued(prepared);
-    } else {
-        actor.requests.commitPrepared(prepared);
-    }
-    noteSentRequest(actor, kind);
+    return .{
+        .storage = if (transient_packet) |send_packet|
+            .{ .transient = .{ .prepared = prepared, .packet = send_packet } }
+        else
+            .{ .retained = prepared },
+    };
 }
 
 pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) !void {

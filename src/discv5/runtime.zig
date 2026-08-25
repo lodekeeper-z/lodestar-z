@@ -432,12 +432,12 @@ const RuntimeImpl = struct {
                 defer self.allocator.free(value.enr);
                 try replyResult(self.io, value.reply, setLocalEnrResult(&self.actor, env, value.enr));
             },
-            .send_ping => |value| try self.handleSendPing(env, value),
-            .send_findnode => |value| try self.handleSendFindNode(env, value),
+            .send_ping => |value| try self.handleSendPing(value),
+            .send_findnode => |value| try self.handleSendFindNode(value),
             .send_talk_request => |value| {
                 defer self.allocator.free(value.protocol_name);
                 defer self.allocator.free(value.request);
-                try self.handleSendTalkRequest(env, value);
+                try self.handleSendTalkRequest(value);
             },
             .send_talk_response => |value| {
                 defer self.allocator.free(value.response);
@@ -471,28 +471,27 @@ const RuntimeImpl = struct {
         }
     }
 
-    fn handleSendPing(self: *RuntimeImpl, env: actor_mod.Env, value: SendPing) Io.Cancelable!void {
+    fn handleSendPing(self: *RuntimeImpl, value: SendPing) Io.Cancelable!void {
         const reliable = value.origin == .reliable_api;
         if (reliable and !self.request_result_outbox.claim()) unreachable;
-        const result = sendPingResult(&self.actor, env, value.endpoint, &value.pubkey, value.enr_seq, value.origin);
+        const result = sendPingResult(self, value.endpoint, &value.pubkey, value.enr_seq, value.origin);
         if (result) |_| {} else |_| if (reliable) self.request_result_outbox.release();
         try replyResult(self.io, value.reply, result);
     }
 
-    fn handleSendFindNode(self: *RuntimeImpl, env: actor_mod.Env, value: SendFindNode) Io.Cancelable!void {
+    fn handleSendFindNode(self: *RuntimeImpl, value: SendFindNode) Io.Cancelable!void {
         const reliable = value.origin == .reliable_api;
         if (reliable and !self.request_result_outbox.claim()) unreachable;
-        const result = sendFindNodeResult(&self.actor, env, value.endpoint, &value.pubkey, value.distances[0..value.distances_len], value.origin);
+        const result = sendFindNodeResult(self, value.endpoint, &value.pubkey, value.distances[0..value.distances_len], value.origin);
         if (result) |_| {} else |_| if (reliable) self.request_result_outbox.release();
         try replyResult(self.io, value.reply, result);
     }
 
-    fn handleSendTalkRequest(self: *RuntimeImpl, env: actor_mod.Env, value: SendTalkRequest) Io.Cancelable!void {
+    fn handleSendTalkRequest(self: *RuntimeImpl, value: SendTalkRequest) Io.Cancelable!void {
         const reliable = value.origin == .reliable_api;
         if (reliable and !self.request_result_outbox.claim()) unreachable;
         const result = sendTalkRequestResult(
-            &self.actor,
-            env,
+            self,
             value.endpoint,
             &value.pubkey,
             value.protocol_name,
@@ -626,8 +625,36 @@ fn setLocalEnrResult(actor: *actor_mod.Actor, env: actor_mod.Env, raw: []const u
     };
 }
 
-fn sendPingResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64, origin: types.RequestOrigin) RequestError!message.ReqId {
-    return actor.sendPing(env, endpoint, pubkey, enr_seq, origin) catch |err| switch (err) {
+fn executeRequestEffect(runtime: *RuntimeImpl, action_value: actor_mod.OutboundRequestAction) !message.ReqId {
+    var action = action_value;
+    const req_id = action.requestId();
+    switch (action) {
+        .queued => {},
+        .send => |effect| {
+            runtime.transport.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+                runtime.actor.applySendCompletion(&runtime.admission, effect, .failed);
+                return err;
+            };
+            runtime.actor.applySendCompletion(&runtime.admission, effect, .sent);
+        },
+    }
+    return req_id;
+}
+
+fn executePingEffect(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64, origin: types.RequestOrigin) !message.ReqId {
+    return executeRequestEffect(runtime, try runtime.actor.preparePing(.{ .io = runtime.io, .ingress = &runtime.admission }, endpoint, pubkey, enr_seq, origin));
+}
+
+fn executeFindNodeEffect(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16, origin: types.RequestOrigin) !message.ReqId {
+    return executeRequestEffect(runtime, try runtime.actor.prepareFindNode(.{ .io = runtime.io, .ingress = &runtime.admission }, endpoint, pubkey, distances, origin));
+}
+
+fn executeTalkRequestEffect(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) !message.ReqId {
+    return executeRequestEffect(runtime, try runtime.actor.prepareTalkRequest(.{ .io = runtime.io, .ingress = &runtime.admission }, endpoint, pubkey, protocol_name, request, origin));
+}
+
+fn sendPingResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64, origin: types.RequestOrigin) RequestError!message.ReqId {
+    return executePingEffect(runtime, endpoint, pubkey, enr_seq, origin) catch |err| switch (err) {
         error.Canceled => error.Canceled,
         error.DuplicateChallenge => error.DuplicateChallenge,
         error.DuplicateRequest => error.DuplicateRequest,
@@ -660,8 +687,8 @@ fn sendPingResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.E
     };
 }
 
-fn sendFindNodeResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16, origin: types.RequestOrigin) FindNodeError!message.ReqId {
-    return actor.sendFindNode(env, endpoint, pubkey, distances, origin) catch |err| switch (err) {
+fn sendFindNodeResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16, origin: types.RequestOrigin) FindNodeError!message.ReqId {
+    return executeFindNodeEffect(runtime, endpoint, pubkey, distances, origin) catch |err| switch (err) {
         error.Canceled => error.Canceled,
         error.DuplicateChallenge => error.DuplicateChallenge,
         error.DuplicateRequest => error.DuplicateRequest,
@@ -695,8 +722,8 @@ fn sendFindNodeResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: typ
     };
 }
 
-fn sendTalkRequestResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) TalkRequestError!message.ReqId {
-    return actor.sendTalkRequestWithOrigin(env, endpoint, pubkey, protocol_name, request, origin) catch |err| switch (err) {
+fn sendTalkRequestResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) TalkRequestError!message.ReqId {
+    return executeTalkRequestEffect(runtime, endpoint, pubkey, protocol_name, request, origin) catch |err| switch (err) {
         // Keep encoder exhaustion normalized in case message layout drifts
         // beyond its packet-sized scratch buffer before the packet preflight.
         error.BufferTooSmall => error.MessageTooLarge,

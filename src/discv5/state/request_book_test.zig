@@ -324,7 +324,7 @@ fn allocationLifecycle(alloc: std.mem.Allocator) !void {
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(3), try message.ReqId.fromSlice(&.{1}));
     const requested = requestedDistances(&.{1});
-    const prepared = try book.prepareActive(&ingress, key, .api, book.makeResponse(.findnode, &requested), .{
+    const prepared = try book.prepareActive(&ingress, key, .api, book.makeExpectation(.findnode, &requested), .{
         .awaiting_whoareyou = try probe(9),
     }, 0, true);
     book.commitPrepared(prepared);
