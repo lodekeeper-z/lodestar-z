@@ -2,6 +2,7 @@ const std = @import("std");
 const actor_mod = @import("../actor.zig");
 const config = @import("../config.zig");
 const enr = @import("../enr.zig");
+const outbound = @import("../flow/outbound.zig");
 const packet = @import("../protocol/packet.zig");
 const secp = @import("../secp256k1.zig");
 const request_book = @import("../state/request_book.zig");
@@ -119,6 +120,62 @@ test "prepared FINDNODE effect commits the nodes response state" {
 
     const request = context.harness.actor.requests.get(key) orelse return error.MissingActiveRequest;
     try std.testing.expect(request.response == .nodes);
+}
+
+test "bounded request effect output owns preparation without executing transport" {
+    var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb9, 0xba, 85, 9285);
+    defer context.deinit();
+    var storage: [1]actor_mod.SendDatagramEffect = undefined;
+    var effects = actor_mod.RequestEffectQueue.init(&storage);
+    const action = try context.harness.actor.preparePing(
+        .{ .io = context.harness.io, .ingress = &context.harness.ingress },
+        context.endpoint,
+        &context.remote_pubkey,
+        0,
+        .reliable_api,
+    );
+
+    try outbound.emitPrepared(&context.harness.actor, &context.harness.ingress, &effects, action);
+
+    try std.testing.expectEqual(@as(usize, 1), effects.count());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
+    const effect = effects.pop() orelse return error.MissingEffect;
+    context.harness.actor.applySendCompletion(&context.harness.ingress, effect, .failed);
+}
+
+test "full request effect output aborts the unaccepted preparation" {
+    var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xbb, 0xbc, 86, 9286);
+    defer context.deinit();
+    var storage: [1]actor_mod.SendDatagramEffect = undefined;
+    var effects = actor_mod.RequestEffectQueue.init(&storage);
+
+    const first = try context.harness.actor.preparePing(
+        .{ .io = context.harness.io, .ingress = &context.harness.ingress },
+        context.endpoint,
+        &context.remote_pubkey,
+        0,
+        .reliable_api,
+    );
+    try outbound.emitPrepared(&context.harness.actor, &context.harness.ingress, &effects, first);
+    const second = try context.harness.actor.preparePing(
+        .{ .io = context.harness.io, .ingress = &context.harness.ingress },
+        context.endpoint,
+        &context.remote_pubkey,
+        0,
+        .reliable_api,
+    );
+
+    try std.testing.expectError(
+        error.TooManyActiveRequests,
+        outbound.emitPrepared(&context.harness.actor, &context.harness.ingress, &effects, second),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), effects.count());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
+    const effect = effects.pop() orelse return error.MissingEffect;
+    context.harness.actor.applySendCompletion(&context.harness.ingress, effect, .failed);
+    try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
 }
 
 test "prepared TALKREQ effect commits the talk response state" {

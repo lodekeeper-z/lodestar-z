@@ -32,6 +32,21 @@ pub fn prepareTracked(
     return .{ .send = try prepareDispatch(actor, context, endpoint, dest_pubkey, req_id, kind, &requested_distances, plaintext, origin) };
 }
 
+pub fn emitPrepared(
+    actor: *Actor,
+    ingress: *@import("../admission.zig").IngressAdmission,
+    effects: *actor_mod.RequestEffectQueue,
+    action: actor_mod.OutboundRequestAction,
+) !void {
+    switch (action) {
+        .queued => {},
+        .send => |effect| effects.push(effect) catch {
+            actor.applySendCompletion(ingress, effect, .failed);
+            return error.TooManyActiveRequests;
+        },
+    }
+}
+
 pub fn executePrepared(actor: *Actor, env: Env, action: actor_mod.OutboundRequestAction) !void {
     switch (action) {
         .queued => {},

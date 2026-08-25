@@ -117,6 +117,38 @@ pub const OutboundRequestAction = union(enum) {
     }
 };
 
+/// Runtime-owned bounded output for tracked request effects. Actor transitions
+/// may append move-owned effects but never execute transport through this queue.
+pub const RequestEffectQueue = struct {
+    storage: []SendDatagramEffect,
+    head: usize = 0,
+    len: usize = 0,
+
+    pub fn init(storage: []SendDatagramEffect) RequestEffectQueue {
+        std.debug.assert(storage.len > 0);
+        return .{ .storage = storage };
+    }
+
+    pub fn count(self: *const RequestEffectQueue) usize {
+        return self.len;
+    }
+
+    pub fn push(self: *RequestEffectQueue, effect: SendDatagramEffect) error{Full}!void {
+        if (self.len == self.storage.len) return error.Full;
+        const index = (self.head + self.len) % self.storage.len;
+        self.storage[index] = effect;
+        self.len += 1;
+    }
+
+    pub fn pop(self: *RequestEffectQueue) ?SendDatagramEffect {
+        if (self.len == 0) return null;
+        const effect = self.storage[self.head];
+        self.head = (self.head + 1) % self.storage.len;
+        self.len -= 1;
+        return effect;
+    }
+};
+
 pub const ProbeSnapshot = struct {
     endpoint: types.Endpoint,
     pubkey: [33]u8,
