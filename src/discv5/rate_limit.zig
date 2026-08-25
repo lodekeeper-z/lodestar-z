@@ -51,6 +51,12 @@ pub fn RateLimiterGcra(comptime Key: type) type {
     return struct {
         const Self = @This();
 
+        const Commit = struct {
+            key: Key,
+            tat_ms: f64,
+            now_ns: i64,
+        };
+
         allocator: Allocator,
         tat_per_key: lru.LruCache(Key, f64),
         tau_ms: f64,
@@ -73,6 +79,31 @@ pub fn RateLimiterGcra(comptime Key: type) type {
 
         pub fn deinit(self: *Self) void {
             self.tat_per_key.deinit(self.allocator);
+        }
+
+        /// Compute an admission without changing quota, TTL, or LRU recency.
+        /// The caller must serialize preview/commit ownership so another
+        /// admission cannot invalidate the preview before it is committed.
+        fn preview(self: *const Self, key: Key, tokens: u32, ms_since_start: u64) ?Commit {
+            const additional_time = self.token_interval_ms * @as(f64, @floatFromInt(tokens));
+            if (additional_time > self.tau_ms) return null;
+
+            const now: f64 = @floatFromInt(ms_since_start);
+            const now_ns = timestampMsToNs(ms_since_start);
+            const tat = self.tat_per_key.peek(key, now_ns) orelse now;
+
+            const earliest_time = tat + additional_time - self.tau_ms;
+            if (now < earliest_time) return null;
+
+            return .{
+                .key = key,
+                .tat_ms = @max(now, tat) + additional_time,
+                .now_ns = now_ns,
+            };
+        }
+
+        fn commit(self: *Self, admission: Commit) void {
+            self.tat_per_key.put(admission.key, admission.tat_ms, self.ttl_ms, admission.now_ns);
         }
 
         pub fn allows(self: *Self, key: Key, tokens: u32, ms_since_start: u64) bool {
@@ -123,16 +154,19 @@ pub const RateLimiter = struct {
 
     pub fn allowEncodedPacket(self: *RateLimiter, addr: Address, now_ms: u64) bool {
         const ip = IpKey.fromAddress(addr);
-        if (!self.by_ip.allows(ip, 1, now_ms)) {
+        const by_ip_admission = self.by_ip.preview(ip, 1, now_ms) orelse {
             self.stats.rate_limit_hit_ip_total +|= 1;
             return false;
-        }
+        };
 
-        if (!self.global.allows(0, 1, now_ms)) {
+        const global_admission = self.global.preview(0, 1, now_ms) orelse {
             self.stats.rate_limit_hit_total +|= 1;
             return false;
-        }
+        };
 
+        // Preserve per-IP-before-global commit order.
+        self.by_ip.commit(by_ip_admission);
+        self.global.commit(global_admission);
         return true;
     }
 
@@ -158,6 +192,37 @@ test "GCRA allows burst then replenishes over time" {
     try std.testing.expect(limiter.allows(ip, 1, 0));
     try std.testing.expect(!limiter.allows(ip, 1, 0));
     try std.testing.expect(limiter.allows(ip, 1, 500));
+}
+
+test "standalone GCRA rejected live lookup promotes recency" {
+    var limiter = try RateLimiterGcra(u8).fromQuota(std.testing.allocator, .{
+        .replenish_all_every_ms = 1_000,
+        .max_tokens = 1,
+    }, 2);
+    defer limiter.deinit();
+
+    try std.testing.expect(limiter.allows(1, 1, 0));
+    try std.testing.expect(limiter.allows(2, 1, 0));
+    try std.testing.expect(!limiter.allows(1, 1, 0));
+    try std.testing.expect(limiter.allows(3, 1, 0));
+
+    try std.testing.expect(limiter.tat_per_key.contains(1));
+    try std.testing.expect(!limiter.tat_per_key.contains(2));
+    try std.testing.expect(limiter.tat_per_key.contains(3));
+}
+
+test "standalone GCRA expired lookup is replaced and charged once" {
+    var limiter = try RateLimiterGcra(u8).fromQuota(std.testing.allocator, .{
+        .replenish_all_every_ms = 1_000,
+        .max_tokens = 2,
+    }, 1);
+    defer limiter.deinit();
+
+    try std.testing.expect(limiter.allows(1, 1, 0));
+    try std.testing.expect(limiter.allows(1, 1, 1_000));
+    try std.testing.expect(limiter.allows(1, 1, 1_000));
+    try std.testing.expect(!limiter.allows(1, 1, 1_000));
+    try std.testing.expectEqual(@as(usize, 1), limiter.tat_per_key.count());
 }
 
 test "per-IP quota hit does not create a punitive ban" {
@@ -215,4 +280,172 @@ test "rate limiter bounds source IP state" {
         try std.testing.expect(!limiter.allowEncodedPacket(addr, 0));
         try std.testing.expect(limiter.by_ip.tat_per_key.count() <= 2);
     }
+}
+
+test "global rejection neither spends nor creates per-IP state" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+        .by_ip_state_capacity = 2,
+    });
+    defer limiter.deinit();
+
+    const first = testAddress(1);
+    const rejected = testAddress(2);
+    try std.testing.expect(limiter.allowEncodedPacket(first, 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(rejected, 0));
+    try std.testing.expectEqual(@as(usize, 1), limiter.by_ip.tat_per_key.count());
+    try std.testing.expect(!limiter.by_ip.tat_per_key.contains(IpKey.fromAddress(rejected)));
+    try std.testing.expectEqual(Stats{ .rate_limit_hit_total = 1 }, limiter.statsSnapshot());
+
+    try std.testing.expect(limiter.allowEncodedPacket(rejected, 1_000));
+}
+
+test "global rejection does not refresh existing per-IP state" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+    });
+    defer limiter.deinit();
+
+    const addr = testAddress(1);
+    const ip = IpKey.fromAddress(addr);
+    try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(addr, 500));
+    try std.testing.expectEqual(@as(?f64, null), limiter.by_ip.tat_per_key.peek(ip, timestampMsToNs(1_000)));
+}
+
+test "global rejection of current per-IP LRU does not promote it" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 100 },
+        .by_ip_state_capacity = 2,
+    });
+    defer limiter.deinit();
+
+    const lru_addr = testAddress(1);
+    const mru_addr = testAddress(2);
+    const new_addr = testAddress(3);
+    const lru_ip = IpKey.fromAddress(lru_addr);
+    const mru_ip = IpKey.fromAddress(mru_addr);
+    const new_ip = IpKey.fromAddress(new_addr);
+    try std.testing.expect(limiter.allowEncodedPacket(lru_addr, 0));
+    try std.testing.expect(limiter.allowEncodedPacket(mru_addr, 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(lru_addr, 0));
+    try std.testing.expect(limiter.allowEncodedPacket(new_addr, 500));
+
+    try std.testing.expect(!limiter.by_ip.tat_per_key.contains(lru_ip));
+    try std.testing.expect(limiter.by_ip.tat_per_key.contains(mru_ip));
+    try std.testing.expect(limiter.by_ip.tat_per_key.contains(new_ip));
+}
+
+test "global rejection leaves expired per-IP entry wholly unchanged" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 100, .max_tokens = 100 },
+        .by_ip_state_capacity = 2,
+    });
+    defer limiter.deinit();
+
+    const expired_addr = testAddress(1);
+    const other_addr = testAddress(2);
+    const new_addr = testAddress(3);
+    const expired_ip = IpKey.fromAddress(expired_addr);
+    const other_ip = IpKey.fromAddress(other_addr);
+    const new_ip = IpKey.fromAddress(new_addr);
+    try std.testing.expect(limiter.allowEncodedPacket(expired_addr, 0));
+    try std.testing.expect(limiter.allowEncodedPacket(other_addr, 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(expired_addr, 100));
+
+    try std.testing.expectEqual(@as(usize, 2), limiter.by_ip.tat_per_key.count());
+    try std.testing.expect(limiter.by_ip.tat_per_key.contains(expired_ip));
+    try std.testing.expect(limiter.by_ip.tat_per_key.contains(other_ip));
+    try std.testing.expectEqual(@as(?f64, null), limiter.by_ip.tat_per_key.peek(expired_ip, timestampMsToNs(100)));
+
+    try std.testing.expect(limiter.allowEncodedPacket(new_addr, 500));
+    try std.testing.expectEqual(@as(usize, 2), limiter.by_ip.tat_per_key.count());
+    try std.testing.expect(!limiter.by_ip.tat_per_key.contains(expired_ip));
+    try std.testing.expect(limiter.by_ip.tat_per_key.contains(other_ip));
+    try std.testing.expect(limiter.by_ip.tat_per_key.contains(new_ip));
+}
+
+test "per-IP rejection does not spend global quota" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+    });
+    defer limiter.deinit();
+
+    const first = testAddress(1);
+    try std.testing.expect(limiter.allowEncodedPacket(first, 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(first, 0));
+    try std.testing.expect(limiter.allowEncodedPacket(testAddress(2), 0));
+    try std.testing.expectEqual(Stats{ .rate_limit_hit_ip_total = 1 }, limiter.statsSnapshot());
+}
+
+test "accepted hierarchy commits exactly one per-IP unit at the two-unit boundary" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 100 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+    });
+    defer limiter.deinit();
+
+    const addr = testAddress(1);
+    try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
+    try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(addr, 0));
+}
+
+test "accepted hierarchy commits exactly one global unit at the two-unit boundary" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 100 },
+    });
+    defer limiter.deinit();
+
+    try std.testing.expect(limiter.allowEncodedPacket(testAddress(1), 0));
+    try std.testing.expect(limiter.allowEncodedPacket(testAddress(2), 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(testAddress(3), 0));
+}
+
+test "globally rejected new IPs cannot churn bounded per-IP state" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+        .by_ip_state_capacity = 2,
+    });
+    defer limiter.deinit();
+
+    const first = testAddress(1);
+    const second = testAddress(2);
+    try std.testing.expect(limiter.allowEncodedPacket(first, 0));
+    try std.testing.expect(limiter.allowEncodedPacket(second, 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(testAddress(3), 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(testAddress(4), 499));
+
+    try std.testing.expectEqual(@as(usize, 2), limiter.by_ip.tat_per_key.count());
+    try std.testing.expect(limiter.by_ip.tat_per_key.contains(IpKey.fromAddress(first)));
+    try std.testing.expect(limiter.by_ip.tat_per_key.contains(IpKey.fromAddress(second)));
+    try std.testing.expect(!limiter.by_ip.tat_per_key.contains(IpKey.fromAddress(testAddress(3))));
+    try std.testing.expect(!limiter.by_ip.tat_per_key.contains(IpKey.fromAddress(testAddress(4))));
+}
+
+test "hierarchical quota refill boundaries remain exact" {
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 2 },
+    });
+    defer limiter.deinit();
+
+    const addr = testAddress(1);
+    try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
+    try std.testing.expect(limiter.allowEncodedPacket(addr, 0));
+    try std.testing.expect(!limiter.allowEncodedPacket(addr, 499));
+    try std.testing.expect(limiter.allowEncodedPacket(addr, 500));
+    try std.testing.expect(!limiter.allowEncodedPacket(addr, 999));
+    try std.testing.expect(limiter.allowEncodedPacket(addr, 1_000));
+}
+
+fn testAddress(last_octet: u8) Address {
+    return .{ .ip4 = .{ .bytes = .{ 198, 51, 100, last_octet }, .port = 9_000 } };
 }
