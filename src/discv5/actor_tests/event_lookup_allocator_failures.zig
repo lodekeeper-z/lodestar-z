@@ -25,10 +25,10 @@ fn drainRequestEffects(
 ) !void {
     while (effects.pop()) |effect| {
         recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-            actor.applySendCompletion(env, effect, .failed);
+            actor.applyEffectCompletion(env, effect, .failed);
             return err;
         };
-        actor.applySendCompletion(env, effect, .sent);
+        actor.applyEffectCompletion(env, effect, .sent);
     }
 }
 
@@ -188,6 +188,7 @@ test "maintenance removes every expired lookup and retains live lookups" {
     }
 
     actor.maintenanceAt(harness.env(), now_ns);
+    harness.drainRequestEffectsIgnoringFailures();
 
     for (1..7) |lookup_id| {
         try std.testing.expect(!actor.lookups.contains(@intCast(lookup_id)));
@@ -333,7 +334,7 @@ test "lookup transport failure completes through emitted effect ownership" {
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     while (harness.request_effects.pop()) |effect| {
-        harness.actor.applySendCompletion(env, effect, .failed);
+        harness.actor.applyEffectCompletion(env, effect, .failed);
     }
 
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
@@ -495,11 +496,11 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    var effect_storage: [2]actor_mod.SendDatagramEffect = undefined;
+    var effect_storage: [2]actor_mod.ActorEffect = undefined;
     var effects = actor_mod.RequestEffectQueue.init(&effect_storage);
     const env = actor_mod.Env{
         .io = io,
-        .sender = recording.sender(),
+
         .ingress = &ingress,
         .outbox = &outbox,
         .request_effects = &effects,

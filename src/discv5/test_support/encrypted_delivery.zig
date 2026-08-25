@@ -17,14 +17,24 @@ pub fn deliverEncrypted(
     plaintext: []const u8,
     nonce_byte: u8,
 ) !void {
-    return deliverEncryptedWithEnv(
+    var storage: [32]actor_mod.ActorEffect = undefined;
+    var effects = actor_mod.RequestEffectQueue.init(&storage);
+    const env = actor_mod.Env{ .io = io, .ingress = ingress, .outbox = outbox, .request_effects = &effects };
+    try deliverEncryptedWithEnv(
         actor,
-        .{ .io = io, .sender = sender, .ingress = ingress, .outbox = outbox },
+        env,
         endpoint,
         read_key,
         plaintext,
         nonce_byte,
     );
+    while (effects.pop()) |effect| {
+        sender.send(effect.destination(), effect.packetBytes()) catch |err| {
+            actor.applyEffectCompletion(env, effect, .failed);
+            return err;
+        };
+        actor.applyEffectCompletion(env, effect, .sent);
+    }
 }
 
 pub fn deliverEncryptedWithEnv(

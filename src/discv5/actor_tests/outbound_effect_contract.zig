@@ -59,7 +59,7 @@ const TestContext = struct {
 };
 
 test "outbound request effect fits within four packet budgets" {
-    try std.testing.expect(@sizeOf(actor_mod.SendDatagramEffect) <= 4 * packet.MAX_PACKET_SIZE);
+    try std.testing.expect(@sizeOf(actor_mod.ActorEffect) <= 4 * packet.MAX_PACKET_SIZE);
 }
 
 test "prepared outbound ping owns request until successful send completion" {
@@ -92,7 +92,7 @@ test "failed outbound ping completion releases the effect-owned request" {
     const key = types.RequestKey.init(context.endpoint, effect.requestId());
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
 
-    context.harness.actor.applySendCompletion(context.harness.env(), effect, .failed);
+    context.harness.actor.applyEffectCompletion(context.harness.env(), effect, .failed);
 
     try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.activeCount());
     try std.testing.expect(context.harness.actor.requests.get(key) == null);
@@ -126,7 +126,7 @@ test "prepared FINDNODE effect commits the nodes response state" {
 test "bounded request effect output owns preparation without executing transport" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb9, 0xba, 85, 9285);
     defer context.deinit();
-    var storage: [1]actor_mod.SendDatagramEffect = undefined;
+    var storage: [1]actor_mod.ActorEffect = undefined;
     var effects = actor_mod.RequestEffectQueue.init(&storage);
     const action = try context.harness.actor.preparePing(
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
@@ -144,13 +144,13 @@ test "bounded request effect output owns preparation without executing transport
     try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
     const effect = effects.pop() orelse return error.MissingEffect;
-    context.harness.actor.applySendCompletion(context.harness.env(), effect, .failed);
+    context.harness.actor.applyEffectCompletion(context.harness.env(), effect, .failed);
 }
 
 test "full request effect output aborts the unaccepted preparation" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xbb, 0xbc, 86, 9286);
     defer context.deinit();
-    var storage: [1]actor_mod.SendDatagramEffect = undefined;
+    var storage: [1]actor_mod.ActorEffect = undefined;
     var effects = actor_mod.RequestEffectQueue.init(&storage);
 
     const first = try context.harness.actor.preparePing(
@@ -179,7 +179,7 @@ test "full request effect output aborts the unaccepted preparation" {
     try std.testing.expectEqual(@as(usize, 1), effects.count());
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
     const effect = effects.pop() orelse return error.MissingEffect;
-    context.harness.actor.applySendCompletion(context.harness.env(), effect, .failed);
+    context.harness.actor.applyEffectCompletion(context.harness.env(), effect, .failed);
     try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
 }
 
@@ -257,13 +257,13 @@ test "queued drain emits one FIFO effect per sent completion" {
 
     var first_effect = harness.request_effects.pop() orelse return error.MissingFirstDrainEffect;
     try std.testing.expectEqual(first_id, first_effect.requestId());
-    harness.actor.applySendCompletion(harness.env(), first_effect, .sent);
+    harness.actor.applyEffectCompletion(harness.env(), first_effect, .sent);
     try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
 
     var second_effect = harness.request_effects.pop() orelse return error.MissingSecondDrainEffect;
     try std.testing.expectEqual(second_id, second_effect.requestId());
-    harness.actor.applySendCompletion(harness.env(), second_effect, .sent);
+    harness.actor.applyEffectCompletion(harness.env(), second_effect, .sent);
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 0), harness.request_effects.count());
     try std.testing.expectEqual(@as(usize, 2), harness.actor.requests.activeCount());

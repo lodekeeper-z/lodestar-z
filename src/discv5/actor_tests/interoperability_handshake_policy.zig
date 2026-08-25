@@ -29,10 +29,10 @@ fn drainRequestEffects(
 ) !void {
     while (effects.pop()) |effect| {
         sender.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-            actor.applySendCompletion(env, effect, .failed);
+            actor.applyEffectCompletion(env, effect, .failed);
             return err;
         };
-        actor.applySendCompletion(env, effect, .sent);
+        actor.applyEffectCompletion(env, effect, .sent);
     }
 }
 
@@ -121,11 +121,11 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an exhausted source quot
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
-    var effect_storage_a: [2]actor_mod.SendDatagramEffect = undefined;
+    var effect_storage_a: [2]actor_mod.ActorEffect = undefined;
     var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
-    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
-    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
+    const env_a = actor_mod.Env{ .io = io, .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, &sender_b);
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a, &sender_a);
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -212,14 +212,14 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
-    var effect_storage_a: [4]actor_mod.SendDatagramEffect = undefined;
+    var effect_storage_a: [4]actor_mod.ActorEffect = undefined;
     var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
-    var effect_storage_b: [4]actor_mod.SendDatagramEffect = undefined;
+    var effect_storage_b: [4]actor_mod.ActorEffect = undefined;
     var effects_b = actor_mod.RequestEffectQueue.init(&effect_storage_b);
-    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a, .request_results = &results_a };
-    const env_b = actor_mod.Env{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b, .request_effects = &effects_b };
-    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, env_b);
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
+    const env_a = actor_mod.Env{ .io = io, .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a, .request_results = &results_a };
+    const env_b = actor_mod.Env{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b, .request_effects = &effects_b };
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, env_b, &sender_b);
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a, &sender_a);
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -266,7 +266,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expectEqual(sends_before_unrelated, sender_a.datagrams.items.len);
     unrelated_credit.rollback(&ingress_a);
     try std.testing.expect(actor_b.cancelRequest(
-        .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b },
+        .{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b },
         .init(.{ .node_id = id_a, .addr = address_a }, unrelated_ping_id),
     ));
 
@@ -277,7 +277,8 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expectEqualStrings("test", request_event.talkreq.protocol);
     try std.testing.expectEqualStrings("request", request_event.talkreq.request);
     try std.testing.expectEqualSlices(u8, talk_id.slice(), request_event.talkreq.req_id.slice());
-    try actor_b.sendTalkResponse(.{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b }, .{ .node_id = id_a, .addr = address_a }, request_event.talkreq.req_id, "response");
+    try actor_b.sendTalkResponse(env_b, .{ .node_id = id_a, .addr = address_a }, request_event.talkreq.req_id, "response");
+    try drainRequestEffects(&actor_b, env_b, &effects_b, &sender_b);
     const response_admission = ingress_a.admit(address_b, 1);
     var response_credit = switch (response_admission) {
         .expected => |value| value,
@@ -392,7 +393,9 @@ test "known contact rejects a matching claimed ENR whose key differs from the st
     defer actor_b.deinit(&ingress_b);
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
-    const env_b = actor_mod.Env{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b };
+    var effect_storage_b: [4]actor_mod.ActorEffect = undefined;
+    var effects_b = actor_mod.RequestEffectQueue.init(&effect_storage_b);
+    const env_b = actor_mod.Env{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b, .request_effects = &effects_b };
 
     // Deliberately model a corrupted known-contact mapping: node ID C is
     // associated with stored key A even though key C derives ID C.
@@ -413,6 +416,7 @@ test "known contact rejects a matching claimed ENR whose key differs from the st
         .plaintext = &.{0x44},
     });
     actor_b.handlePacket(env_b, initial_datagram_buffer[0..initial_datagram.len], address_c);
+    try drainRequestEffects(&actor_b, env_b, &effects_b, &sender_b);
 
     const endpoint = types.Endpoint{ .node_id = id_c, .addr = address_c };
     const challenge = actor_b.sessions.peekChallenge(endpoint, outbound.nowNs(io)) orelse return error.MissingChallenge;
@@ -449,7 +453,7 @@ test "known contact rejects a matching claimed ENR whose key differs from the st
     defer credit.rollback(&ingress_b);
     const expected_env = actor_mod.Env{
         .io = io,
-        .sender = sender_b.sender(),
+
         .ingress = &ingress_b,
         .outbox = &outbox_b,
         .expected_credit = &credit,
@@ -526,10 +530,10 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
-    var effect_storage_a: [2]actor_mod.SendDatagramEffect = undefined;
+    var effect_storage_a: [2]actor_mod.ActorEffect = undefined;
     var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
-    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
-    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
+    const env_a = actor_mod.Env{ .io = io, .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, &sender_b);
 
     actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
     const peer_before = actor_b.peers.known(&id_a) orelse return error.MissingKnownPeer;
@@ -570,7 +574,7 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
         else => return error.MissingExpectedCredit,
     };
     defer credit.rollback(&ingress_b);
-    const env_b = actor_mod.Env{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b, .expected_credit = &credit };
+    const env_b = actor_mod.Env{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b, .expected_credit = &credit };
     actor_b.handlePacket(env_b, datagram_buffer[0..datagram.len], address_a);
 
     try std.testing.expect(credit.armed);
@@ -610,7 +614,7 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
         else => return error.MissingSignatureValidationCredit,
     };
     defer signature_credit.rollback(&ingress_b);
-    const signature_env = actor_mod.Env{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b, .expected_credit = &signature_credit };
+    const signature_env = actor_mod.Env{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b, .expected_credit = &signature_credit };
     actor_b.handlePacket(signature_env, datagram_buffer[0..bad_signature_datagram.len], address_a);
     try std.testing.expect(signature_credit.armed);
     signature_credit.rollback(&ingress_b);
@@ -631,7 +635,7 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
         else => return error.MissingDecryptionValidationCredit,
     };
     defer decryption_credit.rollback(&ingress_b);
-    const decryption_env = actor_mod.Env{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b, .expected_credit = &decryption_credit };
+    const decryption_env = actor_mod.Env{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b, .expected_credit = &decryption_credit };
     actor_b.handlePacket(decryption_env, datagram_buffer[0..undecryptable_datagram.len], address_a);
     try std.testing.expect(decryption_credit.armed);
     try std.testing.expect(actor_b.sessions.get(endpoint, outbound.nowNs(io)) == null);
@@ -749,11 +753,11 @@ fn signedEnrHandshake(kind: SignedEnrKind, later_evidence: LaterEndpointEvidence
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
-    var effect_storage_a: [2]actor_mod.SendDatagramEffect = undefined;
+    var effect_storage_a: [2]actor_mod.ActorEffect = undefined;
     var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
-    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
-    var link_a_to_b = PacketLink.init(&sender_a, address_b, observed_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, observed_a, address_b, &actor_a, env_a);
+    const env_a = actor_mod.Env{ .io = io, .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, observed_a, &actor_b, .{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, &sender_b);
+    var link_b_to_a = PacketLink.init(&sender_b, observed_a, address_b, &actor_a, env_a, &sender_a);
 
     if (kind == .trusted_mismatched or kind == .trusted_endpointless) {
         try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, observed_a, null, outbound.nowNs(io)));
@@ -848,11 +852,11 @@ fn contactHandshake(runtime_contact_trusted: bool) !ContactHandshakeResult {
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
-    var effect_storage_a: [2]actor_mod.SendDatagramEffect = undefined;
+    var effect_storage_a: [2]actor_mod.ActorEffect = undefined;
     var effects_a = actor_mod.RequestEffectQueue.init(&effect_storage_a);
-    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
-    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
+    const env_a = actor_mod.Env{ .io = io, .ingress = &ingress_a, .outbox = &outbox_a, .request_effects = &effects_a };
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, &sender_b);
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a, &sender_a);
 
     if (runtime_contact_trusted) {
         try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, outbound.nowNs(io)));

@@ -19,7 +19,6 @@ const request_book = @import("state/request_book.zig");
 const response_book = @import("state/response_book.zig");
 const request_results = @import("request_results.zig");
 const session_book = @import("state/session_book.zig");
-const transport = @import("transport.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -37,7 +36,6 @@ pub const LocalRecord = struct {
 /// Ephemeral runtime capabilities; Actor never stores this context.
 pub const Env = struct {
     io: std.Io,
-    sender: transport.Sender,
     ingress: *admission.IngressAdmission,
     outbox: *events.EventOutbox,
     request_effects: ?*RequestEffectQueue = null,
@@ -124,14 +122,169 @@ pub const OutboundRequestAction = union(enum) {
     }
 };
 
-/// Runtime-owned bounded output for tracked request effects. Actor transitions
-/// may append move-owned effects but never execute transport through this queue.
+pub const ActorEffect = union(enum) {
+    request: SendDatagramEffect,
+    response: ResponseSendEffect,
+    retry: RetrySendEffect,
+    handshake: HandshakeSendEffect,
+    whoareyou: WhoareyouSendEffect,
+
+    pub fn destination(self: *const ActorEffect) types.Address {
+        return switch (self.*) {
+            .request => |*effect| effect.destination(),
+            .response => |*effect| effect.endpoint.addr,
+            .retry => |*effect| effect.destination(),
+            .handshake => |*effect| effect.destination,
+            .whoareyou => |*effect| effect.destination(),
+        };
+    }
+
+    pub fn packetBytes(self: *const ActorEffect) []const u8 {
+        return switch (self.*) {
+            .request => |*effect| effect.packetBytes(),
+            .response => |*effect| effect.packet.slice(),
+            .retry => |*effect| effect.packetBytes(),
+            .handshake => |*effect| effect.packet.slice(),
+            .whoareyou => |*effect| effect.packetBytes(),
+        };
+    }
+
+    pub fn requestId(self: *const ActorEffect) message.ReqId {
+        return switch (self.*) {
+            .request => |*effect| effect.requestId(),
+            .response, .retry, .handshake, .whoareyou => unreachable,
+        };
+    }
+
+    pub fn abortPreparation(self: ActorEffect, ingress: *admission.IngressAdmission) void {
+        switch (self) {
+            .request => |effect| effect.abortPreparation(ingress),
+            .response => |effect| {
+                var permit = effect.admission;
+                permit.release(ingress);
+            },
+            .retry => |effect| effect.abortPreparation(ingress),
+            .handshake => {},
+            .whoareyou => |effect| effect.abortPreparation(ingress),
+        }
+    }
+};
+
+pub const ResponseSendEffect = struct {
+    endpoint: types.Endpoint,
+    nonce: [packet.NONCE_SIZE]u8,
+    dest_pubkey: [33]u8,
+    plaintext: types.PacketBytes,
+    packet: types.PacketBytes,
+    admission: admission.AdmissionPermit,
+    prepared_at_ns: i64,
+};
+
+pub const RetrySendEffect = union(enum) {
+    retained: struct {
+        key: types.RequestKey,
+        packet: types.PacketBytes,
+        deadline_ns: i64,
+        kind: types.RequestKind,
+    },
+    fresh: struct {
+        key: types.RequestKey,
+        packet: types.PacketBytes,
+        deadline_ns: i64,
+        kind: types.RequestKind,
+        transition: request_book.FreshRetryTransition,
+        admission: admission.AdmissionPermit,
+    },
+
+    pub fn destination(self: *const RetrySendEffect) types.Address {
+        return switch (self.*) {
+            .retained => |*value| value.key.endpoint.addr,
+            .fresh => |*value| value.key.endpoint.addr,
+        };
+    }
+
+    pub fn packetBytes(self: *const RetrySendEffect) []const u8 {
+        return switch (self.*) {
+            .retained => |*value| value.packet.slice(),
+            .fresh => |*value| value.packet.slice(),
+        };
+    }
+
+    pub fn abortPreparation(self: RetrySendEffect, ingress: *admission.IngressAdmission) void {
+        switch (self) {
+            .retained => {},
+            .fresh => |value| {
+                var permit = value.admission;
+                permit.release(ingress);
+            },
+        }
+    }
+};
+
+pub const WhoareyouSource = union(enum) {
+    request: request_book.ChallengePreparation,
+    response: response_book.ChallengeView,
+};
+
+pub const HandshakeSendEffect = struct {
+    destination: types.Address,
+    packet: types.PacketBytes,
+    source: WhoareyouSource,
+    initiator_key: [16]u8,
+    recipient_key: [16]u8,
+    deadline_ns: i64,
+    prepared_at_ns: i64,
+    plaintext: types.PacketBytes,
+};
+
+pub const WhoareyouSendEffect = union(enum) {
+    replay: struct {
+        destination: types.Address,
+        packet: types.PacketBytes,
+    },
+    fresh: struct {
+        endpoint: types.Endpoint,
+        challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8,
+        triggering_nonce: [packet.NONCE_SIZE]u8,
+        packet: types.PacketBytes,
+        admission: admission.AdmissionPermit,
+        remote_enr: ?enr.RawEnr,
+        prepared_at_ns: i64,
+    },
+
+    pub fn destination(self: *const WhoareyouSendEffect) types.Address {
+        return switch (self.*) {
+            .replay => |*value| value.destination,
+            .fresh => |*value| value.endpoint.addr,
+        };
+    }
+
+    pub fn packetBytes(self: *const WhoareyouSendEffect) []const u8 {
+        return switch (self.*) {
+            .replay => |*value| value.packet.slice(),
+            .fresh => |*value| value.packet.slice(),
+        };
+    }
+
+    pub fn abortPreparation(self: WhoareyouSendEffect, ingress: *admission.IngressAdmission) void {
+        switch (self) {
+            .replay => {},
+            .fresh => |value| {
+                var permit = value.admission;
+                permit.release(ingress);
+            },
+        }
+    }
+};
+
+/// Runtime-owned bounded output for Actor effects. Actor transitions may
+/// append move-owned effects but never execute transport through this queue.
 pub const RequestEffectQueue = struct {
-    storage: []SendDatagramEffect,
+    storage: []ActorEffect,
     head: usize = 0,
     len: usize = 0,
 
-    pub fn init(storage: []SendDatagramEffect) RequestEffectQueue {
+    pub fn init(storage: []ActorEffect) RequestEffectQueue {
         std.debug.assert(storage.len > 0);
         return .{ .storage = storage };
     }
@@ -140,14 +293,14 @@ pub const RequestEffectQueue = struct {
         return self.len;
     }
 
-    pub fn push(self: *RequestEffectQueue, effect: SendDatagramEffect) error{Full}!void {
+    pub fn push(self: *RequestEffectQueue, effect: ActorEffect) error{Full}!void {
         if (self.len == self.storage.len) return error.Full;
         const index = (self.head + self.len) % self.storage.len;
         self.storage[index] = effect;
         self.len += 1;
     }
 
-    pub fn pop(self: *RequestEffectQueue) ?SendDatagramEffect {
+    pub fn pop(self: *RequestEffectQueue) ?ActorEffect {
         if (self.len == 0) return null;
         const effect = self.storage[self.head];
         self.head = (self.head + 1) % self.storage.len;
@@ -266,12 +419,102 @@ pub const Actor = struct {
         return outbound.prepareTracked(self, context, endpoint, pubkey, req_id, .ping, &.{}, try ping.encodeInto(&buffer), origin);
     }
 
+    pub fn applyEffectCompletion(
+        self: *Actor,
+        env: Env,
+        effect_value: anytype,
+        completion_event: SendCompletion,
+    ) void {
+        if (@TypeOf(effect_value) == SendDatagramEffect) {
+            self.applySendCompletion(env, effect_value, completion_event);
+            return;
+        }
+        const effect: ActorEffect = effect_value;
+        switch (effect) {
+            .request => |request| self.applySendCompletion(env, request, completion_event),
+            .response => |response| {
+                var permit = response.admission;
+                if (completion_event == .sent) {
+                    self.responses.put(.{
+                        .endpoint = response.endpoint,
+                        .nonce = response.nonce,
+                        .dest_pubkey = response.dest_pubkey,
+                        .plaintext = response.plaintext,
+                        .admission = permit.move(),
+                    }, response.prepared_at_ns, env.ingress);
+                    outbound.noteSent(self, response.plaintext.slice());
+                } else {
+                    permit.release(env.ingress);
+                }
+            },
+            .retry => |retry| switch (retry) {
+                .retained => |value| {
+                    self.requests.commitRetry(value.key, value.deadline_ns);
+                    if (completion_event == .sent) outbound.noteSentRequest(self, value.kind);
+                },
+                .fresh => |value| {
+                    var permit = value.admission;
+                    if (completion_event == .sent) {
+                        self.requests.commitFreshRetry(
+                            value.key,
+                            value.transition,
+                            value.deadline_ns,
+                            permit.move(),
+                            env.ingress,
+                        );
+                        outbound.noteSentRequest(self, value.kind);
+                    } else {
+                        permit.release(env.ingress);
+                        self.requests.commitRetry(value.key, value.deadline_ns);
+                    }
+                },
+            },
+            .handshake => |handshake_effect| {
+                if (completion_event != .sent) return;
+                switch (handshake_effect.source) {
+                    .request => |preparation| self.requests.commitChallenge(preparation, .{
+                        .initiator_key = handshake_effect.initiator_key,
+                        .recipient_key = handshake_effect.recipient_key,
+                    }, handshake_effect.deadline_ns),
+                    .response => |view| self.responses.commitCandidate(view, .{
+                        .initiator_key = handshake_effect.initiator_key,
+                        .recipient_key = handshake_effect.recipient_key,
+                    }, handshake_effect.prepared_at_ns, env.ingress),
+                }
+                outbound.noteSent(self, handshake_effect.plaintext.slice());
+            },
+            .whoareyou => |whoareyou| switch (whoareyou) {
+                .replay => {},
+                .fresh => |value| {
+                    var permit = value.admission;
+                    if (completion_event == .sent) {
+                        self.sessions.putChallenge(value.endpoint, .{
+                            .challenge_data = value.challenge_data,
+                            .triggering_nonce = value.triggering_nonce,
+                            .datagram = value.packet,
+                            .admission = permit.move(),
+                            .remote_enr = value.remote_enr,
+                        }, value.prepared_at_ns, env.ingress);
+                    } else {
+                        permit.release(env.ingress);
+                    }
+                },
+            },
+        }
+    }
+
     pub fn applySendCompletion(
         self: *Actor,
         env: Env,
-        effect: SendDatagramEffect,
+        effect_value: anytype,
         completion_event: SendCompletion,
     ) void {
+        const effect: SendDatagramEffect = if (@TypeOf(effect_value) == ActorEffect)
+            switch (effect_value) {
+                .request => |request| request,
+            }
+        else
+            effect_value;
         var pending = effect.takePrepared();
         switch (completion_event) {
             .sent => {
@@ -1098,7 +1341,7 @@ test "discv5 actor: lookup pump exhausts bounded synchronous candidate failures"
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox };
 
     const target = [_]u8{0} ** 32;
     var seeds: [lookup_mod.MAX_RESULTS]types.NodeId = undefined;
@@ -1159,18 +1402,18 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    var effect_storage: [1]SendDatagramEffect = undefined;
+    var effect_storage: [1]ActorEffect = undefined;
     var effects = RequestEffectQueue.init(&effect_storage);
-    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox, .request_effects = &effects };
+    const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .request_effects = &effects };
     try std.testing.expect(actor.addNode(lookup_peer_id, &lookup_pubkey, lookup_address, null, 0));
 
     const blocker_req_id = try actor.sendPing(env, blocker_endpoint, &blocker_pubkey, 0, .api);
     while (effects.pop()) |effect| {
         recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-            actor.applySendCompletion(env, effect, .failed);
+            actor.applyEffectCompletion(env, effect, .failed);
             return err;
         };
-        actor.applySendCompletion(env, effect, .sent);
+        actor.applyEffectCompletion(env, effect, .sent);
     }
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
@@ -1199,10 +1442,10 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     actor.maintenance(env);
     while (effects.pop()) |effect| {
         recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-            actor.applySendCompletion(env, effect, .failed);
+            actor.applyEffectCompletion(env, effect, .failed);
             return err;
         };
-        actor.applySendCompletion(env, effect, .sent);
+        actor.applyEffectCompletion(env, effect, .sent);
     }
     const dispatched = actor.lookups.getPtr(lookup_id) orelse return error.LookupFinishedBeforeDispatch;
     try std.testing.expectEqual(@as(usize, 1), dispatched.num_waiting);
@@ -1248,9 +1491,9 @@ test "discv5 actor: lookup transport send failure remains terminal" {
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    var effect_storage: [1]SendDatagramEffect = undefined;
+    var effect_storage: [1]ActorEffect = undefined;
     var effects = RequestEffectQueue.init(&effect_storage);
-    const env = Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox, .request_effects = &effects };
+    const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .request_effects = &effects };
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, remote_address, null, 0));
     const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0x98} ** 32, &.{remote_id}, outbound.nowNs(io), actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(1, lookup);
@@ -1259,10 +1502,10 @@ test "discv5 actor: lookup transport send failure remains terminal" {
     actor.pumpLookup(env, 1);
     while (effects.pop()) |effect| {
         recording.sender().send(effect.destination(), effect.packetBytes()) catch {
-            actor.applySendCompletion(env, effect, .failed);
+            actor.applyEffectCompletion(env, effect, .failed);
             continue;
         };
-        actor.applySendCompletion(env, effect, .sent);
+        actor.applyEffectCompletion(env, effect, .sent);
     }
 
     try std.testing.expect(!actor.lookups.contains(1));

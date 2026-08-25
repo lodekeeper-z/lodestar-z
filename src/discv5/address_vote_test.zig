@@ -28,10 +28,10 @@ fn drainRequestEffects(
 ) !void {
     while (effects.pop()) |effect| {
         recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-            actor.applySendCompletion(env, effect, .failed);
+            actor.applyEffectCompletion(env, effect, .failed);
             return err;
         };
-        actor.applySendCompletion(env, effect, .sent);
+        actor.applyEffectCompletion(env, effect, .sent);
     }
 }
 
@@ -61,7 +61,7 @@ test "Actor address votes count one voter per native IPv6 source prefix" {
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    const env = actor_mod.Env{ .io = io, .ingress = &ingress, .outbox = &outbox };
 
     const voter_prefix = [8]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 2 };
     const observed = ip6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 3 }, 1, 9100);
@@ -98,7 +98,7 @@ test "Actor address vote window expires old observations deterministically" {
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    const env = actor_mod.Env{ .io = io, .ingress = &ingress, .outbox = &outbox };
     const observed = ip4(.{ 198, 51, 100, 20 }, 9100);
     const window_ns: i64 = addr_votes.VOTE_OBSERVATION_WINDOW_MS * std.time.ns_per_ms;
 
@@ -137,7 +137,7 @@ test "Actor rejects invalid observed endpoints but accepts private unicast" {
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    const env = actor_mod.Env{ .io = io, .ingress = &ingress, .outbox = &outbox };
     const voter = types.Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 10_000 } };
     const invalid = [_]types.Address{
         .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 0 } },
@@ -185,11 +185,11 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    var effect_storage: [4]actor_mod.SendDatagramEffect = undefined;
+    var effect_storage: [4]actor_mod.ActorEffect = undefined;
     var effects = actor_mod.RequestEffectQueue.init(&effect_storage);
     const env = actor_mod.Env{
         .io = io,
-        .sender = recording.sender(),
+
         .ingress = &ingress,
         .outbox = &outbox,
         .request_effects = &effects,

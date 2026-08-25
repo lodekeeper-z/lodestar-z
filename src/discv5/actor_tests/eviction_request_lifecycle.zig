@@ -100,7 +100,7 @@ const EvictionHarness = struct {
     outbox: events.EventOutbox,
     actor: actor_mod.Actor,
     recording: RecordingSender,
-    request_effect_storage: []actor_mod.SendDatagramEffect,
+    request_effect_storage: []actor_mod.ActorEffect,
     request_effects: actor_mod.RequestEffectQueue,
     candidate: @import("../kbucket.zig").EvictionProbe,
     candidate_key: secp.KeyPair,
@@ -138,7 +138,7 @@ const EvictionHarness = struct {
         errdefer outbox.deinit();
         var actor = try actor_mod.Actor.init(alloc, cfg);
         errdefer actor.deinit(&ingress);
-        const request_effect_storage = try alloc.alloc(actor_mod.SendDatagramEffect, cfg.limits.max_active_requests);
+        const request_effect_storage = try alloc.alloc(actor_mod.ActorEffect, try admission.permitCapacity(cfg.limits) + 1);
         errdefer alloc.free(request_effect_storage);
 
         // Fill the candidate's bucket: the real candidate first (learned via
@@ -208,7 +208,7 @@ const EvictionHarness = struct {
     fn env(self: *EvictionHarness) actor_mod.Env {
         return .{
             .io = std.Options.debug_io,
-            .sender = self.recording.sender(),
+
             .ingress = &self.ingress,
             .outbox = &self.outbox,
             .request_effects = &self.request_effects,
@@ -218,15 +218,25 @@ const EvictionHarness = struct {
     fn drainRequestEffects(self: *EvictionHarness) !void {
         while (self.request_effects.pop()) |effect| {
             self.recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-                self.actor.applySendCompletion(self.env(), effect, .failed);
+                self.actor.applyEffectCompletion(self.env(), effect, .failed);
                 return err;
             };
-            self.actor.applySendCompletion(self.env(), effect, .sent);
+            self.actor.applyEffectCompletion(self.env(), effect, .sent);
+        }
+    }
+
+    fn drainRequestEffectsIgnoringFailures(self: *EvictionHarness) void {
+        while (self.request_effects.pop()) |effect| {
+            self.recording.sender().send(effect.destination(), effect.packetBytes()) catch {
+                self.actor.applyEffectCompletion(self.env(), effect, .failed);
+                continue;
+            };
+            self.actor.applyEffectCompletion(self.env(), effect, .sent);
         }
     }
 
     fn failRequestEffects(self: *EvictionHarness) void {
-        while (self.request_effects.pop()) |effect| self.actor.applySendCompletion(self.env(), effect, .failed);
+        while (self.request_effects.pop()) |effect| self.actor.applyEffectCompletion(self.env(), effect, .failed);
     }
 
     fn bucket(self: *EvictionHarness) *kbucket_mod.KBucket {
@@ -312,7 +322,8 @@ test "real eviction probe WHOAREYOU recovery preserves reservation and completes
         .id_nonce = &([_]u8{0x2a} ** 16),
         .enr_seq = 0,
     }, null);
-    harness.actor.handlePacket(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, challenge, harness.candidate_endpoint.addr);
+    harness.actor.handlePacket(harness.env(), challenge, harness.candidate_endpoint.addr);
+    harness.drainRequestEffectsIgnoringFailures();
 
     // The recovery handshake is on the wire while reservation, request,
     // permit, and pending keys all survive.
@@ -343,7 +354,8 @@ test "real eviction probe timeout removes the exact candidate and promotes pendi
     const key = try harness.expectProbeRequest();
 
     const deadline_ns = harness.actor.requests.get(key).?.deadline_ns;
-    harness.actor.maintenanceAt(.{ .io = io, .sender = harness.recording.sender(), .ingress = &harness.ingress, .outbox = &harness.outbox }, deadline_ns);
+    harness.actor.maintenanceAt(harness.env(), deadline_ns);
+    harness.drainRequestEffectsIgnoringFailures();
 
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
@@ -377,6 +389,7 @@ test "bucket expiry resolves a live eviction generation before request timeout" 
     try std.testing.expect(harness.actor.peers.contacts.get(pending.entry.node_id) != null);
 
     harness.actor.maintenanceAt(harness.env(), pending_deadline);
+    harness.drainRequestEffectsIgnoringFailures();
 
     try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
@@ -619,6 +632,7 @@ test "health and eviction probes never queue behind endpoint establishment" {
 
     const deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
     actor.maintenanceAt(harness.env(), deadline_ns);
+    harness.drainRequestEffectsIgnoringFailures();
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, actor.peers.routing.getEntry(&remote_id).?.status);
@@ -807,6 +821,7 @@ test "queued request expires exactly at its actor maintenance deadline" {
     try std.testing.expect(harness.outbox.pop() == null);
 
     actor.maintenanceAt(harness.env(), queued_deadline_ns - 1);
+    harness.drainRequestEffectsIgnoringFailures();
     const queued_before_deadline = (actor.requests.lanes.get(endpoint) orelse return error.MissingQueuedLane).queued.first() orelse return error.QueuedExpiredEarly;
     try std.testing.expect(types.RequestKeyContext.eql(.{}, queued_key, .init(queued_before_deadline.endpoint, queued_before_deadline.req_id)));
     try std.testing.expect(actor.requests.get(active_key) != null);
@@ -818,6 +833,7 @@ test "queued request expires exactly at its actor maintenance deadline" {
     try std.testing.expect(harness.outbox.pop() == null);
 
     actor.maintenanceAt(harness.env(), queued_deadline_ns);
+    harness.drainRequestEffectsIgnoringFailures();
     try std.testing.expect(actor.requests.get(active_key) != null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.lanes.get(endpoint).?.queued.len());
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
@@ -856,6 +872,7 @@ test "AdmissionPermit survives retry and releases on final timeout" {
 
     const first_deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
     actor.maintenanceAt(harness.env(), first_deadline_ns);
+    harness.drainRequestEffectsIgnoringFailures();
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
@@ -863,6 +880,7 @@ test "AdmissionPermit survives retry and releases on final timeout" {
 
     const retry_deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
     actor.maintenanceAt(harness.env(), retry_deadline_ns);
+    harness.drainRequestEffectsIgnoringFailures();
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expect(harness.outbox.pop() == null);
@@ -939,6 +957,7 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
 
     const deadline_ns = actor.requests.get(.init(endpoint, req_id)).?.deadline_ns;
     actor.maintenanceAt(harness.env(), deadline_ns);
+    harness.drainRequestEffectsIgnoringFailures();
     const fresh = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
     try std.testing.expect(fresh.total_responses == null);
     try std.testing.expectEqual(@as(u64, 0), fresh.responses_received);

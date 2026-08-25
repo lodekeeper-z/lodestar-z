@@ -12,7 +12,7 @@ pub const ActorHarness = struct {
     outbox: events.EventOutbox,
     actor: actor_mod.Actor,
     recording: RecordingSender,
-    request_effect_storage: []actor_mod.SendDatagramEffect,
+    request_effect_storage: []actor_mod.ActorEffect,
     request_effects: actor_mod.RequestEffectQueue,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !ActorHarness {
@@ -23,7 +23,7 @@ pub const ActorHarness = struct {
         errdefer outbox.deinit();
         var actor = try actor_mod.Actor.init(allocator, cfg);
         errdefer actor.deinit(&ingress);
-        const request_effect_storage = try allocator.alloc(actor_mod.SendDatagramEffect, cfg.limits.max_active_requests);
+        const request_effect_storage = try allocator.alloc(actor_mod.ActorEffect, try admission.permitCapacity(cfg.limits) + 1);
         return .{
             .allocator = allocator,
             .io = io,
@@ -48,7 +48,6 @@ pub const ActorHarness = struct {
     pub fn env(self: *ActorHarness) actor_mod.Env {
         return .{
             .io = self.io,
-            .sender = self.recording.sender(),
             .ingress = &self.ingress,
             .outbox = &self.outbox,
             .request_effects = &self.request_effects,
@@ -58,16 +57,26 @@ pub const ActorHarness = struct {
     pub fn drainRequestEffects(self: *ActorHarness) !void {
         while (self.request_effects.pop()) |effect| {
             self.recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-                self.actor.applySendCompletion(self.env(), effect, .failed);
+                self.actor.applyEffectCompletion(self.env(), effect, .failed);
                 return err;
             };
-            self.actor.applySendCompletion(self.env(), effect, .sent);
+            self.actor.applyEffectCompletion(self.env(), effect, .sent);
+        }
+    }
+
+    pub fn drainRequestEffectsIgnoringFailures(self: *ActorHarness) void {
+        while (self.request_effects.pop()) |effect| {
+            self.recording.sender().send(effect.destination(), effect.packetBytes()) catch {
+                self.actor.applyEffectCompletion(self.env(), effect, .failed);
+                continue;
+            };
+            self.actor.applyEffectCompletion(self.env(), effect, .sent);
         }
     }
 
     pub fn failRequestEffects(self: *ActorHarness) void {
         while (self.request_effects.pop()) |effect| {
-            self.actor.applySendCompletion(self.env(), effect, .failed);
+            self.actor.applyEffectCompletion(self.env(), effect, .failed);
         }
     }
 };

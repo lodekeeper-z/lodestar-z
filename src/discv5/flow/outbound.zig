@@ -39,7 +39,7 @@ pub fn emitPrepared(
     const effects = env.request_effects orelse unreachable;
     switch (action) {
         .queued => {},
-        .send => |effect| effects.push(effect) catch {
+        .send => |effect| effects.push(.{ .request = effect }) catch {
             effect.abortPreparation(env.ingress);
             return error.TooManyActiveRequests;
         },
@@ -127,16 +127,20 @@ pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext
             !actor.responses.hasLive(endpoint.addr, &encoded.nonce, now_ns)) break;
     } else return error.NonceGenerationExhausted;
     var permit = try env.ingress.acquire(endpoint.addr, @import("../admission.zig").RESPONSE_RECOVERY_PACKET_BUDGET);
-    errdefer permit.release(env.ingress);
-    try env.sender.send(endpoint.addr, encoded.bytes);
-    actor.responses.put(.{
+    const effect = actor_mod.ActorEffect{ .response = .{
         .endpoint = endpoint,
         .nonce = encoded.nonce,
         .dest_pubkey = known.pubkey,
         .plaintext = retained_plaintext,
+        .packet = try .init(encoded.bytes),
         .admission = permit.move(),
-    }, now_ns, env.ingress);
-    noteSent(actor, plaintext);
+        .prepared_at_ns = now_ns,
+    } };
+    const effects = env.request_effects orelse unreachable;
+    effects.push(effect) catch {
+        effect.abortPreparation(env.ingress);
+        return error.TooManyActiveRequests;
+    };
 }
 
 pub const Encoded = struct {

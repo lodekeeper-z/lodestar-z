@@ -85,11 +85,64 @@ These counts are scoped to the tracked reliable-request send transition; they do
 - Destination, request kind, and queued-source flags were removed from the effect because they derive from its canonical prepared request or `RequestBook` queue state. A mutation that ignored the queued entry produced simultaneous queued/active ownership and was caught by `RequestBook.assertInvariants`.
 - Sessionless sends use the request-owned retry datagram directly. Established-session sends retain one transient ciphertext; their separately retained plaintext is a distinct recovery fact.
 
+## Completed architecture: one Runtime-owned effect lifecycle
+
+The temporary compatibility executor and every Actor-side transport capability have now been removed.
+
+```text
+Runtime delivers command | packet | maintenance | completion
+    -> Actor performs one bounded synchronous transition
+    -> Actor appends move-owned ActorEffect values to one bounded FIFO
+    -> Actor returns
+    -> Runtime is the sole transport executor
+    -> Runtime delivers sent | failed | runtime_stopped exactly once
+    -> Actor commits, aborts, or emits bounded follow-up effects
+```
+
+`ActorEffect` has five canonical variants:
+
+- `request`: prepared PING, FINDNODE, TALKREQ, health, eviction, lookup, ENR refresh, and queued-redrain requests;
+- `response`: PONG, NODES, and TALKRESP plus the moved response-recovery permit;
+- `retry`: retained probes and fresh retry transitions plus any replacement permit;
+- `handshake`: request/response challenge source, candidate keys, packet, and completion clocks;
+- `whoareyou`: replay-only or fresh challenge state plus its moved challenge permit.
+
+### Final measured ownership delta
+
+| Ownership / transition measure | Reviewed first slice | Completed architecture |
+| --- | ---: | ---: |
+| Production transport executors | 2 (`Runtime.executeRequestEffect` plus Actor compatibility executor) | 1 Runtime executor |
+| Direct `Sender.send` sites in Actor/flow production code | 7 (compatibility + response/retry/session paths) | 0 |
+| `transport.Sender` capabilities in `Actor.Env` | 1 | 0 |
+| Internal tracked compatibility call paths | 6 | 0 |
+| Ordered Actor effect queues | request-only | 1 queue for every datagram effect |
+| Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
+| Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
+| DiscV5 tests after migration | 307 | 313 |
+| Bounded effect size | request effect within four packet budgets | full `ActorEffect` union within four packet budgets |
+
+### Canonical completion ownership
+
+- **Request `.sent`:** materialize `RequestBook` active state, metrics, health scheduling, and at most one stable-session FIFO continuation.
+- **Request `.failed`:** release preparation and resolve health, eviction, or lookup ownership exactly once.
+- **Response `.sent`:** move the recovery permit into `ResponseBook`; failure releases it.
+- **Retry `.sent`:** commit retry deadline/state/permit swap; failure preserves old active state, releases any replacement permit, and advances the retry deadline.
+- **Handshake `.sent`:** commit request pending keys or response candidate keys; failure leaves the challenged state unchanged.
+- **Fresh WHOAREYOU `.sent`:** install challenge state and moved permit; failure releases it. Replay has no domain mutation.
+- **`runtime_stopped`:** Runtime synthesizes completion for every queued effect before Actor terminalization; lookup work terminates as `runtime_stopped` rather than ordinary failure/repump.
+
+### Ordering, bounds, and late completion policy
+
+- Runtime drains the single FIFO after every command, inbound packet, maintenance turn, and completion-generated continuation.
+- Queue storage is preallocated from the canonical ingress permit capacity plus one replay slot; no per-effect allocation occurs.
+- Queue redrain emits one head. `.sent` removes that head and may emit exactly the next head only under a stable session.
+- Runtime execution is deliberately synchronous in the actor-loop task. Therefore there are no detached transport tasks or replacement generations that can produce late completions. The move-owned effect value is the identity and is consumed once.
+- Cancellation during send maps to `runtime_stopped`; ordinary transport failure maps to `failed`; all remaining queued values are synthesized as `runtime_stopped` during terminalization.
+
 ## Remaining ownership work
 
-This slice is not the complete architecture:
+The outbound transport redesign is complete. Remaining concerns are separate domains rather than compatibility-executor debt:
 
-- Reliable result reservation is still represented by Runtime outbox reservation state and `RequestOrigin.reliable_api`; a later consume-and-resolve result capability should consolidate it.
-- Internal Actor callers still use a synchronous executor that receives `Env.sender`; later Actor transitions should return bounded effects to Runtime instead.
-- Response sends, WHOAREYOU/retry sends, maintenance retries, shutdown terminal publication, peer/contact/routing facts, and lookup/probe lifetimes remain outside this slice.
-- A future asynchronous Runtime executor still needs explicit effect identity/generation and late-completion policy. The present executor resolves each value synchronously and exactly once.
+- Reliable result reservation is represented by Runtime outbox reservation state and `RequestOrigin.reliable_api`; a future consume-and-resolve result capability may consolidate that representation.
+- Peer/contact/routing canonicalization is independent of transport execution ownership.
+- If Runtime transport is later made concurrent or detached, that new design must add explicit generation identity and a late-completion registry. The current synchronous executor intentionally has neither race.

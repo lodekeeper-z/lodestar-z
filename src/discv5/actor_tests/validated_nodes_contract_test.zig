@@ -54,6 +54,7 @@ test "authenticated 128-distance FINDNODE crosses packet ingress and returns NOD
         .plaintext = plaintext,
     });
     actor.handlePacket(harness.env(), datagram, endpoint.addr);
+    harness.drainRequestEffectsIgnoringFailures();
 
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
     try std.testing.expect(harness.recording.datagrams.items[0].address.eql(&endpoint.addr));

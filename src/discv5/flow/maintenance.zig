@@ -70,12 +70,17 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
     const deadline_ns = outbound.deadlineNs(now_ns, actor.request_timeout_ms);
     switch (retry.phase) {
         .awaiting_whoareyou => |probe| {
-            env.sender.send(key.endpoint.addr, probe.retry_packet.slice()) catch {
-                actor.requests.commitRetry(key, deadline_ns);
+            const effect = actor_mod.ActorEffect{ .retry = .{ .retained = .{
+                .key = key,
+                .packet = probe.retry_packet,
+                .deadline_ns = deadline_ns,
+                .kind = retry.kind,
+            } } };
+            const effects = env.request_effects orelse unreachable;
+            effects.push(effect) catch {
+                actor.applyEffectCompletion(env, effect, .failed);
                 return;
             };
-            outbound.noteSentRequest(actor, retry.kind);
-            actor.requests.commitRetry(key, deadline_ns);
         },
         .awaiting_response => |response| {
             var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
@@ -115,6 +120,10 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
                 } }
             else
                 .{ .response = encoded.nonce };
+            const retry_packet = types.PacketBytes.init(encoded.bytes) catch {
+                actor.requests.commitRetry(key, deadline_ns);
+                return;
+            };
             var next_admission = env.ingress.acquire(
                 key.endpoint.addr,
                 @import("../admission.zig").requestPacketBudget(retry.kind),
@@ -122,19 +131,19 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
                 actor.requests.commitRetry(key, deadline_ns);
                 return;
             };
-            env.sender.send(key.endpoint.addr, encoded.bytes) catch {
-                next_admission.release(env.ingress);
-                actor.requests.commitRetry(key, deadline_ns);
+            const effect = actor_mod.ActorEffect{ .retry = .{ .fresh = .{
+                .key = key,
+                .packet = retry_packet,
+                .deadline_ns = deadline_ns,
+                .kind = retry.kind,
+                .transition = transition,
+                .admission = next_admission.move(),
+            } } };
+            const effects = env.request_effects orelse unreachable;
+            effects.push(effect) catch {
+                actor.applyEffectCompletion(env, effect, .failed);
                 return;
             };
-            actor.requests.commitFreshRetry(
-                key,
-                transition,
-                deadline_ns,
-                next_admission.move(),
-                env.ingress,
-            );
-            outbound.noteSentRequest(actor, retry.kind);
         },
     }
 }

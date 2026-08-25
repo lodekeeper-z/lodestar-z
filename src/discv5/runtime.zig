@@ -54,7 +54,7 @@ const RuntimeImpl = struct {
     options: config_mod.Options,
     command_queue: Io.Queue(Command),
     command_buffer: []Command,
-    request_effect_storage: []actor_mod.SendDatagramEffect,
+    request_effect_storage: []actor_mod.ActorEffect,
     request_effects: actor_mod.RequestEffectQueue,
     group: Io.Group = .init,
     lifecycle: std.atomic.Value(Lifecycle) = .init(.ready),
@@ -203,7 +203,7 @@ const RuntimeImpl = struct {
         errdefer actor.deinit(&admission);
         const commands = try allocator.alloc(Command, config.limits.command_capacity);
         errdefer allocator.free(commands);
-        const request_effect_storage = try allocator.alloc(actor_mod.SendDatagramEffect, config.limits.max_active_requests);
+        const request_effect_storage = try allocator.alloc(actor_mod.ActorEffect, try @import("admission.zig").permitCapacity(config.limits) + 1);
         return .{
             .io = io,
             .allocator = allocator,
@@ -386,7 +386,6 @@ const RuntimeImpl = struct {
     fn actorEnv(self: *RuntimeImpl) actor_mod.Env {
         return .{
             .io = self.io,
-            .sender = self.transport.sender(),
             .ingress = &self.admission,
             .outbox = &self.outbox,
             .request_effects = &self.request_effects,
@@ -451,7 +450,7 @@ const RuntimeImpl = struct {
             },
             .send_talk_response => |value| {
                 defer self.allocator.free(value.response);
-                try replyResult(self.io, value.reply, sendTalkResponseResult(&self.actor, env, value.endpoint, value.req_id, value.response));
+                try self.handleSendTalkResponse(env, value);
             },
             .cancel_request => |value| value.reply.putOneUncancelable(
                 self.io,
@@ -493,7 +492,7 @@ const RuntimeImpl = struct {
 
     fn abortRequestEffects(self: *RuntimeImpl) void {
         while (self.request_effects.pop()) |effect| {
-            self.actor.applySendCompletion(self.actorEnv(), effect, .runtime_stopped);
+            self.actor.applyEffectCompletion(self.actorEnv(), effect, .runtime_stopped);
         }
     }
 
@@ -526,6 +525,28 @@ const RuntimeImpl = struct {
         );
         if (result) |_| {} else |_| if (reliable) self.request_result_outbox.release();
         try replyResult(self.io, value.reply, result);
+    }
+
+    fn handleSendTalkResponse(self: *RuntimeImpl, env: actor_mod.Env, value: anytype) Io.Cancelable!void {
+        const prepared = sendTalkResponseResult(&self.actor, env, value.endpoint, value.req_id, value.response);
+        if (prepared) |_| {} else |err| {
+            try replyResult(self.io, value.reply, @as(TalkResponseError!void, err));
+            return;
+        }
+        const effect = self.request_effects.pop() orelse unreachable;
+        executeSendEffect(self, effect) catch |err| {
+            const result: TalkResponseError!void = switch (err) {
+                error.Canceled => error.Canceled,
+                error.MessageOversize => error.MessageTooLarge,
+                error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
+                error.OutOfMemory => error.OutOfMemory,
+                error.TransportSendFailed => error.TransportSendFailed,
+            };
+            try replyResult(self.io, value.reply, result);
+            if (err == error.Canceled) return error.Canceled;
+            return;
+        };
+        try replyResult(self.io, value.reply, @as(TalkResponseError!void, {}));
     }
 
     fn handleStartLookup(self: *RuntimeImpl, env: actor_mod.Env, target: types.NodeId, reply: *LookupReply) Io.Cancelable!void {
@@ -656,17 +677,17 @@ fn executeRequestEffect(runtime: *RuntimeImpl, action_value: actor_mod.OutboundR
     const req_id = action.requestId();
     switch (action) {
         .queued => {},
-        .send => |effect| try executeSendEffect(runtime, effect),
+        .send => |effect| try executeSendEffect(runtime, .{ .request = effect }),
     }
     return req_id;
 }
 
-fn executeSendEffect(runtime: *RuntimeImpl, effect: actor_mod.SendDatagramEffect) !void {
+fn executeSendEffect(runtime: *RuntimeImpl, effect: actor_mod.ActorEffect) !void {
     runtime.transport.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-        runtime.actor.applySendCompletion(runtime.actorEnv(), effect, if (err == error.Canceled) .runtime_stopped else .failed);
+        runtime.actor.applyEffectCompletion(runtime.actorEnv(), effect, if (err == error.Canceled) .runtime_stopped else .failed);
         return err;
     };
-    runtime.actor.applySendCompletion(runtime.actorEnv(), effect, .sent);
+    runtime.actor.applyEffectCompletion(runtime.actorEnv(), effect, .sent);
 }
 
 fn executePingEffect(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64, origin: types.RequestOrigin) !message.ReqId {
@@ -792,31 +813,14 @@ fn sendTalkResponseResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint:
         // Keep encoder exhaustion normalized in case message layout drifts
         // beyond its packet-sized scratch buffer before the packet preflight.
         error.BufferTooSmall => error.MessageTooLarge,
-        error.Canceled => error.Canceled,
         error.EndpointMismatch => error.EndpointMismatch,
         error.MessageTooLarge => error.MessageTooLarge,
         error.NoSession => error.NoSession,
-        error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
         error.NonceGenerationExhausted => error.NonceGenerationExhausted,
         error.OutOfMemory => error.OutOfMemory,
         error.PermitGenerationExhausted => error.PermitGenerationExhausted,
-        error.TransportSendFailed => error.TransportSendFailed,
         error.UnknownPeer => error.UnknownPeer,
-        error.AdmissionBudgetOverflow,
-        error.DecryptionFailed,
-        error.InvalidEncoding,
-        error.InvalidFlag,
-        error.InvalidMessage,
-        error.InvalidPacket,
-        error.InvalidPacketBudget,
-        error.InvalidProtocolId,
-        error.MessageOversize,
-        error.Overflow,
-        error.PacketTooLarge,
-        error.TooManyAdmissionPermits,
-        error.UnexpectedType,
-        error.UnsupportedVersion,
-        => unreachable,
+        else => unreachable,
     };
 }
 

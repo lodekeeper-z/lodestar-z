@@ -20,10 +20,7 @@ const Env = actor_mod.Env;
 const MAX_HANDSHAKE_AUTHDATA: usize = 34 + @as(usize, handshake.sig_size) + @as(usize, handshake.eph_key_size) + enr.MAX_ENR_SIZE;
 const MAX_EPHEMERAL_KEY_ATTEMPTS: usize = 32;
 
-const WhoareyouSource = union(enum) {
-    request: request_book.ChallengePreparation,
-    response: response_book.ChallengeView,
-};
+const WhoareyouSource = actor_mod.WhoareyouSource;
 
 const RecoveryMaterial = struct {
     endpoint: types.Endpoint,
@@ -206,20 +203,18 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         failRequestRecovery(actor, env, source, .packet_too_large);
         return;
     };
-    env.sender.send(from, datagram) catch return;
-    switch (source) {
-        .request => |preparation| actor.requests.commitChallenge(preparation, .{
-            .initiator_key = keys.initiator_key,
-            .recipient_key = keys.recipient_key,
-        }, outbound.deadlineNs(outbound.nowNs(env.io), actor.request_timeout_ms)),
-        .response => |view| {
-            actor.responses.commitCandidate(view, .{
-                .initiator_key = keys.initiator_key,
-                .recipient_key = keys.recipient_key,
-            }, outbound.nowNs(env.io), env.ingress);
-        },
-    }
-    outbound.noteSent(actor, recovery.plaintext.slice());
+    const effect = actor_mod.ActorEffect{ .handshake = .{
+        .destination = from,
+        .packet = types.PacketBytes.init(datagram) catch return,
+        .source = source,
+        .initiator_key = keys.initiator_key,
+        .recipient_key = keys.recipient_key,
+        .deadline_ns = outbound.deadlineNs(now_ns, actor.request_timeout_ms),
+        .prepared_at_ns = now_ns,
+        .plaintext = recovery.plaintext,
+    } };
+    const effects = env.request_effects orelse unreachable;
+    effects.push(effect) catch return;
 }
 
 fn failRequestRecovery(actor: *Actor, env: Env, source: WhoareyouSource, failure: request_results.RequestSendFailure) void {
@@ -333,7 +328,12 @@ fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonc
     const now_ns = outbound.nowNs(env.io);
     if (actor.sessions.peekChallenge(endpoint, now_ns)) |challenge| {
         if (!std.mem.eql(u8, &challenge.triggering_nonce, request_nonce)) return false;
-        env.sender.send(endpoint.addr, challenge.datagram.slice()) catch return false;
+        const effect = actor_mod.ActorEffect{ .whoareyou = .{ .replay = .{
+            .destination = endpoint.addr,
+            .packet = challenge.datagram,
+        } } };
+        const effects = env.request_effects orelse unreachable;
+        effects.push(effect) catch return false;
         return true;
     }
     _ = actor.sessions.removeExpiredChallenge(endpoint, now_ns, env.ingress);
@@ -362,16 +362,19 @@ fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonc
         endpoint.addr,
         @import("../admission.zig").challengePacketBudget(actor.request_retries),
     ) catch return false;
-    env.sender.send(endpoint.addr, datagram) catch {
-        permit.release(env.ingress);
-        return false;
-    };
-    actor.sessions.putChallenge(endpoint, .{
+    const effect = actor_mod.ActorEffect{ .whoareyou = .{ .fresh = .{
+        .endpoint = endpoint,
         .challenge_data = challenge_data,
         .triggering_nonce = request_nonce.*,
-        .datagram = retained,
+        .packet = retained,
         .admission = permit.move(),
         .remote_enr = remote_enr,
-    }, now_ns, env.ingress);
+        .prepared_at_ns = now_ns,
+    } } };
+    const effects = env.request_effects orelse unreachable;
+    effects.push(effect) catch {
+        actor.applyEffectCompletion(env, effect, .failed);
+        return false;
+    };
     return true;
 }
