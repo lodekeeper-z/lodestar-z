@@ -108,9 +108,20 @@ fn runActorLoop(runtime: *runtime_mod.Runtime, result: *?anyerror) void {
     };
 }
 
-fn awaitBoolReply(io: std.Io, reply: *runtime_mod.Testing.EnrAdmissionReply, observed: *std.atomic.Value(bool)) void {
-    const result = reply.getOneUncancelable(io) catch return;
-    _ = result catch {};
+fn awaitBoolReply(
+    io: std.Io,
+    reply: *runtime_mod.Testing.EnrAdmissionReply,
+    observed: *std.atomic.Value(bool),
+    result_error: *?anyerror,
+) void {
+    const result = reply.getOneUncancelable(io) catch |err| {
+        result_error.* = err;
+        observed.store(true, .release);
+        return;
+    };
+    _ = result catch |err| {
+        result_error.* = err;
+    };
     observed.store(true, .release);
 }
 
@@ -768,6 +779,7 @@ test "Runtime cancellation drains accepted owned commands and replies" {
     try runtime_mod.Testing.enqueueAddEnr(runtime, owned, &reply);
 
     var run_error: ?anyerror = null;
+    var reply_error: ?anyerror = null;
     var reply_observed: std.atomic.Value(bool) = .init(false);
     var caller_group: std.Io.Group = .init;
     var caller_group_started = false;
@@ -784,7 +796,7 @@ test "Runtime cancellation drains accepted owned commands and replies" {
         }
         if (caller_group_started) caller_group.await(io) catch {};
     }
-    try caller_group.concurrent(io, awaitBoolReply, .{ io, &reply, &reply_observed });
+    try caller_group.concurrent(io, awaitBoolReply, .{ io, &reply, &reply_observed, &reply_error });
     for (0..10_000) |_| {
         if (runtime.isRunning() and gate.entered.load(.acquire)) break;
         try std.Thread.yield();
@@ -798,6 +810,7 @@ test "Runtime cancellation drains accepted owned commands and replies" {
     caller_group_started = false;
     try std.testing.expectEqual(error.Canceled, run_error.?);
     try std.testing.expect(reply_observed.load(.acquire));
+    try std.testing.expectEqual(error.RuntimeStopped, reply_error.?);
     try std.testing.expect(runtime.isClosed());
     try std.testing.expect(!runtime.isRunning());
 }
@@ -879,8 +892,8 @@ test "Runtime command admission is bounded nonblocking and drains accepted owner
 
     for (&producers) |*producer| {
         if (producer.accepted) {
-            try std.testing.expect(producer.completed);
-            try std.testing.expect(producer.result_error == null);
+            try std.testing.expect(!producer.completed);
+            try std.testing.expectEqual(error.RuntimeStopped, producer.result_error.?);
         } else {
             try std.testing.expectEqual(error.CommandQueueFull, producer.result_error.?);
         }
@@ -1075,7 +1088,7 @@ test "failed maintenance enqueue rolls back pending state for retry" {
     try std.testing.expect(loop_error == null);
 }
 
-test "normal stop drains accepted owned commands and replies" {
+test "stop before run aborts accepted owned commands with runtime stopped" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
@@ -1085,10 +1098,28 @@ test "normal stop drains accepted owned commands and replies" {
     var reply_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
     var reply = runtime_mod.Testing.EnrAdmissionReply.init(&reply_buffer);
     try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xff}), &reply);
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x77} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    var ping_buffer: [1]runtime_mod.Testing.PingResult = undefined;
+    var ping_reply = runtime_mod.Testing.PingReply.init(&ping_buffer);
+    try runtime_mod.Testing.enqueueSendPing(runtime, .{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 77 }, .port = 19077 } },
+    }, remote_pubkey, &ping_reply);
+    var send_gate = transport_mod.Testing.SendGate{};
+    send_gate.proceed.store(true, .release);
+    runtime_mod.Testing.setSendGate(runtime, &send_gate);
+
     runtime.stop();
     try runtime_mod.Testing.actorLoop(runtime);
     const result = try reply.getOneUncancelable(io);
-    try std.testing.expect(!(try result));
+    try std.testing.expectError(error.RuntimeStopped, result);
+    const ping_result = try ping_reply.getOneUncancelable(io);
+    try std.testing.expectError(error.RuntimeStopped, ping_result);
+    try std.testing.expect(!send_gate.entered.load(.acquire));
+    try std.testing.expect(runtime.popRequestResult() == null);
 }
 
 test "reliable lookup results survive a full event outbox and release capacity on take" {

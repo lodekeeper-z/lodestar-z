@@ -148,6 +148,59 @@ const RuntimeImpl = struct {
         local_enr: *EnrReply,
         peer_enr: struct { node_id: types.NodeId, reply: *EnrReply },
         local_enr_seq: *U64Reply,
+
+        fn abort(command: Command, runtime: *RuntimeImpl) void {
+            switch (command) {
+                .inbound => |value| {
+                    var expected = value.expected;
+                    if (expected) |*credit| credit.rollback(&runtime.admission);
+                },
+                .maintenance => runtime.maintenance_due.store(false, .release),
+                .add_node => |value| {
+                    if (value.enr) |bytes| runtime.allocator.free(bytes);
+                    abortReply(runtime.io, value.reply);
+                },
+                .add_enr => |value| {
+                    runtime.allocator.free(value.enr);
+                    abortReply(runtime.io, value.reply);
+                },
+                .set_local_enr => |value| {
+                    runtime.allocator.free(value.enr);
+                    abortReply(runtime.io, value.reply);
+                },
+                .send_ping => |value| {
+                    if (value.origin == .reliable_api) runtime.request_result_outbox.cancelUnclaimed();
+                    abortReply(runtime.io, value.reply);
+                },
+                .send_findnode => |value| {
+                    if (value.origin == .reliable_api) runtime.request_result_outbox.cancelUnclaimed();
+                    abortReply(runtime.io, value.reply);
+                },
+                .send_talk_request => |value| {
+                    runtime.allocator.free(value.protocol_name);
+                    runtime.allocator.free(value.request);
+                    if (value.origin == .reliable_api) runtime.request_result_outbox.cancelUnclaimed();
+                    abortReply(runtime.io, value.reply);
+                },
+                .send_talk_response => |value| {
+                    runtime.allocator.free(value.response);
+                    abortReply(runtime.io, value.reply);
+                },
+                .cancel_request => |value| abortReply(runtime.io, value.reply),
+                .start_lookup => |value| {
+                    runtime.lookup_result_outbox.cancelUnclaimed();
+                    abortReply(runtime.io, value.reply);
+                },
+                .start_random_lookup => |reply| {
+                    runtime.lookup_result_outbox.cancelUnclaimed();
+                    abortReply(runtime.io, reply);
+                },
+                .metrics_snapshot => |reply| abortReply(runtime.io, reply),
+                .local_enr => |reply| abortReply(runtime.io, reply),
+                .peer_enr => |value| abortReply(runtime.io, value.reply),
+                .local_enr_seq => |reply| abortReply(runtime.io, reply),
+            }
+        }
     };
 
     fn init(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) InitError!RuntimeImpl {
@@ -351,7 +404,10 @@ const RuntimeImpl = struct {
                 error.Closed => return,
                 error.Canceled => return error.Canceled,
             };
-            try self.handleCommand(command);
+            switch (self.lifecycle.load(.acquire)) {
+                .stopping, .terminalizing, .stopped => command.abort(self),
+                .ready, .running => try self.handleCommand(command),
+            }
         }
     }
 
@@ -368,15 +424,7 @@ const RuntimeImpl = struct {
             const command = self.command_queue.getOneUncancelable(self.io) catch |err| switch (err) {
                 error.Closed => return,
             };
-            switch (command) {
-                .inbound => |value| if (value.expected) |credit_value| {
-                    var credit = credit_value;
-                    credit.rollback(&self.admission);
-                },
-                else => self.handleCommand(command) catch |err| switch (err) {
-                    error.Canceled => {},
-                },
-            }
+            command.abort(self);
         }
     }
 
@@ -845,6 +893,10 @@ fn startLookupResult(actor: *actor_mod.Actor, env: actor_mod.Env, target: types.
         error.TooManySeeds,
         => unreachable,
     };
+}
+
+fn abortReply(io: std.Io, reply: anytype) void {
+    reply.putOneUncancelable(io, error.RuntimeStopped) catch {};
 }
 
 fn replyResult(io: std.Io, reply: anytype, result: anytype) std.Io.Cancelable!void {
