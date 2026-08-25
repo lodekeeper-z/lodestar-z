@@ -18,6 +18,7 @@ pub const RequestKind = enum {
 
 pub const MaintenanceReason = enum {
     health,
+    enr_propagation,
     enr_refresh,
 };
 

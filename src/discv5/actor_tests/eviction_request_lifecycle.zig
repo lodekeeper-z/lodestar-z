@@ -490,6 +490,48 @@ test "real eviction probe send failure rolls back reservation and bucket state" 
     harness.actor.requests.assertInvariants();
 }
 
+test "health probe emits before transport and failed completion releases reservation" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x91} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
+    remote_builder.ip = .{ 127, 0, 0, 91 };
+    remote_builder.udp = 9091;
+    const remote_enr = try remote_builder.encode();
+    defer alloc.free(remote_enr);
+    const remote_id = (try (try enr.decode(remote_enr)).nodeId()).?;
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 91 }, .port = 9091 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    try std.testing.expect(harness.actor.peers.learnEnr(remote_enr, 0) != null);
+    _ = harness.actor.peers.markResponsive(remote_id, endpoint.addr, 0, null);
+
+    const req_id = try harness.actor.sendProbe(harness.env(), endpoint, &remote_pubkey, .health, .connected_only);
+    const key = types.RequestKey.init(endpoint, req_id);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.request_effects.count());
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try expectActorHealthRequest(&harness.actor, remote_id, key);
+
+    harness.failRequestEffects();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+}
+
 test "health and eviction probes never queue behind endpoint establishment" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;

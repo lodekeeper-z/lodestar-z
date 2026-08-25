@@ -20,6 +20,21 @@ fn ip4(bytes: [4]u8, port: u16) types.Address {
     return .{ .ip4 = .{ .bytes = bytes, .port = port } };
 }
 
+fn drainRequestEffects(
+    actor: *actor_mod.Actor,
+    env: actor_mod.Env,
+    effects: *actor_mod.RequestEffectQueue,
+    recording: *RecordingSender,
+) !void {
+    while (effects.pop()) |effect| {
+        recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+            actor.applySendCompletion(env, effect, .failed);
+            return err;
+        };
+        actor.applySendCompletion(env, effect, .sent);
+    }
+}
+
 test "Actor address votes count one voter per native IPv6 source prefix" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -170,7 +185,15 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     defer actor.deinit(&ingress);
     var recording = RecordingSender.init(alloc);
     defer recording.deinit();
-    const env = actor_mod.Env{ .io = io, .sender = recording.sender(), .ingress = &ingress, .outbox = &outbox };
+    var effect_storage: [4]actor_mod.SendDatagramEffect = undefined;
+    var effects = actor_mod.RequestEffectQueue.init(&effect_storage);
+    const env = actor_mod.Env{
+        .io = io,
+        .sender = recording.sender(),
+        .ingress = &ingress,
+        .outbox = &outbox,
+        .request_effects = &effects,
+    };
 
     const remote_key = try secp.keyPairFromSecret(&([_]u8{0x94} ** 32));
     const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
@@ -186,6 +209,7 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     const observed_a = ip4(.{ 198, 51, 100, 10 }, 9100);
     const observed_b = ip4(.{ 198, 51, 100, 11 }, 9101);
     actor.observeAddressVoteAt(env, remote_address, observed_a, 100);
+    try drainRequestEffects(&actor, env, &effects, &recording);
     try std.testing.expectEqual(@as(u64, 2), actor.localEnrSeq());
     try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
     const propagation = actor.peers.routing.getEntry(&remote_id).?.health_request orelse return error.MissingPropagationPing;
@@ -200,6 +224,7 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
 
     const cooldown_ns: i64 = addr_votes.ENR_UPDATE_COOLDOWN_MS * std.time.ns_per_ms;
     actor.observeAddressVoteAt(env, remote_address, observed_b, 100 + cooldown_ns);
+    try drainRequestEffects(&actor, env, &effects, &recording);
     try std.testing.expectEqual(@as(u64, 3), actor.localEnrSeq());
     try std.testing.expectEqual(@as(usize, 2), recording.datagrams.items.len);
 }

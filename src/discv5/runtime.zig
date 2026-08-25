@@ -54,6 +54,8 @@ const RuntimeImpl = struct {
     options: config_mod.Options,
     command_queue: Io.Queue(Command),
     command_buffer: []Command,
+    request_effect_storage: []actor_mod.SendDatagramEffect,
+    request_effects: actor_mod.RequestEffectQueue,
     group: Io.Group = .init,
     lifecycle: std.atomic.Value(Lifecycle) = .init(.ready),
     terminalized: std.atomic.Value(bool) = .init(false),
@@ -200,6 +202,8 @@ const RuntimeImpl = struct {
         var actor = try actor_mod.Actor.init(allocator, config);
         errdefer actor.deinit(&admission);
         const commands = try allocator.alloc(Command, config.limits.command_capacity);
+        errdefer allocator.free(commands);
+        const request_effect_storage = try allocator.alloc(actor_mod.SendDatagramEffect, config.limits.max_active_requests);
         return .{
             .io = io,
             .allocator = allocator,
@@ -212,6 +216,8 @@ const RuntimeImpl = struct {
             .options = options,
             .command_queue = .init(commands),
             .command_buffer = commands,
+            .request_effect_storage = request_effect_storage,
+            .request_effects = .init(request_effect_storage),
         };
     }
 
@@ -224,6 +230,7 @@ const RuntimeImpl = struct {
         self.actor.deinit(&self.admission);
         self.admission.deinit();
         self.transport.deinit();
+        self.allocator.free(self.request_effect_storage);
         self.allocator.free(self.command_buffer);
     }
 
@@ -276,6 +283,7 @@ const RuntimeImpl = struct {
 
     fn terminalize(self: *RuntimeImpl) void {
         if (self.terminalized.swap(true, .acq_rel)) return;
+        self.abortRequestEffects();
         const env = self.actorEnv();
         self.actor.finishAllReliableRequests(env);
         self.actor.finishAllLookups(env, .runtime_stopped);
@@ -381,12 +389,14 @@ const RuntimeImpl = struct {
             .sender = self.transport.sender(),
             .ingress = &self.admission,
             .outbox = &self.outbox,
+            .request_effects = &self.request_effects,
             .lookup_results = &self.lookup_result_outbox,
             .request_results = &self.request_result_outbox,
         };
     }
 
     fn handleCommand(self: *RuntimeImpl, command: Command) Io.Cancelable!void {
+        defer self.abortRequestEffects();
         var expected = switch (command) {
             .inbound => |value| value.expected,
             else => null,
@@ -468,6 +478,22 @@ const RuntimeImpl = struct {
             .local_enr => |reply| reply.putOneUncancelable(self.io, self.actor.localEnr()) catch {},
             .peer_enr => |value| value.reply.putOneUncancelable(self.io, self.actor.peerEnr(&value.node_id)) catch {},
             .local_enr_seq => |reply| reply.putOneUncancelable(self.io, self.actor.localEnrSeq()) catch {},
+        }
+        try self.drainRequestEffects();
+    }
+
+    fn drainRequestEffects(self: *RuntimeImpl) Io.Cancelable!void {
+        while (self.request_effects.pop()) |effect| {
+            executeSendEffect(self, effect) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => continue,
+            };
+        }
+    }
+
+    fn abortRequestEffects(self: *RuntimeImpl) void {
+        while (self.request_effects.pop()) |effect| {
+            self.actor.applySendCompletion(self.actorEnv(), effect, .failed);
         }
     }
 
@@ -630,15 +656,17 @@ fn executeRequestEffect(runtime: *RuntimeImpl, action_value: actor_mod.OutboundR
     const req_id = action.requestId();
     switch (action) {
         .queued => {},
-        .send => |effect| {
-            runtime.transport.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
-                runtime.actor.applySendCompletion(&runtime.admission, effect, .failed);
-                return err;
-            };
-            runtime.actor.applySendCompletion(&runtime.admission, effect, .sent);
-        },
+        .send => |effect| try executeSendEffect(runtime, effect),
     }
     return req_id;
+}
+
+fn executeSendEffect(runtime: *RuntimeImpl, effect: actor_mod.SendDatagramEffect) !void {
+    runtime.transport.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
+        runtime.actor.applySendCompletion(runtime.actorEnv(), effect, .failed);
+        return err;
+    };
+    runtime.actor.applySendCompletion(runtime.actorEnv(), effect, .sent);
 }
 
 fn executePingEffect(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64, origin: types.RequestOrigin) !message.ReqId {

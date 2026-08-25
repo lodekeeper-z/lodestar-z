@@ -40,6 +40,7 @@ pub const Env = struct {
     sender: transport.Sender,
     ingress: *admission.IngressAdmission,
     outbox: *events.EventOutbox,
+    request_effects: ?*RequestEffectQueue = null,
     lookup_results: ?*lookup_results.LookupResultOutbox = null,
     request_results: ?*request_results.RequestResultOutbox = null,
     expected_credit: ?*admission.ExpectedCredit = null,
@@ -261,18 +262,52 @@ pub const Actor = struct {
 
     pub fn applySendCompletion(
         self: *Actor,
-        ingress: *admission.IngressAdmission,
+        env: Env,
         effect: SendDatagramEffect,
         completion_event: SendCompletion,
     ) void {
         var pending = effect.takePrepared();
         switch (completion_event) {
             .sent => {
+                const key = pending.key;
+                const origin = pending.origin;
                 const kind = pending.response.kind();
                 self.requests.commitSent(pending);
                 outbound.noteSentRequest(self, kind);
+                self.onRequestSendSuccess(env, key, origin);
             },
-            .failed => pending.abort(ingress),
+            .failed => {
+                const key = pending.key;
+                const origin = pending.origin;
+                pending.abort(env.ingress);
+                self.onRequestSendFailure(key, origin);
+            },
+        }
+    }
+
+    fn onRequestSendSuccess(self: *Actor, env: Env, key: types.RequestKey, origin: types.RequestOrigin) void {
+        switch (origin) {
+            .maintenance => |reason| switch (reason) {
+                .health => if (self.peers.routing.getEntryMutWithPending(&key.endpoint.node_id)) |peer| {
+                    peer.next_ping_at_ns = outbound.deadlineNs(outbound.nowNs(env.io), self.ping_interval_ms);
+                },
+                .enr_propagation, .enr_refresh => {},
+            },
+            .api, .reliable_api, .lookup, .detached_lookup, .eviction => {},
+        }
+    }
+
+    fn onRequestSendFailure(self: *Actor, key: types.RequestKey, origin: types.RequestOrigin) void {
+        switch (origin) {
+            .maintenance => |reason| switch (reason) {
+                .health, .enr_propagation => _ = self.peers.cancelHealthRequest(key),
+                .enr_refresh => {},
+            },
+            .eviction => |generation| _ = self.peers.cancelEvictionRequest(.{
+                .incumbent_id = key.endpoint.node_id,
+                .generation = generation,
+            }, key),
+            .api, .reliable_api, .lookup, .detached_lookup => {},
         }
     }
 
@@ -490,7 +525,7 @@ pub const Actor = struct {
         switch (origin) {
             .lookup => self.onRequestCompletion(env, key, origin, false, &.{}),
             .maintenance => |reason| switch (reason) {
-                .health => _ = self.peers.cancelHealthRequest(key),
+                .health, .enr_propagation => _ = self.peers.cancelHealthRequest(key),
                 .enr_refresh => {},
             },
             .eviction => |generation| _ = self.peers.cancelEvictionRequest(.{
@@ -528,7 +563,7 @@ pub const Actor = struct {
                 self.pumpLookup(env, id);
             },
             .maintenance => |reason| switch (reason) {
-                .health => if (!success) self.publishConnection(env.outbox, key.endpoint.node_id, self.peers.markDisconnected(key, outbound.nowNs(env.io))),
+                .health, .enr_propagation => if (!success) self.publishConnection(env.outbox, key.endpoint.node_id, self.peers.markDisconnected(key, outbound.nowNs(env.io))),
                 .enr_refresh => {},
             },
             .eviction => |generation| {
@@ -727,14 +762,17 @@ pub const Actor = struct {
         reason: types.MaintenanceReason,
         policy: peer_book.PeerBook.HealthReservationPolicy,
     ) !message.ReqId {
-        std.debug.assert(reason == .health);
+        std.debug.assert(reason == .health or reason == .enr_propagation);
         const req_id = randomReqId(env.io);
         const key = types.RequestKey.init(endpoint, req_id);
         if (!self.peers.armHealthRequest(key, policy)) return error.ProbeUnavailable;
-        errdefer _ = self.peers.cancelHealthRequest(key);
         const ping = message.Ping{ .req_id = req_id, .enr_seq = self.local.seq };
         var buffer: [128]u8 = undefined;
-        const action = try outbound.prepareTracked(
+        const plaintext = ping.encodeInto(&buffer) catch |err| {
+            _ = self.peers.cancelHealthRequest(key);
+            return err;
+        };
+        const action = outbound.prepareTracked(
             self,
             .{ .io = env.io, .ingress = env.ingress },
             endpoint,
@@ -742,10 +780,13 @@ pub const Actor = struct {
             req_id,
             .ping,
             &.{},
-            try ping.encodeInto(&buffer),
+            plaintext,
             .{ .maintenance = reason },
-        );
-        try outbound.executePrepared(self, env, action);
+        ) catch |err| {
+            _ = self.peers.cancelHealthRequest(key);
+            return err;
+        };
+        try outbound.emitPrepared(self, env, action);
         return req_id;
     }
 
@@ -931,7 +972,7 @@ pub const Actor = struct {
                 count += 1;
             }
             for (snapshots[0..count]) |*snapshot| {
-                _ = self.sendProbe(env, snapshot.endpoint, &snapshot.pubkey, .health, .connected_only) catch continue;
+                _ = self.sendProbe(env, snapshot.endpoint, &snapshot.pubkey, .enr_propagation, .connected_only) catch continue;
             }
         }
     }

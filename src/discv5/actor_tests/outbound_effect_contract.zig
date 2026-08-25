@@ -75,7 +75,7 @@ test "prepared outbound ping owns request until successful send completion" {
     try std.testing.expect(effect.packetBytes().len > 0);
     try std.testing.expect(effect.destination().eql(&context.endpoint.addr));
 
-    context.harness.actor.applySendCompletion(&context.harness.ingress, effect, .sent);
+    context.harness.actor.applySendCompletion(context.harness.env(), effect, .sent);
 
     try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.activeCount());
     try std.testing.expect(context.harness.actor.requests.get(key) != null);
@@ -91,7 +91,7 @@ test "failed outbound ping completion releases the effect-owned request" {
     const key = types.RequestKey.init(context.endpoint, effect.requestId());
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
 
-    context.harness.actor.applySendCompletion(&context.harness.ingress, effect, .failed);
+    context.harness.actor.applySendCompletion(context.harness.env(), effect, .failed);
 
     try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.activeCount());
     try std.testing.expect(context.harness.actor.requests.get(key) == null);
@@ -116,7 +116,7 @@ test "prepared FINDNODE effect commits the nodes response state" {
     };
     const key = types.RequestKey.init(context.endpoint, effect.requestId());
 
-    context.harness.actor.applySendCompletion(&context.harness.ingress, effect, .sent);
+    context.harness.actor.applySendCompletion(context.harness.env(), effect, .sent);
 
     const request = context.harness.actor.requests.get(key) orelse return error.MissingActiveRequest;
     try std.testing.expect(request.response == .nodes);
@@ -135,13 +135,15 @@ test "bounded request effect output owns preparation without executing transport
         .reliable_api,
     );
 
-    try outbound.emitPrepared(&context.harness.actor, &context.harness.ingress, &effects, action);
+    var env = context.harness.env();
+    env.request_effects = &effects;
+    try outbound.emitPrepared(&context.harness.actor, env, action);
 
     try std.testing.expectEqual(@as(usize, 1), effects.count());
     try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
     const effect = effects.pop() orelse return error.MissingEffect;
-    context.harness.actor.applySendCompletion(&context.harness.ingress, effect, .failed);
+    context.harness.actor.applySendCompletion(context.harness.env(), effect, .failed);
 }
 
 test "full request effect output aborts the unaccepted preparation" {
@@ -157,7 +159,9 @@ test "full request effect output aborts the unaccepted preparation" {
         0,
         .reliable_api,
     );
-    try outbound.emitPrepared(&context.harness.actor, &context.harness.ingress, &effects, first);
+    var env = context.harness.env();
+    env.request_effects = &effects;
+    try outbound.emitPrepared(&context.harness.actor, env, first);
     const second = try context.harness.actor.preparePing(
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
@@ -168,13 +172,13 @@ test "full request effect output aborts the unaccepted preparation" {
 
     try std.testing.expectError(
         error.TooManyActiveRequests,
-        outbound.emitPrepared(&context.harness.actor, &context.harness.ingress, &effects, second),
+        outbound.emitPrepared(&context.harness.actor, env, second),
     );
 
     try std.testing.expectEqual(@as(usize, 1), effects.count());
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
     const effect = effects.pop() orelse return error.MissingEffect;
-    context.harness.actor.applySendCompletion(&context.harness.ingress, effect, .failed);
+    context.harness.actor.applySendCompletion(context.harness.env(), effect, .failed);
     try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
 }
 
@@ -196,7 +200,7 @@ test "prepared TALKREQ effect commits the talk response state" {
     };
     const key = types.RequestKey.init(context.endpoint, effect.requestId());
 
-    context.harness.actor.applySendCompletion(&context.harness.ingress, effect, .sent);
+    context.harness.actor.applySendCompletion(context.harness.env(), effect, .sent);
 
     const request = context.harness.actor.requests.get(key) orelse return error.MissingActiveRequest;
     try std.testing.expectEqual(request_book.Response.talkresp, request.response);

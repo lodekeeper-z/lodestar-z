@@ -574,6 +574,7 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
     try std.testing.expectEqual(peer_ids.len, peer_count);
 
     try actor.setLocalEnr(harness.env(), replacement_enr);
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(peer_ids.len, harness.recording.datagrams.items.len);
     try std.testing.expectEqual(peer_ids.len, actor.requests.activeCount());
     try std.testing.expectEqual(peer_ids.len, harness.ingress.permitCount());
@@ -617,17 +618,20 @@ test "maintenance schedules the next health probe only after a successful send" 
 
     harness.recording.fail_next = true;
     actor.maintenance(harness.env());
+    try std.testing.expectError(error.TransportSendFailed, harness.drainRequestEffects());
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
 
     actor.maintenance(harness.env());
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
     const health_request = actor.peers.routing.getEntry(&remote_id).?.health_request orelse
         return error.MissingHealthRequest;
     try std.testing.expect(actor.cancelRequest(harness.env(), health_request));
 
     actor.maintenance(harness.env());
+    try harness.drainRequestEffects();
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);

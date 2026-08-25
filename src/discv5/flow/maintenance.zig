@@ -195,9 +195,6 @@ fn pingDue(actor: *Actor, env: Env, now_ns: i64) void {
                 .health,
                 .connected_only,
             ) catch continue;
-            if (actor.peers.routing.getEntryMutWithPending(&snapshot.endpoint.node_id)) |current| {
-                current.next_ping_at_ns = outbound.deadlineNs(now_ns, actor.ping_interval_ms);
-            }
         }
     }
 }

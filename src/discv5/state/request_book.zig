@@ -303,7 +303,7 @@ pub const RequestBook = struct {
     pub fn queue(self: *RequestBook, request: QueuedRequest) !void {
         switch (request.origin) {
             .maintenance => |reason| switch (reason) {
-                .health => return error.EndpointBusy,
+                .health, .enr_propagation => return error.EndpointBusy,
                 .enr_refresh => {},
             },
             .eviction => return error.EndpointBusy,

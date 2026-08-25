@@ -34,14 +34,14 @@ pub fn prepareTracked(
 
 pub fn emitPrepared(
     actor: *Actor,
-    ingress: *@import("../admission.zig").IngressAdmission,
-    effects: *actor_mod.RequestEffectQueue,
+    env: Env,
     action: actor_mod.OutboundRequestAction,
 ) !void {
+    const effects = env.request_effects orelse unreachable;
     switch (action) {
         .queued => {},
         .send => |effect| effects.push(effect) catch {
-            actor.applySendCompletion(ingress, effect, .failed);
+            actor.applySendCompletion(env, effect, .failed);
             return error.TooManyActiveRequests;
         },
     }
@@ -52,10 +52,10 @@ pub fn executePrepared(actor: *Actor, env: Env, action: actor_mod.OutboundReques
         .queued => {},
         .send => |effect| {
             env.sender.send(effect.destination(), effect.packetBytes()) catch |err| {
-                actor.applySendCompletion(env.ingress, effect, .failed);
+                actor.applySendCompletion(env, effect, .failed);
                 return err;
             };
-            actor.applySendCompletion(env.ingress, effect, .sent);
+            actor.applySendCompletion(env, effect, .sent);
         },
     }
 }
