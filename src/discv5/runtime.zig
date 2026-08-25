@@ -985,6 +985,10 @@ pub const Runtime = opaque {
     pub fn addNode(self: *Runtime, node_id: types.NodeId, pubkey: ?*const [33]u8, address: types.Address, enr_bytes: ?[]const u8) runtime_error.EnrAdmissionError!bool {
         const storage = impl(self);
         try storage.ensureRunning();
+        if (enr_bytes == null) if (pubkey) |key| {
+            const derived = enr.nodeIdFromCompressedPubkey(key) catch return error.InvalidPublicKey;
+            if (!std.mem.eql(u8, &node_id, &derived)) return error.WrongNodeId;
+        };
         if (enr_bytes) |bytes| if (bytes.len > @import("enr.zig").MAX_ENR_SIZE) return error.InvalidEnr;
         var owned: ?[]u8 = if (enr_bytes) |bytes| try storage.allocator.dupe(u8, bytes) else null;
         errdefer if (owned) |bytes| storage.allocator.free(bytes);

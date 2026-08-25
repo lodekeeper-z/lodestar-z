@@ -1122,6 +1122,40 @@ test "stop before run aborts accepted owned commands with runtime stopped" {
     try std.testing.expect(runtime.popRequestResult() == null);
 }
 
+test "raw addNode rejects unproved peer identity before mutation" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x78, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+    }, .{});
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const claimed_key = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
+    const claimed_pubkey = secp.compressedPubkey(&claimed_key);
+    const claimed_id = try enr.nodeIdFromCompressedPubkey(&claimed_pubkey);
+    const supplied_key = try secp.keyPairFromSecret(&([_]u8{0x7a} ** 32));
+    const supplied_pubkey = secp.compressedPubkey(&supplied_key);
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 78 }, .port = 19078 } };
+
+    try std.testing.expectError(error.WrongNodeId, runtime.addNode(claimed_id, &supplied_pubkey, address, null));
+    try std.testing.expect(!runtime_mod.Testing.knowsNode(runtime, claimed_id));
+
+    const malformed_pubkey = [_]u8{0} ** 33;
+    try std.testing.expectError(error.InvalidPublicKey, runtime.addNode(claimed_id, &malformed_pubkey, address, null));
+    try std.testing.expect(!runtime_mod.Testing.knowsNode(runtime, claimed_id));
+
+    try std.testing.expect(try runtime.addNode(claimed_id, &claimed_pubkey, address, null));
+    try std.testing.expect(runtime_mod.Testing.knowsNode(runtime, claimed_id));
+}
+
 test "reliable lookup results survive a full event outbox and release capacity on take" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});

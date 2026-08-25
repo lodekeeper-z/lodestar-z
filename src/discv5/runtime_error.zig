@@ -52,7 +52,9 @@ pub const CommandError = error{
 
 pub const EnrAdmissionError = CommandError || error{
     InvalidEnr,
+    InvalidPublicKey,
     OutOfMemory,
+    WrongNodeId,
 };
 
 pub const SetLocalEnrError = CommandError || error{

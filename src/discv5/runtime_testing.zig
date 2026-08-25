@@ -113,6 +113,10 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             return true;
         }
 
+        pub fn knowsNode(runtime: *Runtime, node_id: types.NodeId) bool {
+            return impl(runtime).actor.peers.known(&node_id) != null;
+        }
+
         pub fn activeAndPermitCount(runtime: *Runtime) struct { active: usize, permits: usize } {
             const counts = activeQueuedAndPermitCount(runtime);
             return .{ .active = counts.active, .permits = counts.permits };
