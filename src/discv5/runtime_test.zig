@@ -8,6 +8,34 @@ const secp = @import("secp256k1.zig");
 const transport_mod = @import("transport.zig");
 const types = @import("types.zig");
 
+fn expectNoRuntimeEvent(runtime: *runtime_mod.Runtime, alloc: std.mem.Allocator) !void {
+    var event = runtime.popEvent() orelse return;
+    defer event.deinit(alloc);
+    return error.UnexpectedEvent;
+}
+
+const RuntimeRequestCleanup = struct {
+    runtime: *runtime_mod.Runtime,
+    key: types.RequestKey,
+    active: bool = true,
+
+    fn consume(self: *RuntimeRequestCleanup) void {
+        std.debug.assert(self.active);
+        self.active = false;
+    }
+
+    fn deinit(self: *RuntimeRequestCleanup) void {
+        if (!self.active) return;
+        _ = self.runtime.cancelRequest(
+            self.key.endpoint.node_id,
+            self.key.endpoint.addr,
+            self.key.req_id,
+        ) catch unreachable;
+        runtime_mod.Testing.reconcileClaimedRequest(self.runtime, self.key);
+        self.active = false;
+    }
+};
+
 fn runRuntime(runtime: *runtime_mod.Runtime, result: *?anyerror) void {
     runtime.run() catch |err| {
         result.* = err;
@@ -1844,7 +1872,7 @@ test "Runtime partial initialization cleans up every allocator failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, runtimeInitializationLifecycle, .{});
 }
 
-test "full EventOutbox cannot lose reliable pong nodes or talk response payloads" {
+test "full or empty EventOutbox never duplicates reliable TALK response terminals" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
@@ -1925,8 +1953,11 @@ test "full EventOutbox cannot lose reliable pong nodes or talk response payloads
     try std.testing.expect(nodes_result.terminal == .nodes);
     try std.testing.expectEqual(@as(usize, 1), nodes_result.terminal.nodes.slice().len);
     try std.testing.expectEqualSlices(u8, local_enr_b, nodes_result.terminal.nodes.slice()[0].slice());
+    const snapshot_before_talk = try runtime_a.metricsSnapshot();
 
     const talk_id = try runtime_a.sendTalkRequest(id_b, &pubkey_b, address_b, "test", "request");
+    var talk_cleanup = RuntimeRequestCleanup{ .runtime = runtime_a, .key = .init(endpoint_b, talk_id) };
+    defer talk_cleanup.deinit();
     var response_sent = false;
     for (0..2_000) |_| {
         while (runtime_b.popEvent()) |event_value| {
@@ -1942,19 +1973,51 @@ test "full EventOutbox cannot lose reliable pong nodes or talk response payloads
     }
     try std.testing.expect(response_sent);
     const talk_result = try awaitRequestResult(io, runtime_a);
+    talk_cleanup.consume();
     try expectRequestIdentity(&talk_result, endpoint_b, talk_id, .talkreq);
     try std.testing.expect(talk_result.terminal == .talk_response);
     try std.testing.expectEqualSlices(u8, "response bytes", talk_result.terminal.talk_response.slice());
     try std.testing.expect(runtime_a.popRequestResult() == null);
 
-    const snapshot = try runtime_a.metricsSnapshot();
-    try std.testing.expect(snapshot.dropped_event_count >= 1);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.droppedEventCount(.talk_resp_received));
+    const snapshot_full = try runtime_a.metricsSnapshot();
+    try std.testing.expectEqual(snapshot_before_talk.dropped_event_count, snapshot_full.dropped_event_count);
     var blocker = runtime_a.popEvent() orelse return error.MissingEventOutboxBlocker;
     defer blocker.deinit(alloc);
     try std.testing.expect(blocker == .local_enr_updated);
-    try std.testing.expect(runtime_a.popEvent() == null);
-    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime_a);
+    try expectNoRuntimeEvent(runtime_a, alloc);
+    var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime_a);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+
+    const empty_talk_id = try runtime_a.sendTalkRequest(id_b, &pubkey_b, address_b, "test", "second request");
+    var empty_talk_cleanup = RuntimeRequestCleanup{ .runtime = runtime_a, .key = .init(endpoint_b, empty_talk_id) };
+    defer empty_talk_cleanup.deinit();
+    response_sent = false;
+    for (0..2_000) |_| {
+        while (runtime_b.popEvent()) |event_value| {
+            var event = event_value;
+            defer event.deinit(alloc);
+            if (event == .talkreq and std.mem.eql(u8, event.talkreq.req_id.slice(), empty_talk_id.slice())) {
+                try runtime_b.sendTalkResponse(id_a, address_a, event.talkreq.req_id, "second response");
+                response_sent = true;
+            }
+        }
+        if (response_sent) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(response_sent);
+    const empty_talk_result = try awaitRequestResult(io, runtime_a);
+    empty_talk_cleanup.consume();
+    try expectRequestIdentity(&empty_talk_result, endpoint_b, empty_talk_id, .talkreq);
+    try std.testing.expect(empty_talk_result.terminal == .talk_response);
+    try std.testing.expectEqualSlices(u8, "second response", empty_talk_result.terminal.talk_response.slice());
+    try std.testing.expect(runtime_a.popRequestResult() == null);
+    try expectNoRuntimeEvent(runtime_a, alloc);
+    const snapshot_empty = try runtime_a.metricsSnapshot();
+    try std.testing.expectEqual(snapshot_full.dropped_event_count, snapshot_empty.dropped_event_count);
+
+    counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime_a);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
     try std.testing.expectEqual(@as(usize, 0), counts.permits);

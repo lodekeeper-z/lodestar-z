@@ -20,17 +20,6 @@ pub const TalkReqEvent = struct {
     }
 };
 
-pub const TalkRespEvent = struct {
-    peer_id: types.NodeId,
-    peer_addr: types.Address,
-    req_id: message.ReqId,
-    response: []u8,
-
-    pub fn deinit(self: *TalkRespEvent, alloc: Allocator) void {
-        alloc.free(self.response);
-    }
-};
-
 pub const EnrAddedEvent = struct {
     node_id: types.NodeId,
     addr: types.Address,
@@ -49,7 +38,6 @@ pub const EventKind = enum {
     enr_added,
     multiaddr_updated,
     talk_req_received,
-    talk_resp_received,
     session_established,
     peer_disconnected,
 
@@ -59,7 +47,6 @@ pub const EventKind = enum {
             .enr_added => 1,
             .multiaddr_updated => 2,
             .talk_req_received => 3,
-            .talk_resp_received => 4,
             .session_established => 5,
             .peer_disconnected => 6,
         };
@@ -72,20 +59,20 @@ pub const EventKind = enum {
             .enr_added => "enrAdded",
             .multiaddr_updated => "multiaddrUpdated",
             .talk_req_received => "talkReqReceived",
-            .talk_resp_received => "talkRespReceived",
             .session_established => "established",
             .peer_disconnected => "disconnected",
         };
     }
 };
 
-pub const event_kind_count = @typeInfo(EventKind).@"enum".fields.len;
+/// Dense metric storage preserves the retired TALK response observation at
+/// slot 4 so surviving public event-kind indices remain stable.
+pub const event_kind_count = 7;
 
 /// Best-effort observations only. Initiated request and lookup terminal outcomes
 /// are delivered through the reserved RequestResult and LookupResult outboxes.
 pub const Event = union(enum) {
     talkreq: TalkReqEvent,
-    talkresp: TalkRespEvent,
     discovered_enr: struct { raw: enr.RawEnr, enr: enr.Enr },
     enr_added: EnrAddedEvent,
     local_enr_updated: struct { seq: u64, enr: []u8 },
@@ -98,7 +85,6 @@ pub const Event = union(enum) {
             .enr_added => .enr_added,
             .local_enr_updated => .multiaddr_updated,
             .talkreq => .talk_req_received,
-            .talkresp => .talk_resp_received,
             .peer_connected => .session_established,
             .peer_disconnected => .peer_disconnected,
         };
@@ -113,7 +99,6 @@ pub const Event = union(enum) {
         switch (self.*) {
             .discovered_enr, .peer_connected, .peer_disconnected => {},
             .talkreq => |*value| value.deinit(alloc),
-            .talkresp => |*value| value.deinit(alloc),
             .enr_added => |*value| value.deinit(alloc),
             .local_enr_updated => |value| alloc.free(value.enr),
         }
@@ -219,6 +204,7 @@ test "event outbox drops and deinitializes owned payloads when full" {
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedEventCount(.multiaddr_updated));
     const counts = outbox.droppedEventCounts();
     try std.testing.expectEqual(@as(u64, 1), counts[EventKind.multiaddr_updated.index()]);
+    try std.testing.expectEqual(@as(u64, 0), counts[4]);
 }
 
 test "payload drops are classified by intended event kind" {
@@ -233,6 +219,8 @@ test "payload drops are classified by intended event kind" {
     try std.testing.expectEqual(@as(u64, 3), outbox.droppedCount());
     try std.testing.expectEqual(@as(u64, 2), outbox.droppedEventCount(.talk_req_received));
     try std.testing.expectEqual(@as(u64, 1), outbox.droppedEventCount(.enr_added));
+    const counts = outbox.droppedEventCounts();
+    try std.testing.expectEqual(@as(u64, 0), counts[4]);
 }
 
 test "every event maps to a stable kind and TS-aligned event name" {
@@ -251,11 +239,6 @@ test "every event maps to a stable kind and TS-aligned event name" {
             .event = .{ .talkreq = .{ .peer_id = peer_id, .peer_addr = addr, .req_id = req_id, .protocol = empty, .request = empty } },
             .kind = .talk_req_received,
             .name = "talkReqReceived",
-        },
-        .{
-            .event = .{ .talkresp = .{ .peer_id = peer_id, .peer_addr = addr, .req_id = req_id, .response = empty } },
-            .kind = .talk_resp_received,
-            .name = "talkRespReceived",
         },
         .{
             .event = .{ .discovered_enr = .{ .raw = .{}, .enr = undefined } },
@@ -293,7 +276,10 @@ test "every event maps to a stable kind and TS-aligned event name" {
 test "EventKind is root exported for stable classification" {
     try std.testing.expect(@import("root.zig").EventKind == EventKind);
     try std.testing.expect(@import("root.zig").Event == Event);
-    try std.testing.expectEqual(event_kind_count, @typeInfo(EventKind).@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 6), @typeInfo(EventKind).@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 7), event_kind_count);
     try std.testing.expectEqualStrings("talkReqReceived", EventKind.talk_req_received.label());
     try std.testing.expectEqual(@as(usize, 3), EventKind.talk_req_received.index());
+    try std.testing.expectEqual(@as(usize, 5), EventKind.session_established.index());
+    try std.testing.expectEqual(@as(usize, 6), EventKind.peer_disconnected.index());
 }

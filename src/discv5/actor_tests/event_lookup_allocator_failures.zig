@@ -99,49 +99,7 @@ test "event payload allocation failure preserves Actor state and counts one drop
     try std.testing.expect(outbox.pop() == null);
 }
 
-test "response payload allocation failure still completes and releases permit" {
-    const alloc = std.testing.allocator;
-    const io = std.Options.debug_io;
-    const local_key = try secp.keyPairFromSecret(&([_]u8{0x60} ** 32));
-    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
-    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x63} ** 32));
-    const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
-    const endpoint = types.Endpoint{
-        .node_id = remote_id,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 23 }, .port = 9023 } },
-    };
-    const cfg = config.Config{
-        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
-        .local_key_pair = local_key,
-        .local_node_id = local_id,
-        .rate_limiter = null,
-        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
-    };
-    var harness = try ActorHarness.init(alloc, io, cfg);
-    defer harness.deinit();
-    const actor = &harness.actor;
-    const stable = session_book.StableSession{ .initiator_key = [_]u8{0x64} ** 16, .recipient_key = [_]u8{0x65} ** 16 };
-    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const req_id = try actor.sendTalkRequest(harness.env(), endpoint, &remote_pubkey, "test", "request");
-    const response = message.TalkResp{ .req_id = req_id, .response = "allocation must fail" };
-    var response_buffer: [128]u8 = undefined;
-    const plaintext = try response.encodeInto(&response_buffer);
-    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    actor.alloc = failing.allocator();
-    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, plaintext, 10);
-    actor.alloc = alloc;
-
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
-    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedEventCount(.talk_resp_received));
-    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedEventCount(.talk_req_received));
-    try std.testing.expect(harness.outbox.pop() == null);
-}
-
-test "full event outbox preserves completion and queued drain with one owned drop" {
+test "full event outbox preserves non-reliable completion and queued drain without an event" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x64} ** 32));
@@ -174,13 +132,22 @@ test "full event outbox preserves completion and queued drain with one owned dro
 
     const response = message.TalkResp{ .req_id = talk_id, .response = "owned response" };
     var response_buffer: [128]u8 = undefined;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    actor.alloc = failing.allocator();
+    defer actor.alloc = alloc;
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try response.encodeInto(&response_buffer), 11);
-    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
+    actor.alloc = alloc;
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
     try std.testing.expect(actor.requests.get(.init(endpoint, talk_id)) == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expect(actor.requests.get(.init(endpoint, queued_id)) != null);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
+    var blocker = harness.outbox.pop() orelse return error.MissingEventOutboxBlocker;
+    defer blocker.deinit(alloc);
+    try std.testing.expect(blocker == .local_enr_updated);
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "maintenance removes every expired lookup and retains live lookups" {

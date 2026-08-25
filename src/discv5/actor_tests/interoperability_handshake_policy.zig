@@ -8,11 +8,53 @@ const outbound = @import("../flow/outbound.zig");
 const handshake = @import("../protocol/handshake.zig");
 const message = @import("../protocol/message.zig");
 const packet = @import("../protocol/packet.zig");
+const request_results = @import("../request_results.zig");
 const session_crypto = @import("../protocol/session.zig");
 const secp = @import("../secp256k1.zig");
 const types = @import("../types.zig");
 const PacketLink = @import("../test_support/packet_link.zig").PacketLink;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
+
+fn expectNoEvent(outbox: *events.EventOutbox, alloc: std.mem.Allocator) !void {
+    var event = outbox.pop() orelse return;
+    defer event.deinit(alloc);
+    return error.UnexpectedEvent;
+}
+
+const ReliableRequestCleanup = struct {
+    actor: *actor_mod.Actor,
+    env: actor_mod.Env,
+    results: *request_results.RequestResultOutbox,
+    key: ?types.RequestKey = null,
+    state: enum { unclaimed, claimed, consumed } = .unclaimed,
+
+    fn claim(self: *ReliableRequestCleanup, key: types.RequestKey) void {
+        if (!self.results.claim()) unreachable;
+        self.key = key;
+        self.state = .claimed;
+    }
+
+    fn consume(self: *ReliableRequestCleanup) void {
+        std.debug.assert(self.state == .claimed);
+        self.state = .consumed;
+    }
+
+    fn deinit(self: *ReliableRequestCleanup) void {
+        switch (self.state) {
+            .unclaimed => self.results.cancelUnclaimed(),
+            .consumed => {},
+            .claimed => {
+                const key = self.key.?;
+                if (self.actor.requests.get(key) != null) {
+                    if (!self.actor.cancelRequest(self.env, key)) unreachable;
+                }
+                if (self.results.pop() != null) return;
+                std.debug.assert(self.actor.requests.get(key) == null);
+                self.results.release();
+            },
+        }
+    }
+};
 
 test "WHOAREYOU permit admits a valid HANDSHAKE through an exhausted source quota" {
     const alloc = std.testing.allocator;
@@ -145,6 +187,8 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer outbox_a.deinit();
     var outbox_b = try events.EventOutbox.init(io, alloc, limits.event_capacity);
     defer outbox_b.deinit();
+    var results_a = try request_results.RequestResultOutbox.init(io, alloc, 1);
+    defer results_a.deinit();
     var actor_a = try actor_mod.Actor.init(alloc, config_a);
     defer actor_a.deinit(&ingress_a);
     var actor_b = try actor_mod.Actor.init(alloc, config_b);
@@ -153,8 +197,10 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
-    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b });
-    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, .{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a });
+    const env_a = actor_mod.Env{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a, .request_results = &results_a };
+    const env_b = actor_mod.Env{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b };
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, env_b);
+    var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a);
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
@@ -165,7 +211,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();
 
-    try std.testing.expect(outbox_a.pop() == null);
+    try expectNoEvent(&outbox_a, alloc);
     try std.testing.expect(actor_a.requests.get(.init(.{ .node_id = id_b, .addr = address_b }, ping_id)) == null);
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
@@ -173,7 +219,11 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expect(actor_b.sessions.get(.{ .node_id = id_a, .addr = address_a }, now_ns) != null);
 
     try std.testing.expect(ingress_a.admit(address_b, 0) == .ordinary);
-    const talk_id = try actor_a.sendTalkRequest(.{ .io = io, .sender = sender_a.sender(), .ingress = &ingress_a, .outbox = &outbox_a }, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, "test", "request");
+    try std.testing.expect(results_a.reserve());
+    var result_cleanup = ReliableRequestCleanup{ .actor = &actor_a, .env = env_a, .results = &results_a };
+    defer result_cleanup.deinit();
+    const talk_id = try actor_a.sendTalkRequestWithOrigin(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, "test", "request", .reliable_api);
+    result_cleanup.claim(.init(.{ .node_id = id_b, .addr = address_b }, talk_id));
 
     const unrelated_ping_id = try actor_b.sendPing(
         .{ .io = io, .sender = sender_b.sender(), .ingress = &ingress_b, .outbox = &outbox_b },
@@ -214,10 +264,16 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer response_credit.rollback(&ingress_a);
     try link_b_to_a.deliverNextExpected(&response_credit);
     try std.testing.expect(!response_credit.armed);
-    var response_event = outbox_a.pop() orelse return error.MissingTalkResponse;
-    defer response_event.deinit(alloc);
-    try std.testing.expect(response_event == .talkresp);
-    try std.testing.expectEqualStrings("response", response_event.talkresp.response);
+    const response_result = results_a.pop() orelse return error.MissingTalkResponse;
+    result_cleanup.consume();
+    try std.testing.expectEqual(types.RequestKind.talkreq, response_result.kind);
+    try std.testing.expect(response_result.key.endpoint.addr.eql(&address_b));
+    try std.testing.expectEqual(id_b, response_result.key.endpoint.node_id);
+    try std.testing.expectEqualSlices(u8, talk_id.slice(), response_result.key.req_id.slice());
+    try std.testing.expect(response_result.terminal == .talk_response);
+    try std.testing.expectEqualStrings("response", response_result.terminal.talk_response.slice());
+    try std.testing.expect(results_a.pop() == null);
+    try expectNoEvent(&outbox_a, alloc);
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
 
@@ -255,7 +311,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     defer discovered_event.deinit(alloc);
     try std.testing.expect(discovered_event == .discovered_enr);
     try std.testing.expectEqualSlices(u8, enr_d, discovered_event.discovered_enr.raw.slice());
-    try std.testing.expect(outbox_a.pop() == null);
+    try expectNoEvent(&outbox_a, alloc);
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
 }

@@ -101,6 +101,19 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             };
         }
 
+        /// Reconcile a claimed reservation after a test has used cancelRequest
+        /// as an actor-loop barrier and still observed no public terminal.
+        pub fn reconcileClaimedRequest(runtime: *Runtime, key: types.RequestKey) void {
+            const storage = impl(runtime);
+            std.debug.assert(storage.actor.requests.get(key) == null);
+            if (storage.request_result_outbox.pop()) |result| {
+                std.debug.assert(types.RequestKeyContext.eql(.{}, result.key, key));
+                return;
+            }
+            std.debug.assert(storage.actor.requests.get(key) == null);
+            storage.request_result_outbox.release();
+        }
+
         pub fn acquireAdmission(runtime: *Runtime, address: types.Address, budget: u16) !admission.AdmissionPermit {
             return impl(runtime).admission.acquire(address, budget);
         }

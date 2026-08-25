@@ -241,16 +241,6 @@ fn handleTalkResp(actor: *Actor, env: Env, plaintext: []const u8, endpoint: type
         .{ .success = &.{} },
         .{ .talk_response = types.PacketBytes.init(response.response) catch unreachable },
     )) return;
-    const copy = actor.alloc.dupe(u8, response.response) catch {
-        env.outbox.notePayloadDrop(.talk_resp_received);
-        return;
-    };
-    env.outbox.publish(.{ .talkresp = .{
-        .peer_id = endpoint.node_id,
-        .peer_addr = endpoint.addr,
-        .req_id = response.req_id,
-        .response = copy,
-    } });
 }
 
 fn matchesDistances(node_id: *const types.NodeId, responder: *const types.NodeId, accumulator: *const request_book.NodesAccumulator) bool {
