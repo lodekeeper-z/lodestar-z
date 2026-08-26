@@ -123,11 +123,11 @@ fn prepareDispatch(
 }
 
 pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) !void {
+    const retained_plaintext = types.RecoverablePlaintext.init(plaintext) catch return error.MessageTooLarge;
     const now_ns = nowNs(env.io);
     const stable = actor.sessions.get(endpoint, now_ns) orelse return error.NoSession;
     const known = actor.peers.known(&endpoint.node_id) orelse return error.UnknownPeer;
     if (!known.addr.eql(&endpoint.addr)) return error.EndpointMismatch;
-    const retained_plaintext = try types.PacketBytes.init(plaintext);
     var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     var encoded: Encoded = undefined;
     var attempts: usize = 0;

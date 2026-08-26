@@ -17,7 +17,6 @@ const rpc = @import("rpc.zig");
 const Actor = actor_mod.Actor;
 const Env = actor_mod.Env;
 
-const MAX_HANDSHAKE_AUTHDATA: usize = 34 + @as(usize, handshake.sig_size) + @as(usize, handshake.eph_key_size) + enr.MAX_ENR_SIZE;
 const MAX_EPHEMERAL_KEY_ATTEMPTS: usize = 32;
 
 const WhoareyouSource = actor_mod.WhoareyouSource;
@@ -144,6 +143,11 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         else => return,
     };
     env.commitExpected();
+    var response_recovery_transferred = false;
+    defer if (!response_recovery_transferred) switch (source) {
+        .request => {},
+        .response => |view| _ = actor.responses.failRecovery(view, env.ingress),
+    };
     const recovery: RecoveryMaterial = switch (source) {
         .request => |preparation| .{
             .endpoint = preparation.handle.key.endpoint,
@@ -153,7 +157,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         .response => |view| .{
             .endpoint = view.endpoint,
             .dest_pubkey = view.dest_pubkey,
-            .plaintext = view.plaintext,
+            .plaintext = types.PacketBytes.init(view.plaintext.slice()) catch unreachable,
         },
     };
     const remote_seq = std.mem.readInt(u64, parsed.authdata_raw[16..24], .big);
@@ -178,7 +182,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         &recovery.endpoint.node_id,
     ) catch return;
     const local_enr: []const u8 = if (actor.local.raw) |*raw| if (remote_seq < actor.local.seq) raw.slice() else &.{} else &.{};
-    var authdata_buffer: [MAX_HANDSHAKE_AUTHDATA]u8 = undefined;
+    var authdata_buffer: [handshake.MAX_AUTHDATA_SIZE]u8 = undefined;
     const authdata = handshake.buildAuthdata(
         &authdata_buffer,
         actor.local_node_id,
@@ -215,12 +219,13 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
     } };
     const effects = env.effects orelse unreachable;
     effects.push(effect) catch return;
+    response_recovery_transferred = true;
 }
 
 fn failRequestRecovery(actor: *Actor, env: Env, source: WhoareyouSource, failure: request_results.RequestSendFailure) void {
     switch (source) {
         .request => |preparation| _ = completion.finish(actor, env, preparation.handle.key, .failure, .{ .send_failure = failure }),
-        .response => {},
+        .response => |view| _ = actor.responses.failRecovery(view, env.ingress),
     }
 }
 

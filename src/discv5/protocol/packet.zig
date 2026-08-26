@@ -23,6 +23,15 @@ pub const ID_NONCE_SIZE = 16;
 pub const WHOAREYOU_AUTHDATA_SIZE = ID_NONCE_SIZE + 8;
 pub const WHOAREYOU_CHALLENGE_DATA_SIZE = MASKING_IV_SIZE + STATIC_HEADER_SIZE + WHOAREYOU_AUTHDATA_SIZE;
 pub const MAX_ORDINARY_MESSAGE_SIZE = MAX_PACKET_SIZE - MASKING_IV_SIZE - STATIC_HEADER_SIZE - NODE_ID_SIZE - GCM_TAG_SIZE;
+const MAX_RECOVERY_OVERHEAD = MASKING_IV_SIZE + STATIC_HEADER_SIZE + handshake.MAX_AUTHDATA_SIZE + GCM_TAG_SIZE;
+pub const MAX_RECOVERABLE_PLAINTEXT_SIZE = std.math.sub(usize, MAX_PACKET_SIZE, MAX_RECOVERY_OVERHEAD) catch
+    @compileError("maximum handshake framing exceeds the discv5 packet size");
+
+comptime {
+    std.debug.assert(MAX_RECOVERY_OVERHEAD <= MAX_PACKET_SIZE);
+    std.debug.assert(MAX_RECOVERABLE_PLAINTEXT_SIZE == 794);
+    std.debug.assert(MAX_RECOVERY_OVERHEAD + MAX_RECOVERABLE_PLAINTEXT_SIZE == MAX_PACKET_SIZE);
+}
 
 /// Whether an ordinary packet with fixed NodeId authdata fits the wire limit.
 /// Layout: masking IV || static header || NodeId authdata || plaintext || GCM tag.
@@ -588,6 +597,46 @@ test "discv5 packet: ordinary message plaintext fit boundary" {
     try std.testing.expect(ordinaryMessageFits(max_plaintext));
     try std.testing.expect(!ordinaryMessageFits(max_plaintext + 1));
     try std.testing.expect(!ordinaryMessageFits(std.math.maxInt(usize)));
+}
+
+test "discv5 packet: recoverable plaintext exact maximum handshake boundary" {
+    try std.testing.expectEqual(@as(usize, 794), MAX_RECOVERABLE_PLAINTEXT_SIZE);
+    try std.testing.expectEqual(
+        MAX_PACKET_SIZE,
+        MASKING_IV_SIZE + STATIC_HEADER_SIZE + handshake.MAX_AUTHDATA_SIZE + MAX_RECOVERABLE_PLAINTEXT_SIZE + GCM_TAG_SIZE,
+    );
+
+    const node_id = [_]u8{0x11} ** NODE_ID_SIZE;
+    const nonce = [_]u8{0x22} ** NONCE_SIZE;
+    const masking_iv = [_]u8{0x33} ** MASKING_IV_SIZE;
+    const key = [_]u8{0x44} ** 16;
+    var authdata = [_]u8{0x55} ** handshake.MAX_AUTHDATA_SIZE;
+    authdata[32] = handshake.sig_size;
+    authdata[33] = handshake.eph_key_size;
+    const maximum_plaintext = [_]u8{0x66} ** MAX_RECOVERABLE_PLAINTEXT_SIZE;
+    var buffer: [MAX_PACKET_SIZE]u8 = undefined;
+
+    const maximum = try encodeMessagePacketInto(&buffer, .{
+        .kind = .handshake,
+        .masking_iv = &masking_iv,
+        .recipient_node_id = &node_id,
+        .nonce = &nonce,
+        .authdata = &authdata,
+        .write_key = &key,
+        .plaintext = &maximum_plaintext,
+    });
+    try std.testing.expectEqual(MAX_PACKET_SIZE, maximum.len);
+
+    const oversized_plaintext = [_]u8{0x77} ** (MAX_RECOVERABLE_PLAINTEXT_SIZE + 1);
+    try std.testing.expectError(error.InvalidPacket, encodeMessagePacketInto(&buffer, .{
+        .kind = .handshake,
+        .masking_iv = &masking_iv,
+        .recipient_node_id = &node_id,
+        .nonce = &nonce,
+        .authdata = &authdata,
+        .write_key = &key,
+        .plaintext = &oversized_plaintext,
+    }));
 }
 
 test "discv5 packet: AES-CTR masking round-trip" {

@@ -1571,6 +1571,121 @@ test "WHOAREYOU and response send failures release prepared permits and retained
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
 }
 
+test "established session rejects 1100 byte TALK response before recovery ownership" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x6a} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x6b} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 52 }, .port = 9252 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .response_recovery_capacity = 1, .event_capacity = 1, .command_capacity = 1 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xc1} ** 16,
+        .recipient_key = [_]u8{0xc2} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+    const response = [_]u8{0x5a} ** 1_100;
+
+    try std.testing.expectError(error.MessageTooLarge, actor.sendTalkResponse(
+        harness.env(),
+        endpoint,
+        try message.ReqId.fromSlice(&.{1}),
+        &response,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), harness.effects.count());
+    try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), actor.responses.count());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    const unchanged = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingStableSession;
+    try std.testing.expectEqual(stable.initiator_key, unchanged.initiator_key);
+    try std.testing.expectEqual(stable.recipient_key, unchanged.recipient_key);
+}
+
+test "matched WHOAREYOU enqueue failure removes exact response recovery once" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x6c} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x6d} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 53 }, .port = 9253 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .response_recovery_capacity = 2, .event_capacity = 1, .command_capacity = 1 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
+    actor.sessions.put(endpoint, .{
+        .initiator_key = [_]u8{0xd1} ** 16,
+        .recipient_key = [_]u8{0xd2} ** 16,
+    }, outbound.nowNs(io));
+
+    try actor.sendTalkResponse(harness.env(), endpoint, try message.ReqId.fromSlice(&.{1}), "retained");
+    try harness.drainEffects();
+    var first_datagram = harness.recording.datagrams.items[0].bytes;
+    const retained_nonce = (try packet.decode(first_datagram.bytes[0..first_datagram.len], &remote_id)).static_header.nonce;
+    try std.testing.expectEqual(@as(usize, 1), actor.responses.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+
+    // Keep a second prepared response in a separate capacity-one effect queue so
+    // the matching response handshake cannot be enqueued.
+    try actor.sendTalkResponse(harness.env(), endpoint, try message.ReqId.fromSlice(&.{2}), "queue filler");
+    const filler = harness.effects.pop() orelse return error.MissingFillerEffect;
+    var full_storage: [1]actor_mod.ActorEffect = undefined;
+    var full_effects = actor_mod.EffectQueue.init(&full_storage);
+    try full_effects.push(filler);
+    var full_env = harness.env();
+    full_env.effects = &full_effects;
+    try std.testing.expectEqual(@as(usize, 1), full_effects.count());
+    try std.testing.expectEqual(@as(usize, 2), harness.ingress.permitCount());
+
+    var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    _ = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
+        .masking_iv = &([_]u8{0xde} ** packet.MASKING_IV_SIZE),
+        .recipient_node_id = &local_id,
+        .request_nonce = &retained_nonce,
+        .id_nonce = &([_]u8{0xdf} ** packet.ID_NONCE_SIZE),
+        .enr_seq = 0,
+    }, null);
+    const replay = challenge_buffer;
+    actor.handlePacket(full_env, &challenge_buffer, endpoint.addr);
+    try std.testing.expectEqual(@as(usize, 0), actor.responses.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), full_effects.count());
+    try std.testing.expect(full_effects.storage[full_effects.head] == .response);
+
+    var duplicate = replay;
+    actor.handlePacket(full_env, &duplicate, endpoint.addr);
+    try std.testing.expectEqual(@as(usize, 0), actor.responses.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), full_effects.count());
+
+    const retained_filler = full_effects.pop() orelse return error.MissingFillerEffect;
+    actor.applyEffectCompletion(full_env, retained_filler, .failed);
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+}
+
 test "transactional capacity-one challenge replacement send failure preserves original" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;

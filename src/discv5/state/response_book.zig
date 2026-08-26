@@ -6,22 +6,28 @@ const packet = @import("../protocol/packet.zig");
 const types = @import("../types.zig");
 
 const Allocator = std.mem.Allocator;
-const RecoveryCache = lru.LruCache(types.ChallengeKey, Recovery);
+const RecoveryCache = lru.LruCache(types.ChallengeKey, StoredRecovery);
 const CandidateCache = lru.LruCacheWithContext(types.Endpoint, CandidateKeys, types.EndpointContext);
 
 pub const Recovery = struct {
     endpoint: types.Endpoint,
     nonce: [packet.NONCE_SIZE]u8,
     dest_pubkey: [33]u8,
-    plaintext: types.PacketBytes,
+    plaintext: types.RecoverablePlaintext,
     admission: admission_mod.AdmissionPermit,
+};
+
+const StoredRecovery = struct {
+    recovery: Recovery,
+    generation: u64,
 };
 
 pub const ChallengeView = struct {
     endpoint: types.Endpoint,
     nonce: [packet.NONCE_SIZE]u8,
     dest_pubkey: [33]u8,
-    plaintext: types.PacketBytes,
+    plaintext: types.RecoverablePlaintext,
+    generation: u64,
 };
 
 pub const CandidateKeys = struct {
@@ -33,6 +39,7 @@ pub const ResponseBook = struct {
     recoveries: RecoveryCache,
     candidates: CandidateCache,
     timeout_ms: u64,
+    next_generation: u64 = 1,
 
     pub fn init(alloc: Allocator, config: config_mod.Config) !ResponseBook {
         var recoveries = try RecoveryCache.init(alloc, config.limits.response_recovery_capacity);
@@ -48,7 +55,7 @@ pub const ResponseBook = struct {
         var removed: usize = 0;
         while (removed < self.recoveries.capacity()) : (removed += 1) {
             const entry = self.recoveries.popLruMove() orelse break;
-            cleanup(entry.value, admission);
+            cleanup(entry.value.recovery, admission);
         }
         removed = 0;
         while (removed < self.candidates.capacity()) : (removed += 1) {
@@ -71,8 +78,10 @@ pub const ResponseBook = struct {
         admission: *admission_mod.IngressAdmission,
     ) void {
         const key = types.ChallengeKey.init(recovery.endpoint.addr, &recovery.nonce);
-        if (self.recoveries.putMove(key, recovery, self.timeout_ms, now_ns)) |removed|
-            cleanup(removed.value, admission);
+        const generation = self.next_generation;
+        self.next_generation = std.math.add(u64, self.next_generation, 1) catch unreachable;
+        if (self.recoveries.putMove(key, .{ .recovery = recovery, .generation = generation }, self.timeout_ms, now_ns)) |removed|
+            cleanup(removed.value.recovery, admission);
     }
 
     pub fn hasLive(self: *const ResponseBook, address: types.Address, nonce: *const [packet.NONCE_SIZE]u8, now_ns: i64) bool {
@@ -87,7 +96,7 @@ pub const ResponseBook = struct {
         admission: *admission_mod.IngressAdmission,
     ) void {
         const removed = self.recoveries.takeExpiredMove(.init(address, nonce), now_ns) orelse return;
-        cleanup(removed, admission);
+        cleanup(removed.recovery, admission);
     }
 
     pub fn challenge(
@@ -100,10 +109,11 @@ pub const ResponseBook = struct {
         self.removeExpired(address, nonce, now_ns, admission);
         const recovery = self.recoveries.peekPtr(.init(address, nonce), now_ns) orelse return null;
         return .{
-            .endpoint = recovery.endpoint,
-            .nonce = recovery.nonce,
-            .dest_pubkey = recovery.dest_pubkey,
-            .plaintext = recovery.plaintext,
+            .endpoint = recovery.recovery.endpoint,
+            .nonce = recovery.recovery.nonce,
+            .dest_pubkey = recovery.recovery.dest_pubkey,
+            .plaintext = recovery.recovery.plaintext,
+            .generation = recovery.generation,
         };
     }
 
@@ -114,7 +124,17 @@ pub const ResponseBook = struct {
         admission: *admission_mod.IngressAdmission,
     ) bool {
         const recovery = self.recoveries.takeMove(.init(address, nonce)) orelse return false;
-        cleanup(recovery, admission);
+        cleanup(recovery.recovery, admission);
+        return true;
+    }
+
+    pub fn failRecovery(self: *ResponseBook, view: ChallengeView, admission: *admission_mod.IngressAdmission) bool {
+        const key = types.ChallengeKey.init(view.endpoint.addr, &view.nonce);
+        const current = self.recoveries.peekPtrRaw(key) orelse return false;
+        if (current.generation != view.generation or
+            !types.EndpointContext.eql(.{}, current.recovery.endpoint, view.endpoint)) return false;
+        const recovery = self.recoveries.takeMove(key) orelse unreachable;
+        cleanup(recovery.recovery, admission);
         return true;
     }
 
@@ -126,8 +146,9 @@ pub const ResponseBook = struct {
         admission: *admission_mod.IngressAdmission,
     ) void {
         const recovery = self.recoveries.takeMove(.init(view.endpoint.addr, &view.nonce)) orelse unreachable;
-        std.debug.assert(types.EndpointContext.eql(.{}, recovery.endpoint, view.endpoint));
-        cleanup(recovery, admission);
+        std.debug.assert(recovery.generation == view.generation);
+        std.debug.assert(types.EndpointContext.eql(.{}, recovery.recovery.endpoint, view.endpoint));
+        cleanup(recovery.recovery, admission);
         _ = self.candidates.putMove(view.endpoint, keys, self.timeout_ms, now_ns);
     }
 
@@ -143,7 +164,7 @@ pub const ResponseBook = struct {
         var pruned: usize = 0;
         while (pruned < self.recoveries.capacity()) : (pruned += 1) {
             const removed = self.recoveries.popExpiredLruMove(now_ns) orelse break;
-            cleanup(removed.value, admission);
+            cleanup(removed.value.recovery, admission);
         }
         pruned = 0;
         while (pruned < self.candidates.capacity()) : (pruned += 1) {
@@ -213,6 +234,34 @@ test "response candidates are key-only bounded expiring and shutdown-clean" {
     try putTestCandidate(&book, &admission, 4, 2 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(usize, 1), book.count());
     try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
+}
+
+test "exact failed response recovery releases once and stale replay preserves newer recovery" {
+    const alloc = std.testing.allocator;
+    var admission = try admission_mod.IngressAdmission.init(alloc, null, 2);
+    defer admission.deinit();
+    const key_pair = @import("../secp256k1.zig").KeyPair.generate(std.Options.debug_io);
+    var book = try ResponseBook.init(alloc, .{
+        .bind_addresses = .{ .ip4 = testAddress(1) },
+        .local_key_pair = key_pair,
+        .limits = .{ .response_recovery_capacity = 2 },
+    });
+    defer book.deinit(alloc, &admission);
+
+    try putTestRecovery(&book, &admission, 1, 0);
+    const nonce_one = [_]u8{1} ** packet.NONCE_SIZE;
+    const matched = book.challenge(testAddress(1), &nonce_one, 0, &admission) orelse return error.MissingRecovery;
+    try std.testing.expectEqual(@as(usize, 1), admission.permitCount());
+
+    try std.testing.expect(book.failRecovery(matched, &admission));
+    try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
+
+    // Reuse the exact address and nonce with a newer recovery generation. The
+    // stale matched view must not remove it or release its permit.
+    try putTestRecovery(&book, &admission, 1, 0);
+    try std.testing.expect(!book.failRecovery(matched, &admission));
+    try std.testing.expectEqual(@as(usize, 1), admission.permitCount());
+    try std.testing.expect(book.hasLive(testAddress(1), &nonce_one, 0));
 }
 
 fn putTestRecovery(book: *ResponseBook, admission: *admission_mod.IngressAdmission, byte: u8, now_ns: i64) !void {

@@ -16,7 +16,9 @@ pub const sig_size: u8 = 64;
 /// Ephemeral compressed-pubkey size in handshake authdata.
 pub const eph_key_size: u8 = 33;
 /// authdata-head = src-id (32) || sig-size (1) || eph-key-size (1).
-const authdata_head_size: usize = 34;
+pub const AUTHDATA_HEAD_SIZE: usize = 34;
+pub const RECORDLESS_AUTHDATA_SIZE: usize = AUTHDATA_HEAD_SIZE + @as(usize, sig_size) + @as(usize, eph_key_size);
+pub const MAX_AUTHDATA_SIZE: usize = RECORDLESS_AUTHDATA_SIZE + enr_mod.MAX_ENR_SIZE;
 
 pub const Error = error{
     ShortAuthdata,
@@ -41,19 +43,19 @@ pub const Authdata = struct {
 ///   authdata = src-id (32) || sig-size (1) || eph-key-size (1)
 ///              || id-signature (64) || eph-pubkey (33) || [record]
 pub fn parseAuthdata(authdata: []const u8) Error!Authdata {
-    if (authdata.len < authdata_head_size) return Error.ShortAuthdata;
+    if (authdata.len < AUTHDATA_HEAD_SIZE) return Error.ShortAuthdata;
 
     const declared_sig = authdata[32];
     const declared_eph = authdata[33];
-    if (authdata.len < authdata_head_size + @as(usize, declared_sig) + @as(usize, declared_eph))
+    if (authdata.len < AUTHDATA_HEAD_SIZE + @as(usize, declared_sig) + @as(usize, declared_eph))
         return Error.TruncatedAuthdata;
     if (declared_sig != sig_size or declared_eph != eph_key_size) return Error.BadAuthdataSizes;
 
-    const sig_end = authdata_head_size + @as(usize, sig_size);
+    const sig_end = AUTHDATA_HEAD_SIZE + @as(usize, sig_size);
     const eph_end = sig_end + @as(usize, eph_key_size);
     return .{
         .src_id = authdata[0..32].*,
-        .id_sig = authdata[authdata_head_size..][0..sig_size],
+        .id_sig = authdata[AUTHDATA_HEAD_SIZE..][0..sig_size],
         .eph_pubkey = authdata[sig_end..][0..eph_key_size],
         .maybe_enr = if (authdata.len > eph_end) authdata[eph_end..] else null,
     };
@@ -68,7 +70,7 @@ pub fn buildAuthdata(
     eph_pubkey: *const [eph_key_size]u8,
     enr_bytes: []const u8,
 ) Error![]u8 {
-    const sig_end = authdata_head_size + @as(usize, sig_size);
+    const sig_end = AUTHDATA_HEAD_SIZE + @as(usize, sig_size);
     const eph_end = sig_end + @as(usize, eph_key_size);
     const total = eph_end + enr_bytes.len;
     if (total > out.len) return Error.BufferTooSmall;
@@ -76,7 +78,7 @@ pub fn buildAuthdata(
     out[0..32].* = local_node_id;
     out[32] = sig_size;
     out[33] = eph_key_size;
-    @memcpy(out[authdata_head_size..sig_end], id_sig);
+    @memcpy(out[AUTHDATA_HEAD_SIZE..sig_end], id_sig);
     @memcpy(out[sig_end..eph_end], eph_pubkey);
     if (enr_bytes.len > 0) @memcpy(out[eph_end..total], enr_bytes);
     return out[0..total];
@@ -125,7 +127,7 @@ test "parseAuthdata carries the optional trailing ENR" {
 test "parseAuthdata rejects short and truncated authdata" {
     try std.testing.expectError(Error.ShortAuthdata, parseAuthdata(&[_]u8{ 0x00, 0x01 }));
 
-    var head = [_]u8{0} ** authdata_head_size;
+    var head = [_]u8{0} ** AUTHDATA_HEAD_SIZE;
     head[32] = sig_size;
     head[33] = eph_key_size;
     try std.testing.expectError(Error.TruncatedAuthdata, parseAuthdata(&head));
@@ -134,7 +136,7 @@ test "parseAuthdata rejects short and truncated authdata" {
 test "parseAuthdata rejects non-v4 sizes" {
     // Long enough to pass the truncation check (which runs first) so the
     // wrong-sizes check is what trips.
-    var buf = [_]u8{0} ** (authdata_head_size + 65 + eph_key_size);
+    var buf = [_]u8{0} ** (AUTHDATA_HEAD_SIZE + 65 + eph_key_size);
     buf[32] = 65; // wrong sig size
     buf[33] = eph_key_size;
     try std.testing.expectError(Error.BadAuthdataSizes, parseAuthdata(&buf));

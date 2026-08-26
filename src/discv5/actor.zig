@@ -148,7 +148,7 @@ pub const ResponseSendEffect = struct {
     endpoint: types.Endpoint,
     nonce: [packet.NONCE_SIZE]u8,
     dest_pubkey: [33]u8,
-    plaintext: types.PacketBytes,
+    plaintext: types.RecoverablePlaintext,
     packet: types.PacketBytes,
     admission: admission.AdmissionPermit,
     prepared_at_ns: i64,
@@ -453,7 +453,13 @@ pub const Actor = struct {
                 },
             },
             .handshake => |handshake_effect| {
-                if (completion_event != .sent) return;
+                if (completion_event != .sent) {
+                    switch (handshake_effect.source) {
+                        .request => {},
+                        .response => |view| _ = self.responses.failRecovery(view, env.ingress),
+                    }
+                    return;
+                }
                 switch (handshake_effect.source) {
                     .request => |preparation| self.requests.commitChallenge(preparation, .{
                         .initiator_key = handshake_effect.initiator_key,

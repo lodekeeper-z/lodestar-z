@@ -103,6 +103,13 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             return &self.nodes[index].value;
         }
 
+        /// Read a value without applying TTL policy. Exact terminal cleanup uses
+        /// this only to compare ownership before removing an already-matched entry.
+        pub fn peekPtrRaw(self: *const Self, key: K) ?*const V {
+            const index = self.map.get(key) orelse return null;
+            return &self.nodes[index].value;
+        }
+
         pub fn getRefreshPtr(self: *Self, key: K, ttl_ms: u64, now_ns: i64) ?*V {
             const index = self.map.get(key) orelse return null;
             if (self.isExpired(index, now_ns)) {

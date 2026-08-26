@@ -122,6 +122,22 @@ pub const PacketBytes = struct {
     }
 };
 
+pub const RecoverablePlaintext = struct {
+    bytes: [packet.MAX_RECOVERABLE_PLAINTEXT_SIZE]u8 = undefined,
+    len: u16 = 0,
+
+    pub fn init(data: []const u8) error{PacketTooLargeForRecovery}!RecoverablePlaintext {
+        if (data.len > packet.MAX_RECOVERABLE_PLAINTEXT_SIZE) return error.PacketTooLargeForRecovery;
+        var result = RecoverablePlaintext{ .len = @intCast(data.len) };
+        @memcpy(result.bytes[0..data.len], data);
+        return result;
+    }
+
+    pub fn slice(self: *const RecoverablePlaintext) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 fn hashAddress(hasher: *std.hash.Wyhash, addr: Address) void {
     switch (addr) {
         .ip4 => |ip4| {
@@ -135,6 +151,15 @@ fn hashAddress(hasher: *std.hash.Wyhash, addr: Address) void {
             std.hash.autoHash(hasher, ip6.port);
         },
     }
+}
+
+test "recoverable plaintext accepts 794 bytes and rejects 795" {
+    const maximum = [_]u8{0xaa} ** packet.MAX_RECOVERABLE_PLAINTEXT_SIZE;
+    const accepted = try RecoverablePlaintext.init(&maximum);
+    try std.testing.expectEqualSlices(u8, &maximum, accepted.slice());
+
+    const oversized = [_]u8{0xbb} ** (packet.MAX_RECOVERABLE_PLAINTEXT_SIZE + 1);
+    try std.testing.expectError(error.PacketTooLargeForRecovery, RecoverablePlaintext.init(&oversized));
 }
 
 test "request keys distinguish empty request ids" {
