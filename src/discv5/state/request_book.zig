@@ -339,27 +339,22 @@ pub const RequestBook = struct {
         return self.queued_total;
     }
 
-    pub const ReliableSnapshot = struct {
+    pub const RequestSnapshot = struct {
         key: types.RequestKey,
         kind: types.RequestKind,
     };
 
-    pub fn firstReliableActive(self: *const RequestBook) ?ReliableSnapshot {
+    pub fn firstActive(self: *const RequestBook) ?RequestSnapshot {
         var active = self.active.iterator();
-        while (active.next()) |entry| {
-            if (entry.value_ptr.origin != .reliable_api) continue;
-            return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.response.kind() };
-        }
-        return null;
+        const entry = active.next() orelse return null;
+        return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.response.kind() };
     }
 
-    pub fn firstReliableQueued(self: *const RequestBook) ?ReliableSnapshot {
+    pub fn firstQueuedRequest(self: *const RequestBook) ?RequestSnapshot {
         var lanes = self.lanes.iterator();
         while (lanes.next()) |entry| {
-            for (entry.value_ptr.queued.items.items[entry.value_ptr.queued.head..]) |queued| {
-                if (queued.origin != .reliable_api) continue;
-                return .{ .key = .init(queued.endpoint, queued.req_id), .kind = queued.kind };
-            }
+            const queued = entry.value_ptr.queued.first() orelse continue;
+            return .{ .key = .init(queued.endpoint, queued.req_id), .kind = queued.kind };
         }
         return null;
     }

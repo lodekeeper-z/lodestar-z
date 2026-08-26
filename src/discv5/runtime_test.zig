@@ -715,6 +715,10 @@ test "lookup send cancellation terminates active lookup as runtime stopped" {
     try std.testing.expectEqual(runtime_mod.LookupTerminalReason.runtime_stopped, result.reason);
     try std.testing.expect(runtime.popLookupResult() == null);
     try std.testing.expectError(error.Closed, runtime.nextLookupResult());
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
 }
 
 test "actor cancellation closes command intake before draining" {
@@ -1273,6 +1277,67 @@ test "lookup result capacity rejects before actor insertion or network work and 
     try std.testing.expectEqualSlices(u8, &network_target, &stopped.target);
     try std.testing.expectEqual(runtime_mod.LookupTerminalReason.runtime_stopped, stopped.reason);
     try std.testing.expect(runtime.popLookupResult() == null);
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+}
+
+test "shutdown detaches and removes queued lookup behind endpoint establishment" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x8b, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .max_queued_requests_per_endpoint = 2,
+        .event_capacity = 2,
+        .command_capacity = 4,
+        .lookup_result_capacity = 1,
+        .request_result_capacity = 1,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x8c} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 140 }, .port = 9140 } };
+    var remote_builder = enr.Builder.init(alloc, remote_key, 1);
+    remote_builder.ip = .{ 127, 0, 0, 140 };
+    remote_builder.udp = 9140;
+    const remote_enr = try remote_builder.encode();
+    defer alloc.free(remote_enr);
+    try std.testing.expect(try runtime.addNode(remote_id, &remote_pubkey, remote_address, remote_enr));
+
+    const ping_id = try runtime.sendPing(remote_id, &remote_pubkey, remote_address, 1);
+    const lookup_id = try runtime.startLookup([_]u8{0x8d} ** 32);
+    var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 1), counts.active);
+    try std.testing.expectEqual(@as(usize, 1), counts.queued);
+    try std.testing.expectEqual(@as(usize, 1), counts.permits);
+
+    running.stop();
+    try running.await();
+    try std.testing.expect(running.run_result == null);
+
+    const lookup_result = runtime.popLookupResult() orelse return error.MissingShutdownLookupResult;
+    try std.testing.expectEqual(lookup_id, lookup_result.lookup_id);
+    try std.testing.expectEqual(runtime_mod.LookupTerminalReason.runtime_stopped, lookup_result.reason);
+    try std.testing.expect(runtime.popLookupResult() == null);
+
+    const request_result = runtime.popRequestResult() orelse return error.MissingStoppedRequestResult;
+    try std.testing.expectEqualSlices(u8, ping_id.slice(), request_result.key.req_id.slice());
+    try std.testing.expect(request_result.terminal == .runtime_stopped);
+    try std.testing.expect(runtime.popRequestResult() == null);
+
+    counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
 }
 
 test "lookup timeout publishes a reliable timed out terminal result" {

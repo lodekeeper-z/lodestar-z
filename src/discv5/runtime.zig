@@ -327,7 +327,8 @@ const RuntimeImpl = struct {
         self.command_queue.close(self.io);
         // Commands carry caller-stack reply queues and, in some cases, owned
         // allocations. Intake closure bounds this drain by command capacity;
-        // execute accepted commands so neither replies nor ownership dangle.
+        // Abort accepted commands so neither replies nor ownership dangle and
+        // shutdown performs no new domain or transport work.
         self.drainAcceptedCommands();
         self.group.cancel(self.io);
         self.terminalize();
@@ -338,8 +339,8 @@ const RuntimeImpl = struct {
         if (self.terminalized.swap(true, .acq_rel)) return;
         self.abortEffects();
         const env = self.actorEnv();
-        self.actor.finishAllReliableRequests(env);
         self.actor.finishAllLookups(env, .runtime_stopped);
+        self.actor.finishAllRequests(env);
         self.request_result_outbox.close();
         self.lookup_result_outbox.close();
         self.outbox.close();

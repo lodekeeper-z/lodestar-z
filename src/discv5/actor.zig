@@ -871,23 +871,25 @@ pub const Actor = struct {
         result_outbox.publishAssumeReserved(.{ .key = key, .kind = kind, .terminal = terminal });
     }
 
-    pub fn finishAllReliableRequests(self: *Actor, env: Env) void {
+    pub fn finishAllRequests(self: *Actor, env: Env) void {
         var active_finished: usize = 0;
         while (active_finished < self.limits.max_active_requests) : (active_finished += 1) {
-            const snapshot = self.requests.firstReliableActive() orelse break;
+            const snapshot = self.requests.firstActive() orelse break;
             var active = self.requests.take(snapshot.key) orelse unreachable;
+            std.debug.assert(std.meta.activeTag(active.origin) != .lookup);
             self.publishRequestTerminal(env, snapshot.key, snapshot.kind, active.origin, .runtime_stopped);
             active.admission.release(env.ingress);
         }
-        std.debug.assert(self.requests.firstReliableActive() == null);
+        std.debug.assert(self.requests.firstActive() == null);
 
         var queued_finished: usize = 0;
         while (queued_finished < self.limits.max_queued_requests) : (queued_finished += 1) {
-            const snapshot = self.requests.firstReliableQueued() orelse break;
+            const snapshot = self.requests.firstQueuedRequest() orelse break;
             const queued = self.requests.takeQueued(snapshot.key) orelse unreachable;
+            std.debug.assert(std.meta.activeTag(queued.origin) != .lookup);
             self.publishRequestTerminal(env, snapshot.key, snapshot.kind, queued.origin, .runtime_stopped);
         }
-        std.debug.assert(self.requests.firstReliableQueued() == null);
+        std.debug.assert(self.requests.firstQueuedRequest() == null);
     }
 
     pub fn publishConnection(self: *Actor, outbox: *events.EventOutbox, node_id: types.NodeId, transition: peer_book.ConnectionTransition) void {
