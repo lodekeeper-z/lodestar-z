@@ -134,7 +134,9 @@ Runtime delivers command | packet | maintenance | completion
 ### Ordering, bounds, and late completion policy
 
 - Runtime drains the single FIFO after every command, inbound packet, maintenance turn, and completion-generated continuation.
-- Queue storage is preallocated from the canonical ingress permit capacity plus one replay slot; no per-effect allocation occurs.
+- Queue storage is preallocated as `max(A, min(P, M + 1))`, where `A` is the active-request limit, `P` is the canonical ingress permit capacity, and `M` is the maximum NODES response chunk count.
+- Request effects are bounded by active plus move-owned prepared request ownership. An atomic authenticated FINDNODE turn is bounded by `M` response chunks plus one eviction probe, while all permit-bearing effects are also bounded by `P`.
+- Runtime pops before applying completion and drains before the next command, so the request and atomic-ingress bounds are alternatives rather than additive queue residents. No per-effect allocation occurs.
 - Queue redrain emits one head. `.sent` removes that head and may emit exactly the next head only under a stable session.
 - Runtime execution is deliberately synchronous in the actor-loop task. Therefore there are no detached transport tasks or replacement generations that can produce late completions. The move-owned effect value is the identity and is consumed once.
 - Cancellation during send maps to `runtime_stopped`; ordinary transport failure maps to `failed`; all remaining queued values are synthesized as `runtime_stopped` during terminalization.
