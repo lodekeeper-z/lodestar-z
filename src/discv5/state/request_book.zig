@@ -303,6 +303,34 @@ pub const RequestBook = struct {
         establish: bool,
         queued_intent: bool,
     ) !RequestHandle {
+        return self.beginSendingWithGeneration(admission, key, origin, response, phase, deadline_ns, establish, queued_intent, null);
+    }
+
+    pub fn beginSendingQueued(
+        self: *RequestBook,
+        admission: *admission_mod.IngressAdmission,
+        handle: RequestHandle,
+        origin: types.RequestOrigin,
+        response: ResponseExpectation,
+        phase: Phase,
+        deadline_ns: i64,
+        establish: bool,
+    ) !RequestHandle {
+        return self.beginSendingWithGeneration(admission, handle.key, origin, response, phase, deadline_ns, establish, true, handle.generation);
+    }
+
+    fn beginSendingWithGeneration(
+        self: *RequestBook,
+        admission: *admission_mod.IngressAdmission,
+        key: types.RequestKey,
+        origin: types.RequestOrigin,
+        response: ResponseExpectation,
+        phase: Phase,
+        deadline_ns: i64,
+        establish: bool,
+        queued_intent: bool,
+        assigned_generation: ?u64,
+    ) !RequestHandle {
         if (self.active.contains(key)) return error.DuplicateRequest;
         if (self.active.count() >= self.limits.max_active_requests) return error.TooManyActiveRequests;
         if (establish) {
@@ -310,9 +338,14 @@ pub const RequestBook = struct {
         }
         const challenge_index = challengeForPhase(key.endpoint.addr, phase);
         if (challenge_index) |index| if (self.challenge_by_nonce.contains(index)) return error.DuplicateChallenge;
-        const generation = std.math.add(u64, self.next_generation, 1) catch return error.GenerationExhausted;
-        const handle = RequestHandle{ .key = key, .generation = self.next_generation };
-        self.next_generation = generation;
+        const handle = if (assigned_generation) |generation|
+            RequestHandle{ .key = key, .generation = generation }
+        else blk: {
+            const next_generation = std.math.add(u64, self.next_generation, 1) catch return error.GenerationExhausted;
+            const allocated = RequestHandle{ .key = key, .generation = self.next_generation };
+            self.next_generation = next_generation;
+            break :blk allocated;
+        };
         var permit = try admission.acquire(key.endpoint.addr, admission_mod.requestPacketBudget(response.kind()));
         errdefer permit.release(admission);
         self.active.putAssumeCapacityNoClobber(key, .{ .sending = .{
@@ -360,7 +393,8 @@ pub const RequestBook = struct {
         return view;
     }
 
-    pub fn queue(self: *RequestBook, request: QueuedRequest) !void {
+    pub fn queue(self: *RequestBook, request_value: QueuedRequest) !RequestHandle {
+        var request = request_value;
         switch (request.origin) {
             .maintenance => |reason| switch (reason) {
                 .health, .enr_propagation => return error.EndpointBusy,
@@ -382,8 +416,12 @@ pub const RequestBook = struct {
         };
         if (lane.value_ptr.queued.len() >= self.limits.max_queued_requests_per_endpoint)
             return error.TooManyQueuedRequestsForEndpoint;
+        const next_generation = std.math.add(u64, self.next_generation, 1) catch return error.GenerationExhausted;
+        request.generation = self.next_generation;
+        self.next_generation = next_generation;
         try lane.value_ptr.queued.append(self.alloc, request);
         self.queued_total += 1;
+        return request.handle();
     }
 
     pub fn shouldQueue(self: *const RequestBook, endpoint: types.Endpoint) bool {
@@ -566,6 +604,23 @@ pub const RequestBook = struct {
         return self.active.contains(key);
     }
 
+    pub fn matchesHandle(self: *const RequestBook, handle: RequestHandle) bool {
+        const current = self.currentHandle(handle.key) orelse return false;
+        return handleEql(current, handle);
+    }
+
+    pub fn handleFor(self: *const RequestBook, key: types.RequestKey) ?RequestHandle {
+        return self.currentHandle(key);
+    }
+
+    pub fn queuedHandleFor(self: *const RequestBook, key: types.RequestKey) ?RequestHandle {
+        const lane = self.lanes.get(key.endpoint) orelse return null;
+        for (lane.queued.items.items[lane.queued.head..]) |queued| {
+            if (types.RequestKeyContext.eql(.{}, queued.handle().key, key)) return queued.handle();
+        }
+        return null;
+    }
+
     pub const ActiveScan = struct {
         index: usize = 0,
         slots_scanned: usize = 0,
@@ -715,6 +770,16 @@ pub const RequestBook = struct {
             if (lane.queued.len() == 0) lane.queued.compact();
             self.removeEmptyLane(key.endpoint);
             return removed;
+        }
+        return null;
+    }
+
+    pub fn takeQueuedHandle(self: *RequestBook, handle: RequestHandle) ?QueuedRequest {
+        const lane = self.lanes.getPtr(handle.key.endpoint) orelse return null;
+        for (lane.queued.items.items[lane.queued.head..]) |queued| {
+            if (queued.generation != handle.generation) continue;
+            if (!types.RequestKeyContext.eql(.{}, queued.handle().key, handle.key)) continue;
+            return self.takeQueued(handle.key);
         }
         return null;
     }

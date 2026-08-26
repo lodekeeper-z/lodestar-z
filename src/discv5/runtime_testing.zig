@@ -1,6 +1,7 @@
 const std = @import("std");
 const admission = @import("admission.zig");
 const message = @import("protocol/message.zig");
+const public_api = @import("public_api.zig");
 const runtime_error = @import("runtime_error.zig");
 const transport = @import("transport.zig");
 const types = @import("types.zig");
@@ -29,7 +30,7 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
         };
         pub const EnrAdmissionResult = runtime_error.EnrAdmissionError!bool;
         pub const EnrAdmissionReply = std.Io.Queue(EnrAdmissionResult);
-        pub const PingResult = runtime_error.RequestError!message.ReqId;
+        pub const PingResult = runtime_error.RequestError!public_api.RequestHandle;
         pub const PingReply = std.Io.Queue(PingResult);
 
         pub fn actorLoop(runtime: *Runtime) std.Io.Cancelable!void {
@@ -46,13 +47,12 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
 
         pub fn enqueueSendPing(runtime: *Runtime, endpoint: types.Endpoint, pubkey: [33]u8, reply: *PingReply) !void {
             const storage = impl(runtime);
+            if (!storage.actor.addNode(endpoint.node_id, &pubkey, endpoint.addr, null, 0)) return error.InvalidPeer;
             if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
             var reservation_transferred = false;
             errdefer if (!reservation_transferred) storage.request_result_outbox.cancelUnclaimed();
             try storage.enqueueCommand(.{ .send_ping = .{
-                .endpoint = endpoint,
-                .pubkey = pubkey,
-                .enr_seq = 0,
+                .node_id = endpoint.node_id,
                 .origin = .reliable_api,
                 .reply = reply,
             } });
@@ -87,21 +87,20 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             runtime: *Runtime,
             endpoint: types.Endpoint,
             pubkey: [33]u8,
-        ) !message.ReqId {
+        ) !public_api.RequestHandle {
             const storage = impl(runtime);
             var action = try storage.actor.preparePing(
                 .{ .io = storage.io, .ingress = &storage.admission },
                 endpoint,
                 &pubkey,
-                0,
                 .api,
             );
-            const req_id = action.requestId();
+            const handle = public_api.handleFromInternal(action.handle());
             switch (action) {
                 .send => |effect| try storage.effects.push(.{ .request = effect }),
                 .queued => unreachable,
             }
-            return req_id;
+            return handle;
         }
 
         pub fn addConnectedNode(
@@ -152,6 +151,41 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
                 .outstanding = outbox.outstanding.load(.acquire),
                 .unclaimed = outbox.unclaimed.load(.acquire),
             };
+        }
+
+        pub fn effectCount(runtime: *Runtime) usize {
+            return impl(runtime).effects.count();
+        }
+
+        pub const ActiveRequestEvidence = struct {
+            endpoint: types.Endpoint,
+            dest_pubkey: [33]u8,
+            plaintext: types.PacketBytes,
+        };
+
+        pub fn activeRequestEvidence(runtime: *Runtime, handle: public_api.RequestHandle) ?ActiveRequestEvidence {
+            const storage = impl(runtime);
+            const internal = public_api.handleToInternal(handle);
+            if (!storage.actor.requests.matchesHandle(internal)) return null;
+            const active = storage.actor.requests.get(internal.key) orelse return null;
+            const recovery = switch (active.phase) {
+                .awaiting_whoareyou => |value| value.recovery,
+                .awaiting_response => |value| value.recovery,
+            };
+            return .{
+                .endpoint = internal.key.endpoint,
+                .dest_pubkey = recovery.dest_pubkey,
+                .plaintext = recovery.plaintext,
+            };
+        }
+
+        pub fn requestHandleMatches(runtime: *Runtime, handle: public_api.RequestHandle) bool {
+            const storage = impl(runtime);
+            const internal = public_api.handleToInternal(handle);
+            if (storage.actor.requests.matchesHandle(internal)) return true;
+            const queued = storage.actor.requests.queuedHandleFor(internal.key) orelse return false;
+            return queued.generation == internal.generation and
+                types.RequestKeyContext.eql(.{}, queued.key, internal.key);
         }
 
         /// Reconcile a claimed reservation after a test has used cancelRequest

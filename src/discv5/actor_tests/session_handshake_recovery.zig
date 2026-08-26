@@ -153,7 +153,7 @@ test "smaller sessionless TALKREQ still recovers with one handshake packet" {
     try std.testing.expectEqual(packet.FLAG_HANDSHAKE, (try packet.decode(recovered.bytes[0..recovered.len], &remote_id)).static_header.flag);
     try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
-    try std.testing.expect(harness.actor.cancelRequest(harness.env(), .init(endpoint, req_id)));
+    try std.testing.expect(harness.actor.cancelRequest(harness.env(), types.RequestKey.init(endpoint, req_id)));
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     harness.actor.requests.assertInvariants();
 }
@@ -230,7 +230,6 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
         env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
-        0,
         .api,
     );
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
@@ -325,7 +324,6 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
         env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
-        0,
         .api,
     );
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
@@ -420,7 +418,6 @@ test "response recovery keeps stable keys until candidate proof then promotes an
         env_a,
         endpoint_b,
         &pubkey_b,
-        0,
         .api,
     );
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
@@ -533,7 +530,7 @@ test "failed retry datagram does not increment sent message metrics" {
     defer harness.deinit();
     const actor = &harness.actor;
     actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 }, outbound.nowNs(io));
-    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
     var initial = harness.recording.datagrams.items[0].bytes;
     const initial_nonce = (try packet.decode(initial.bytes[0..initial.len], &endpoint.node_id)).static_header.nonce;
@@ -774,9 +771,9 @@ test "competing WHOAREYOU is rejected before a conflicting handshake is sent" {
     const now_ns = outbound.nowNs(io);
     actor.sessions.put(endpoint, stable, now_ns);
 
-    const req_a = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    const req_a = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
-    const req_b = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
+    const req_b = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
     var sent_a = harness.recording.datagrams.items[0].bytes;
     var sent_b = harness.recording.datagrams.items[1].bytes;
@@ -836,7 +833,7 @@ test "HANDSHAKE send failure leaves WHOAREYOU request state unchanged" {
     var harness = try ActorHarness.init(alloc, io, cfg);
     defer harness.deinit();
     const actor = &harness.actor;
-    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
     var probe = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(probe.bytes[0..probe.len], &remote_id)).static_header.nonce;
@@ -953,7 +950,7 @@ test "expired stable outbound paths recover without access-time removal" {
     ));
     try std.testing.expectEqual(@as(usize, 1), actor.sessions.count());
 
-    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
     try std.testing.expectEqual(@as(usize, 1), actor.sessions.count());
     const active = actor.requests.get(.init(endpoint, req_id)) orelse return error.MissingExpiredSessionRequest;
@@ -1224,7 +1221,6 @@ test "successful handshake records initial probe nonce and replay is inert" {
         env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
-        0,
         .api,
     );
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
@@ -1341,7 +1337,7 @@ test "old key remains accepted without promotion until candidate response" {
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
     const old = session_book.StableSession{ .initiator_key = [_]u8{0x71} ** 16, .recipient_key = [_]u8{0x72} ** 16 };
     actor.sessions.put(endpoint, old, outbound.nowNs(io));
-    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
     var sent = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id)).static_header.nonce;
@@ -1425,7 +1421,7 @@ test "rekey lane queues stable-key requests and drains FIFO after candidate proo
     const old = session_book.StableSession{ .initiator_key = [_]u8{0x75} ** 16, .recipient_key = [_]u8{0x76} ** 16 };
     actor.sessions.put(endpoint, old, outbound.nowNs(io));
 
-    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 0, .api);
+    _ = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
     var sent = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id)).static_header.nonce;
@@ -1442,8 +1438,8 @@ test "rekey lane queues stable-key requests and drains FIFO after candidate proo
     const pending = actor.requests.pendingKeys(endpoint) orelse return error.MissingPendingRekey;
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
 
-    const second_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .api);
-    const third_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 2, .api);
+    const second_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
+    const third_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .api);
     try std.testing.expectEqual(@as(usize, 2), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 2), actor.requests.queuedCount());
 

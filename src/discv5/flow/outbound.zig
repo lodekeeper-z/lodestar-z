@@ -25,8 +25,8 @@ pub fn prepareTracked(
     if (actor.requests.shouldQueue(endpoint)) {
         // RequestBook.queue is the canonical policy point for which origins
         // may wait behind endpoint establishment (health/eviction never do).
-        try actor.requests.queue(try .init(origin, endpoint, dest_pubkey, req_id, kind, distances, plaintext, deadlineNs(now_ns, actor.request_timeout_ms)));
-        return .{ .queued = req_id };
+        const handle = try actor.requests.queue(try .init(origin, endpoint, dest_pubkey, req_id, kind, distances, plaintext, deadlineNs(now_ns, actor.request_timeout_ms)));
+        return .{ .queued = handle };
     }
     const requested_distances = request_book.RequestDistances.fromSlice(distances);
     return .{ .send = try prepareDispatch(actor, context, endpoint, dest_pubkey, req_id, kind, &requested_distances, plaintext, origin, false) };
@@ -97,16 +97,28 @@ fn prepareDispatch(
         .{ .awaiting_response = .{ .recovery = recovery, .wait = .session_request } };
     const response = actor.requests.makeExpectation(kind, requested_distances);
     const send_packet = try types.PacketBytes.init(encoded.bytes);
-    const handle = try actor.requests.beginSending(
-        context.ingress,
-        .init(endpoint, req_id),
-        origin,
-        response,
-        phase,
-        deadlineNs(now_ns, actor.request_timeout_ms),
-        stable == null,
-        queued_intent,
-    );
+    const key = types.RequestKey.init(endpoint, req_id);
+    const handle = if (queued_intent)
+        try actor.requests.beginSendingQueued(
+            context.ingress,
+            actor.requests.firstQueued(endpoint).?.handle(),
+            origin,
+            response,
+            phase,
+            deadlineNs(now_ns, actor.request_timeout_ms),
+            stable == null,
+        )
+    else
+        try actor.requests.beginSending(
+            context.ingress,
+            key,
+            origin,
+            response,
+            phase,
+            deadlineNs(now_ns, actor.request_timeout_ms),
+            stable == null,
+            false,
+        );
     return .{ .handle = handle, .packet = send_packet };
 }
 

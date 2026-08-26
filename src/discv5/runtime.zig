@@ -8,6 +8,7 @@ const lookup_results = @import("lookup_results.zig");
 const message = @import("protocol/message.zig");
 const metrics = @import("metrics.zig");
 const packet = @import("protocol/packet.zig");
+const public_api = @import("public_api.zig");
 const request_results = @import("request_results.zig");
 const transport_mod = @import("transport.zig");
 const types = @import("types.zig");
@@ -67,9 +68,9 @@ const RuntimeImpl = struct {
 
     const EnrAdmissionResult = EnrAdmissionError!bool;
     const SetLocalEnrResult = SetLocalEnrError!void;
-    const PingResult = RequestError!message.ReqId;
-    const FindNodeResult = FindNodeError!message.ReqId;
-    const TalkRequestResult = TalkRequestError!message.ReqId;
+    const PingResult = RequestError!public_api.RequestHandle;
+    const FindNodeResult = FindNodeError!public_api.RequestHandle;
+    const TalkRequestResult = TalkRequestError!public_api.RequestHandle;
     const TalkResponseResult = TalkResponseError!void;
     const LookupStartResult = LookupError!u32;
     const CommandBoolResult = CommandError!bool;
@@ -103,16 +104,13 @@ const RuntimeImpl = struct {
     };
 
     const SendPing = struct {
-        endpoint: types.Endpoint,
-        pubkey: [33]u8,
-        enr_seq: u64,
+        node_id: types.NodeId,
         origin: types.RequestOrigin,
         reply: *PingReply,
     };
 
     const SendFindNode = struct {
-        endpoint: types.Endpoint,
-        pubkey: [33]u8,
+        node_id: types.NodeId,
         distances: [types.MAX_OUTBOUND_FINDNODE_DISTANCES]u16,
         distances_len: u8,
         origin: types.RequestOrigin,
@@ -120,8 +118,7 @@ const RuntimeImpl = struct {
     };
 
     const SendTalkRequest = struct {
-        endpoint: types.Endpoint,
-        pubkey: [33]u8,
+        node_id: types.NodeId,
         protocol_name: []u8,
         request: []u8,
         origin: types.RequestOrigin,
@@ -143,7 +140,7 @@ const RuntimeImpl = struct {
             response: []u8,
             reply: *TalkResponseReply,
         },
-        cancel_request: struct { key: types.RequestKey, reply: *CommandBoolReply },
+        cancel_request: struct { handle: types.RequestHandle, reply: *CommandBoolReply },
         start_lookup: struct { target: types.NodeId, reply: *LookupReply },
         start_random_lookup: *LookupReply,
         metrics_snapshot: *MetricsReply,
@@ -540,7 +537,7 @@ const RuntimeImpl = struct {
             },
             .cancel_request => |value| value.reply.putOneUncancelable(
                 self.io,
-                self.actor.cancelRequest(env, value.key),
+                self.actor.cancelRequest(env, value.handle),
             ) catch {},
             .start_lookup => |value| try self.handleStartLookup(env, value.target, value.reply),
             .start_random_lookup => |reply| {
@@ -585,7 +582,7 @@ const RuntimeImpl = struct {
     fn handleSendPing(self: *RuntimeImpl, value: SendPing) Io.Cancelable!void {
         const reliable = value.origin == .reliable_api;
         if (reliable and !self.request_result_outbox.claim()) unreachable;
-        const result = sendPingResult(self, value.endpoint, &value.pubkey, value.enr_seq, value.origin);
+        const result = sendPingResult(self, value.node_id, value.origin);
         if (result) |_| {} else |_| if (reliable) self.request_result_outbox.release();
         try replyResult(self.io, value.reply, result);
     }
@@ -593,7 +590,7 @@ const RuntimeImpl = struct {
     fn handleSendFindNode(self: *RuntimeImpl, value: SendFindNode) Io.Cancelable!void {
         const reliable = value.origin == .reliable_api;
         if (reliable and !self.request_result_outbox.claim()) unreachable;
-        const result = sendFindNodeResult(self, value.endpoint, &value.pubkey, value.distances[0..value.distances_len], value.origin);
+        const result = sendFindNodeResult(self, value.node_id, value.distances[0..value.distances_len], value.origin);
         if (result) |_| {} else |_| if (reliable) self.request_result_outbox.release();
         try replyResult(self.io, value.reply, result);
     }
@@ -603,8 +600,7 @@ const RuntimeImpl = struct {
         if (reliable and !self.request_result_outbox.claim()) unreachable;
         const result = sendTalkRequestResult(
             self,
-            value.endpoint,
-            &value.pubkey,
+            value.node_id,
             value.protocol_name,
             value.request,
             value.origin,
@@ -758,11 +754,11 @@ fn setLocalEnrResult(actor: *actor_mod.Actor, env: actor_mod.Env, raw: []const u
     };
 }
 
-fn executeRequestEffect(runtime: *RuntimeImpl, action_value: actor_mod.OutboundRequestAction) !message.ReqId {
+fn executeRequestEffect(runtime: *RuntimeImpl, action_value: actor_mod.OutboundRequestAction) !types.RequestHandle {
     var action = action_value;
-    const req_id = action.requestId();
+    const handle = action.handle();
     switch (action) {
-        .queued => return req_id,
+        .queued => return handle,
         .send => |effect| {
             const target_index = runtime.effects.count();
             runtime.effects.push(.{ .request = effect }) catch unreachable;
@@ -775,7 +771,7 @@ fn executeRequestEffect(runtime: *RuntimeImpl, action_value: actor_mod.OutboundR
             }
         },
     }
-    return req_id;
+    return handle;
 }
 
 fn executeSendEffect(runtime: *RuntimeImpl, effect: actor_mod.ActorEffect) !void {
@@ -786,25 +782,47 @@ fn executeSendEffect(runtime: *RuntimeImpl, effect: actor_mod.ActorEffect) !void
     runtime.actor.applyEffectCompletion(runtime.actorEnv(), effect, .sent);
 }
 
-fn executePingEffect(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64, origin: types.RequestOrigin) !message.ReqId {
-    return executeRequestEffect(runtime, try runtime.actor.preparePing(.{ .io = runtime.io, .ingress = &runtime.admission }, endpoint, pubkey, enr_seq, origin));
+fn executePingEffect(runtime: *RuntimeImpl, node_id: types.NodeId, origin: types.RequestOrigin) !types.RequestHandle {
+    const known = runtime.actor.peers.known(&node_id) orelse return error.UnknownPeer;
+    return executeRequestEffect(runtime, try runtime.actor.preparePing(
+        .{ .io = runtime.io, .ingress = &runtime.admission },
+        .{ .node_id = node_id, .addr = known.addr },
+        &known.pubkey,
+        origin,
+    ));
 }
 
-fn executeFindNodeEffect(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16, origin: types.RequestOrigin) !message.ReqId {
-    return executeRequestEffect(runtime, try runtime.actor.prepareFindNode(.{ .io = runtime.io, .ingress = &runtime.admission }, endpoint, pubkey, distances, origin));
+fn executeFindNodeEffect(runtime: *RuntimeImpl, node_id: types.NodeId, distances: []const u16, origin: types.RequestOrigin) !types.RequestHandle {
+    const known = runtime.actor.peers.known(&node_id) orelse return error.UnknownPeer;
+    return executeRequestEffect(runtime, try runtime.actor.prepareFindNode(
+        .{ .io = runtime.io, .ingress = &runtime.admission },
+        .{ .node_id = node_id, .addr = known.addr },
+        &known.pubkey,
+        distances,
+        origin,
+    ));
 }
 
-fn executeTalkRequestEffect(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) !message.ReqId {
-    return executeRequestEffect(runtime, try runtime.actor.prepareTalkRequest(.{ .io = runtime.io, .ingress = &runtime.admission }, endpoint, pubkey, protocol_name, request, origin));
+fn executeTalkRequestEffect(runtime: *RuntimeImpl, node_id: types.NodeId, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) !types.RequestHandle {
+    const known = runtime.actor.peers.known(&node_id) orelse return error.UnknownPeer;
+    return executeRequestEffect(runtime, try runtime.actor.prepareTalkRequest(
+        .{ .io = runtime.io, .ingress = &runtime.admission },
+        .{ .node_id = node_id, .addr = known.addr },
+        &known.pubkey,
+        protocol_name,
+        request,
+        origin,
+    ));
 }
 
-fn sendPingResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, enr_seq: u64, origin: types.RequestOrigin) RequestError!message.ReqId {
-    return executePingEffect(runtime, endpoint, pubkey, enr_seq, origin) catch |err| switch (err) {
+fn sendPingResult(runtime: *RuntimeImpl, node_id: types.NodeId, origin: types.RequestOrigin) RequestError!public_api.RequestHandle {
+    const handle = executePingEffect(runtime, node_id, origin) catch |err| return switch (err) {
         error.Canceled => error.Canceled,
         error.DuplicateChallenge => error.DuplicateChallenge,
         error.DuplicateRequest => error.DuplicateRequest,
         error.GenerationExhausted => error.GenerationExhausted,
         error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
+        error.UnknownPeer => error.UnknownPeer,
         error.OutOfMemory => error.OutOfMemory,
         error.PermitGenerationExhausted => error.PermitGenerationExhausted,
         error.TooManyActiveRequests => error.TooManyActiveRequests,
@@ -831,16 +849,18 @@ fn sendPingResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *cons
         error.UnsupportedVersion,
         => unreachable,
     };
+    return public_api.handleFromInternal(handle);
 }
 
-fn sendFindNodeResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16, origin: types.RequestOrigin) FindNodeError!message.ReqId {
-    return executeFindNodeEffect(runtime, endpoint, pubkey, distances, origin) catch |err| switch (err) {
+fn sendFindNodeResult(runtime: *RuntimeImpl, node_id: types.NodeId, distances: []const u16, origin: types.RequestOrigin) FindNodeError!public_api.RequestHandle {
+    const handle = executeFindNodeEffect(runtime, node_id, distances, origin) catch |err| return switch (err) {
         error.Canceled => error.Canceled,
         error.DuplicateChallenge => error.DuplicateChallenge,
         error.DuplicateRequest => error.DuplicateRequest,
         error.GenerationExhausted => error.GenerationExhausted,
         error.InvalidDistance => error.InvalidDistance,
         error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
+        error.UnknownPeer => error.UnknownPeer,
         error.OutOfMemory => error.OutOfMemory,
         error.PermitGenerationExhausted => error.PermitGenerationExhausted,
         error.TooManyActiveRequests => error.TooManyActiveRequests,
@@ -867,10 +887,11 @@ fn sendFindNodeResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *
         error.UnsupportedVersion,
         => unreachable,
     };
+    return public_api.handleFromInternal(handle);
 }
 
-fn sendTalkRequestResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) TalkRequestError!message.ReqId {
-    return executeTalkRequestEffect(runtime, endpoint, pubkey, protocol_name, request, origin) catch |err| switch (err) {
+fn sendTalkRequestResult(runtime: *RuntimeImpl, node_id: types.NodeId, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) TalkRequestError!public_api.RequestHandle {
+    const handle = executeTalkRequestEffect(runtime, node_id, protocol_name, request, origin) catch |err| return switch (err) {
         // Keep encoder exhaustion normalized in case message layout drifts
         // beyond its packet-sized scratch buffer before the packet preflight.
         error.BufferTooSmall => error.MessageTooLarge,
@@ -880,6 +901,7 @@ fn sendTalkRequestResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey
         error.GenerationExhausted => error.GenerationExhausted,
         error.MessageTooLarge => error.MessageTooLarge,
         error.NoSocketForAddressFamily => error.NoSocketForAddressFamily,
+        error.UnknownPeer => error.UnknownPeer,
         error.OutOfMemory => error.OutOfMemory,
         error.PermitGenerationExhausted => error.PermitGenerationExhausted,
         error.TooManyActiveRequests => error.TooManyActiveRequests,
@@ -905,6 +927,7 @@ fn sendTalkRequestResult(runtime: *RuntimeImpl, endpoint: types.Endpoint, pubkey
         error.UnsupportedVersion,
         => unreachable,
     };
+    return public_api.handleFromInternal(handle);
 }
 
 fn sendTalkResponseResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint: types.Endpoint, req_id: message.ReqId, response: []const u8) TalkResponseError!void {
@@ -1072,7 +1095,7 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn sendPing(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, enr_seq: u64) runtime_error.RequestError!message.ReqId {
+    pub fn sendPing(self: *Runtime, node_id: types.NodeId) runtime_error.RequestError!public_api.RequestHandle {
         const storage = impl(self);
         try storage.ensureRunning();
         if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
@@ -1081,9 +1104,7 @@ pub const Runtime = opaque {
         var buffer: [1]RuntimeImpl.PingResult = undefined;
         var reply = RuntimeImpl.PingReply.init(&buffer);
         try storage.enqueueCommand(.{ .send_ping = .{
-            .endpoint = .{ .node_id = node_id, .addr = address },
-            .pubkey = pubkey.*,
-            .enr_seq = enr_seq,
+            .node_id = node_id,
             .origin = .reliable_api,
             .reply = &reply,
         } });
@@ -1091,7 +1112,7 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn sendFindNode(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, distances: []const u16) runtime_error.FindNodeError!message.ReqId {
+    pub fn sendFindNode(self: *Runtime, node_id: types.NodeId, distances: []const u16) runtime_error.FindNodeError!public_api.RequestHandle {
         const storage = impl(self);
         try storage.ensureRunning();
         if (distances.len > types.MAX_OUTBOUND_FINDNODE_DISTANCES) return error.TooManyDistances;
@@ -1106,8 +1127,7 @@ pub const Runtime = opaque {
         var buffer: [1]RuntimeImpl.FindNodeResult = undefined;
         var reply = RuntimeImpl.FindNodeReply.init(&buffer);
         try storage.enqueueCommand(.{ .send_findnode = .{
-            .endpoint = .{ .node_id = node_id, .addr = address },
-            .pubkey = pubkey.*,
+            .node_id = node_id,
             .distances = copied,
             .distances_len = @intCast(distances.len),
             .origin = .reliable_api,
@@ -1117,7 +1137,7 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn sendTalkRequest(self: *Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, protocol_name: []const u8, request: []const u8) runtime_error.TalkRequestError!message.ReqId {
+    pub fn sendTalkRequest(self: *Runtime, node_id: types.NodeId, protocol_name: []const u8, request: []const u8) runtime_error.TalkRequestError!public_api.RequestHandle {
         const storage = impl(self);
         try storage.ensureRunning();
         const payload_len = std.math.add(usize, protocol_name.len, request.len) catch return error.MessageTooLarge;
@@ -1132,8 +1152,7 @@ pub const Runtime = opaque {
         var buffer: [1]RuntimeImpl.TalkRequestResult = undefined;
         var reply = RuntimeImpl.TalkRequestReply.init(&buffer);
         try storage.enqueueCommand(.{ .send_talk_request = .{
-            .endpoint = .{ .node_id = node_id, .addr = address },
-            .pubkey = pubkey.*,
+            .node_id = node_id,
             .protocol_name = protocol_copy.?,
             .request = request_copy.?,
             .origin = .reliable_api,
@@ -1145,9 +1164,10 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn sendTalkResponse(self: *Runtime, node_id: types.NodeId, address: types.Address, req_id: message.ReqId, response: []const u8) runtime_error.TalkResponseError!void {
+    pub fn sendTalkResponse(self: *Runtime, node_id: types.NodeId, address: types.Address, request_id: []const u8, response: []const u8) runtime_error.TalkResponseError!void {
         const storage = impl(self);
         try storage.ensureRunning();
+        const req_id = message.ReqId.fromSlice(request_id) catch return error.InvalidRequestId;
         if (response.len > packet.MAX_PACKET_SIZE) return error.MessageTooLarge;
         var owned: ?[]u8 = try storage.allocator.dupe(u8, response);
         errdefer if (owned) |bytes| storage.allocator.free(bytes);
@@ -1176,13 +1196,13 @@ pub const Runtime = opaque {
         return try reply.getOneUncancelable(storage.io);
     }
 
-    pub fn cancelRequest(self: *Runtime, node_id: types.NodeId, address: types.Address, req_id: message.ReqId) runtime_error.CommandError!bool {
+    pub fn cancelRequest(self: *Runtime, handle: public_api.RequestHandle) runtime_error.CommandError!bool {
         const storage = impl(self);
         try storage.ensureRunning();
         var buffer: [1]RuntimeImpl.CommandBoolResult = undefined;
         var reply = RuntimeImpl.CommandBoolReply.init(&buffer);
         try storage.enqueueCommand(.{ .cancel_request = .{
-            .key = .init(.{ .node_id = node_id, .addr = address }, req_id),
+            .handle = public_api.handleToInternal(handle),
             .reply = &reply,
         } });
         return try reply.getOneUncancelable(storage.io);

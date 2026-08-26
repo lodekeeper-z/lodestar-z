@@ -21,6 +21,7 @@ pub const RequestDistances = struct {
 };
 
 pub const QueuedRequest = struct {
+    generation: u64 = 0,
     origin: types.RequestOrigin,
     endpoint: types.Endpoint,
     dest_pubkey: [33]u8,
@@ -29,6 +30,11 @@ pub const QueuedRequest = struct {
     requested_distances: RequestDistances,
     plaintext: types.PacketBytes,
     deadline_ns: i64,
+
+    pub fn handle(self: *const QueuedRequest) types.RequestHandle {
+        std.debug.assert(self.generation != 0);
+        return .{ .key = .init(self.endpoint, self.req_id), .generation = self.generation };
+    }
 
     pub fn init(
         origin: types.RequestOrigin,

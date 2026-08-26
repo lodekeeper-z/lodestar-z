@@ -224,7 +224,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
 
-    const ping_id = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
+    const ping_id = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();
@@ -250,7 +250,6 @@ test "paired Actors complete handshake PING and TALK request response flows" {
         env_b,
         .{ .node_id = id_a, .addr = address_a },
         &pubkey_a,
-        0,
         .api,
     );
     try drainEffects(&actor_b, env_b, &effects_b, &sender_b);
@@ -267,7 +266,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     unrelated_credit.rollback(&ingress_a);
     try std.testing.expect(actor_b.cancelRequest(
         .{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b },
-        .init(.{ .node_id = id_a, .addr = address_a }, unrelated_ping_id),
+        types.RequestKey.init(.{ .node_id = id_a, .addr = address_a }, unrelated_ping_id),
     ));
 
     try link_a_to_b.deliverNext();
@@ -538,7 +537,7 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
     actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
     const peer_before = actor_b.peers.known(&id_a) orelse return error.MissingKnownPeer;
     try std.testing.expectEqual(@as(usize, 1), actor_b.peers.contacts.count());
-    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
+    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     const endpoint = types.Endpoint{ .node_id = id_a, .addr = address_a };
@@ -774,7 +773,7 @@ fn signedEnrHandshake(kind: SignedEnrKind, later_evidence: LaterEndpointEvidence
         try std.testing.expect(actor_b.peers.routing.getEntry(&id_a).?.raw_enr_relay_eligible);
     }
 
-    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
+    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();
@@ -864,7 +863,7 @@ fn contactHandshake(runtime_contact_trusted: bool) !ContactHandshakeResult {
         actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
     }
     try std.testing.expectEqual(runtime_contact_trusted, actor_b.peers.known(&id_a).?.runtime_contact_trusted);
-    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, 0, .api);
+    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();

@@ -2,7 +2,9 @@ const std = @import("std");
 const config = @import("config.zig");
 const enr = @import("enr.zig");
 const metrics = @import("metrics.zig");
+const message = @import("protocol/message.zig");
 const packet = @import("protocol/packet.zig");
+const public_api = @import("public_api.zig");
 const runtime_mod = @import("runtime.zig");
 const secp = @import("secp256k1.zig");
 const transport_mod = @import("transport.zig");
@@ -16,7 +18,7 @@ fn expectNoRuntimeEvent(runtime: *runtime_mod.Runtime, alloc: std.mem.Allocator)
 
 const RuntimeRequestCleanup = struct {
     runtime: *runtime_mod.Runtime,
-    key: types.RequestKey,
+    handle: public_api.RequestHandle,
     active: bool = true,
 
     fn consume(self: *RuntimeRequestCleanup) void {
@@ -26,12 +28,8 @@ const RuntimeRequestCleanup = struct {
 
     fn deinit(self: *RuntimeRequestCleanup) void {
         if (!self.active) return;
-        _ = self.runtime.cancelRequest(
-            self.key.endpoint.node_id,
-            self.key.endpoint.addr,
-            self.key.req_id,
-        ) catch unreachable;
-        runtime_mod.Testing.reconcileClaimedRequest(self.runtime, self.key);
+        _ = self.runtime.cancelRequest(self.handle) catch unreachable;
+        runtime_mod.Testing.reconcileClaimedRequest(self.runtime, public_api.handleToInternal(self.handle).key);
         self.active = false;
     }
 };
@@ -171,6 +169,12 @@ fn initTestRuntime(io: std.Io, alloc: std.mem.Allocator, secret_byte: u8, limits
     }, options);
 }
 
+fn admitTestPeer(runtime: *runtime_mod.Runtime, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address) !void {
+    const derived = try enr.nodeIdFromCompressedPubkey(pubkey);
+    try std.testing.expectEqualSlices(u8, &derived, &node_id);
+    try std.testing.expect(try runtime.addNode(node_id, pubkey, address, null));
+}
+
 test "Runtime effect FIFO follows the bounded production burst" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -243,8 +247,9 @@ fn awaitRequestClosure(context: *PlaneClosure) void {
     };
 }
 
-fn expectRequestIdentity(result: *const runtime_mod.RequestResult, endpoint: types.Endpoint, req_id: @import("protocol/message.zig").ReqId, kind: types.RequestKind) !void {
-    try std.testing.expect(types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, req_id)));
+fn expectRequestIdentity(result: *const runtime_mod.RequestResult, endpoint: types.Endpoint, handle: public_api.RequestHandle, kind: types.RequestKind) !void {
+    try std.testing.expect(types.EndpointContext.eql(.{}, result.key.endpoint, endpoint));
+    try std.testing.expectEqualSlices(u8, handle.request_id.slice(), result.key.req_id.slice());
     try std.testing.expectEqual(kind, result.kind);
 }
 
@@ -429,12 +434,12 @@ const RuntimePingContext = struct {
     remote_id: types.NodeId,
     remote_pubkey: [33]u8,
     remote_address: types.Address,
-    req_id: ?@import("protocol/message.zig").ReqId = null,
+    req_id: ?public_api.RequestHandle = null,
     result_error: ?anyerror = null,
 };
 
 fn sendRuntimePing(context: *RuntimePingContext) void {
-    context.req_id = context.runtime.sendPing(context.remote_id, &context.remote_pubkey, context.remote_address, 0) catch |err| {
+    context.req_id = context.runtime.sendPing(context.remote_id) catch |err| {
         context.result_error = err;
         return;
     };
@@ -488,13 +493,14 @@ test "Runtime public request effects preserve the shared effect FIFO" {
         .node_id = try enr.nodeIdFromCompressedPubkey(&public_pubkey),
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 106 }, .port = 9306 } },
     };
-    const public_req_id = try runtime.sendPing(public_endpoint.node_id, &public_pubkey, public_endpoint.addr, 0);
+    try admitTestPeer(runtime, public_endpoint.node_id, &public_pubkey, public_endpoint.addr);
+    const public_req_id = try runtime.sendPing(public_endpoint.node_id);
 
     const first_destination = gate.first_destination orelse return error.MissingFirstEffectDestination;
     try std.testing.expect(first_destination.eql(&queued_endpoint.addr));
 
-    try std.testing.expect(try runtime.cancelRequest(queued_endpoint.node_id, queued_endpoint.addr, queued_req_id));
-    try std.testing.expect(try runtime.cancelRequest(public_endpoint.node_id, public_endpoint.addr, public_req_id));
+    try std.testing.expect(try runtime.cancelRequest(queued_req_id));
+    try std.testing.expect(try runtime.cancelRequest(public_req_id));
     const canceled = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
     try expectRequestIdentity(&canceled, public_endpoint, public_req_id, .ping);
     try std.testing.expect(canceled.terminal == .canceled);
@@ -644,6 +650,7 @@ test "Runtime send cancellation closes drains joins and releases command state" 
         .remote_pubkey = remote_pubkey,
         .remote_address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9399 } },
     };
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, ping_context.remote_address);
     try api_group.concurrent(io, sendRuntimePing, .{&ping_context});
     api_group_started = true;
     try awaitFlag(&gate.entered, error.RuntimeDidNotEnter);
@@ -700,6 +707,7 @@ test "Runtime stop interrupts a blocked transport send without caller cancellati
         .remote_pubkey = remote_pubkey,
         .remote_address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9398 } },
     };
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, ping_context.remote_address);
     var api_group: std.Io.Group = .init;
     var api_started = false;
     defer {
@@ -1030,7 +1038,8 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
     const first_pubkey = secp.compressedPubkey(&first_key);
     const first_id = try enr.nodeIdFromCompressedPubkey(&first_pubkey);
     const first_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 10 }, .port = 19079 } };
-    _ = try runtime.sendPing(first_id, &first_pubkey, first_address, 0);
+    try admitTestPeer(runtime, first_id, &first_pubkey, first_address);
+    _ = try runtime.sendPing(first_id);
     const initial_counts = runtime_mod.Testing.activeAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 1), initial_counts.active);
     try std.testing.expectEqual(@as(usize, 1), initial_counts.permits);
@@ -1254,6 +1263,153 @@ test "raw addNode rejects unproved peer identity before mutation" {
     try std.testing.expect(runtime_mod.Testing.knowsNode(runtime, claimed_id));
 }
 
+test "public sends reject unknown peers without state" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x7b, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+    }, .{});
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const unknown = [_]u8{0x7c} ** 32;
+    try std.testing.expectError(error.UnknownPeer, runtime.sendPing(unknown));
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+    try std.testing.expectEqual(@as(usize, 0), runtime_mod.Testing.effectCount(runtime));
+    try std.testing.expect(runtime.popRequestResult() == null);
+}
+
+test "public ping uses current local sequence and canonical peer contact" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x7f} ** 32));
+    const runtime = try runtime_mod.Runtime.init(io, alloc, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 4 },
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    var local_builder = enr.Builder.init(alloc, local_key, 41);
+    const local_enr = try local_builder.encode();
+    defer alloc.free(local_enr);
+    try runtime.setLocalEnr(local_enr);
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x80} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 128 }, .port = 19128 } };
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, remote_address);
+
+    const handle = try runtime.sendPing(remote_id);
+    const evidence = for (0..10_000) |_| {
+        if (runtime_mod.Testing.activeRequestEvidence(runtime, handle)) |value| break value;
+        try std.Thread.yield();
+    } else return error.RequestDidNotBecomeActive;
+    try std.testing.expectEqualSlices(u8, &remote_id, &handle.node_id);
+    try std.testing.expect(handle.address.eql(&remote_address));
+    try std.testing.expect(evidence.endpoint.addr.eql(&remote_address));
+    try std.testing.expectEqualSlices(u8, &remote_pubkey, &evidence.dest_pubkey);
+    const ping = try message.Ping.decode(evidence.plaintext.slice());
+    try std.testing.expectEqual(@as(u64, 41), ping.enr_seq);
+
+    try std.testing.expect(try runtime.cancelRequest(handle));
+    _ = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+}
+
+test "public queued handle keeps its generation and rejects stale cancellation" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x81, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .max_queued_requests_per_endpoint = 2,
+        .event_capacity = 2,
+        .command_capacity = 4,
+        .request_result_capacity = 2,
+    }, .{ .maintenance_interval_ms = 60_000 });
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x82} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 129 }, .port = 19129 } };
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, remote_address);
+
+    const active = try runtime.sendPing(remote_id);
+    const queued = try runtime.sendTalkRequest(remote_id, "proto", "queued");
+    try std.testing.expect(active.generation != queued.generation);
+    try std.testing.expect(runtime_mod.Testing.requestHandleMatches(runtime, queued));
+
+    try std.testing.expect(try runtime.cancelRequest(active));
+    _ = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+    try std.testing.expect(runtime_mod.Testing.requestHandleMatches(runtime, queued));
+
+    var stale = queued;
+    stale.generation = active.generation;
+    try std.testing.expect(!try runtime.cancelRequest(stale));
+    try std.testing.expect(runtime_mod.Testing.requestHandleMatches(runtime, queued));
+    try std.testing.expect(try runtime.cancelRequest(queued));
+    _ = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
+}
+
+test "public talk response validates raw request id before mutation" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const runtime = try initTestRuntime(io, alloc, 0x7d, .{
+        .max_active_requests = 2,
+        .max_queued_requests = 2,
+        .event_capacity = 2,
+        .command_capacity = 2,
+    }, .{});
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    const peer = [_]u8{0x7e} ** 32;
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 126 }, .port = 19126 } };
+    var gate = runtime_mod.Testing.CommandGate{};
+    runtime_mod.Testing.setCommandGate(runtime, &gate);
+    defer gate.proceed.store(true, .release);
+    const before = runtime_mod.Testing.requestResultReservationCount(runtime);
+    try std.testing.expectError(error.InvalidRequestId, runtime.sendTalkResponse(peer, address, &([_]u8{1} ** 9), "response"));
+    try std.testing.expect(!gate.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), runtime_mod.Testing.effectCount(runtime));
+    const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.queued);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+    try std.testing.expectEqual(before, runtime_mod.Testing.requestResultReservationCount(runtime));
+    try std.testing.expect(runtime.popRequestResult() == null);
+
+    runtime_mod.Testing.setCommandGate(runtime, null);
+    try std.testing.expectError(error.NoSession, runtime.sendTalkResponse(peer, address, &([_]u8{2} ** 8), "response"));
+}
+
 test "reliable lookup results survive a full event outbox and release capacity on take" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -1407,7 +1563,7 @@ test "shutdown detaches and removes queued lookup behind endpoint establishment"
     defer alloc.free(remote_enr);
     try std.testing.expect(try runtime.addNode(remote_id, &remote_pubkey, remote_address, remote_enr));
 
-    const ping_id = try runtime.sendPing(remote_id, &remote_pubkey, remote_address, 1);
+    const ping_id = try runtime.sendPing(remote_id);
     const lookup_id = try runtime.startLookup([_]u8{0x8d} ** 32);
     var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 1), counts.active);
@@ -1424,7 +1580,7 @@ test "shutdown detaches and removes queued lookup behind endpoint establishment"
     try std.testing.expect(runtime.popLookupResult() == null);
 
     const request_result = runtime.popRequestResult() orelse return error.MissingStoppedRequestResult;
-    try std.testing.expectEqualSlices(u8, ping_id.slice(), request_result.key.req_id.slice());
+    try std.testing.expectEqualSlices(u8, ping_id.request_id.slice(), request_result.key.req_id.slice());
     try std.testing.expect(request_result.terminal == .runtime_stopped);
     try std.testing.expect(runtime.popRequestResult() == null);
 
@@ -1537,8 +1693,9 @@ test "request result capacity rejects before actor work and pop releases one slo
         .node_id = remote_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 92 }, .port = 9092 } },
     };
-    const first_id = try runtime.sendPing(remote_id, &remote_pubkey, endpoint.addr, 0);
-    try std.testing.expectError(error.RequestResultCapacityExceeded, runtime.sendPing(remote_id, &remote_pubkey, endpoint.addr, 1));
+    try admitTestPeer(runtime, endpoint.node_id, &remote_pubkey, endpoint.addr);
+    const first_id = try runtime.sendPing(remote_id);
+    try std.testing.expectError(error.RequestResultCapacityExceeded, runtime.sendPing(remote_id));
     var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 1), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
@@ -1546,15 +1703,15 @@ test "request result capacity rejects before actor work and pop releases one slo
     var snapshot = try runtime.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), snapshot.sentMessageCount(.ping));
 
-    try std.testing.expect(try runtime.cancelRequest(remote_id, endpoint.addr, first_id));
-    try std.testing.expectError(error.RequestResultCapacityExceeded, runtime.sendPing(remote_id, &remote_pubkey, endpoint.addr, 2));
+    try std.testing.expect(try runtime.cancelRequest(first_id));
+    try std.testing.expectError(error.RequestResultCapacityExceeded, runtime.sendPing(remote_id));
     const canceled = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
     try expectRequestIdentity(&canceled, endpoint, first_id, .ping);
     try std.testing.expect(canceled.terminal == .canceled);
     try std.testing.expect(runtime.popRequestResult() == null);
 
-    const second_id = try runtime.sendPing(remote_id, &remote_pubkey, endpoint.addr, 3);
-    try std.testing.expect(try runtime.cancelRequest(remote_id, endpoint.addr, second_id));
+    const second_id = try runtime.sendPing(remote_id);
+    try std.testing.expect(try runtime.cancelRequest(second_id));
     const second = try runtime.nextRequestResult();
     try expectRequestIdentity(&second, endpoint, second_id, .ping);
     try std.testing.expect(second.terminal == .canceled);
@@ -1594,15 +1751,16 @@ test "reliable request results cover active and queued cancellation exactly once
         .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 94 }, .port = 9094 } },
     };
-    const active_id = try runtime.sendPing(endpoint.node_id, &remote_pubkey, endpoint.addr, 0);
-    const queued_id = try runtime.sendTalkRequest(endpoint.node_id, &remote_pubkey, endpoint.addr, "proto", "queued");
+    try admitTestPeer(runtime, endpoint.node_id, &remote_pubkey, endpoint.addr);
+    const active_id = try runtime.sendPing(endpoint.node_id);
+    const queued_id = try runtime.sendTalkRequest(endpoint.node_id, "proto", "queued");
     var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 1), counts.active);
     try std.testing.expectEqual(@as(usize, 1), counts.queued);
     try std.testing.expectEqual(@as(usize, 1), counts.permits);
 
-    try std.testing.expect(try runtime.cancelRequest(endpoint.node_id, endpoint.addr, queued_id));
-    try std.testing.expect(try runtime.cancelRequest(endpoint.node_id, endpoint.addr, active_id));
+    try std.testing.expect(try runtime.cancelRequest(queued_id));
+    try std.testing.expect(try runtime.cancelRequest(active_id));
     const first = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
     const second = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
     try std.testing.expect(first.terminal == .canceled);
@@ -1610,18 +1768,18 @@ test "reliable request results cover active and queued cancellation exactly once
     var saw_active = false;
     var saw_queued = false;
     for ([_]runtime_mod.RequestResult{ first, second }) |result| {
-        if (types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, active_id))) {
+        if (types.RequestKeyContext.eql(.{}, result.key, public_api.handleToInternal(active_id).key)) {
             try std.testing.expectEqual(types.RequestKind.ping, result.kind);
             saw_active = true;
-        } else if (types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, queued_id))) {
+        } else if (types.RequestKeyContext.eql(.{}, result.key, public_api.handleToInternal(queued_id).key)) {
             try std.testing.expectEqual(types.RequestKind.talkreq, result.kind);
             saw_queued = true;
         } else return error.UnexpectedRequestResult;
     }
     try std.testing.expect(saw_active and saw_queued);
     try std.testing.expect(runtime.popRequestResult() == null);
-    try std.testing.expect(!try runtime.cancelRequest(endpoint.node_id, endpoint.addr, active_id));
-    try std.testing.expect(!try runtime.cancelRequest(endpoint.node_id, endpoint.addr, queued_id));
+    try std.testing.expect(!try runtime.cancelRequest(active_id));
+    try std.testing.expect(!try runtime.cancelRequest(queued_id));
     counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
@@ -1662,7 +1820,8 @@ test "request timeout publishes one reliable terminal result" {
         .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 96 }, .port = 9096 } },
     };
-    const req_id = try runtime.sendFindNode(endpoint.node_id, &remote_pubkey, endpoint.addr, &.{1});
+    try admitTestPeer(runtime, endpoint.node_id, &remote_pubkey, endpoint.addr);
+    const req_id = try runtime.sendFindNode(endpoint.node_id, &.{1});
     try runtime_mod.Testing.putMaintenance(runtime);
     _ = try runtime.metricsSnapshot();
     const result = runtime.popRequestResult() orelse return error.MissingTimeoutRequestResult;
@@ -1702,8 +1861,9 @@ test "Runtime shutdown terminates active and queued reliable requests" {
         .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 98 }, .port = 9098 } },
     };
-    const active_id = try runtime.sendPing(endpoint.node_id, &remote_pubkey, endpoint.addr, 0);
-    const queued_id = try runtime.sendFindNode(endpoint.node_id, &remote_pubkey, endpoint.addr, &.{1});
+    try admitTestPeer(runtime, endpoint.node_id, &remote_pubkey, endpoint.addr);
+    const active_id = try runtime.sendPing(endpoint.node_id);
+    const queued_id = try runtime.sendFindNode(endpoint.node_id, &.{1});
     const before = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 1), before.active);
     try std.testing.expectEqual(@as(usize, 1), before.queued);
@@ -1718,10 +1878,10 @@ test "Runtime shutdown terminates active and queued reliable requests" {
     var saw_active = false;
     var saw_queued = false;
     for ([_]runtime_mod.RequestResult{ first, second }) |result| {
-        if (types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, active_id))) {
+        if (types.RequestKeyContext.eql(.{}, result.key, public_api.handleToInternal(active_id).key)) {
             try std.testing.expectEqual(types.RequestKind.ping, result.kind);
             saw_active = true;
-        } else if (types.RequestKeyContext.eql(.{}, result.key, .init(endpoint, queued_id))) {
+        } else if (types.RequestKeyContext.eql(.{}, result.key, public_api.handleToInternal(queued_id).key)) {
             try std.testing.expectEqual(types.RequestKind.findnode, result.kind);
             saw_queued = true;
         } else return error.UnexpectedRequestResult;
@@ -1756,12 +1916,14 @@ test "request result reservation rolls back on actor send error" {
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const unavailable = types.Address{ .ip6 = .{ .bytes = [_]u8{0} ** 15 ++ .{1}, .port = 9099 } };
-    try std.testing.expectError(error.NoSocketForAddressFamily, runtime.sendPing(remote_id, &remote_pubkey, unavailable, 0));
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, unavailable);
+    try std.testing.expectError(error.NoSocketForAddressFamily, runtime.sendPing(remote_id));
     try std.testing.expect(runtime.popRequestResult() == null);
 
     const available = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 99 }, .port = 9099 } };
-    const req_id = try runtime.sendPing(remote_id, &remote_pubkey, available, 0);
-    try std.testing.expect(try runtime.cancelRequest(remote_id, available, req_id));
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, available);
+    const req_id = try runtime.sendPing(remote_id);
+    try std.testing.expect(try runtime.cancelRequest(req_id));
     const result = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
     try std.testing.expect(result.terminal == .canceled);
     const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
@@ -1789,6 +1951,12 @@ test "request result reservation rolls back when command enqueue is full" {
     try running.start(runtime);
     try running.awaitStarted();
 
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9c} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 100 }, .port = 9100 } };
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, address);
+
     var gate = runtime_mod.Testing.CommandGate{};
     runtime_mod.Testing.setCommandGate(runtime, &gate);
     var blocker_buffer: [1]runtime_mod.Testing.EnrAdmissionResult = undefined;
@@ -1799,11 +1967,7 @@ test "request result reservation rolls back when command enqueue is full" {
     var queued_reply = runtime_mod.Testing.EnrAdmissionReply.init(&queued_buffer);
     try runtime_mod.Testing.enqueueAddEnr(runtime, try alloc.dupe(u8, &.{0xfe}), &queued_reply);
 
-    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x9c} ** 32));
-    const remote_pubkey = secp.compressedPubkey(&remote_key);
-    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
-    const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 100 }, .port = 9100 } };
-    try std.testing.expectError(error.CommandQueueFull, runtime.sendPing(remote_id, &remote_pubkey, address, 0));
+    try std.testing.expectError(error.CommandQueueFull, runtime.sendPing(remote_id));
     try std.testing.expect(runtime.popRequestResult() == null);
 
     gate.proceed.store(true, .release);
@@ -1811,8 +1975,8 @@ test "request result reservation rolls back when command enqueue is full" {
     _ = try blocker_result;
     const queued_result = try queued_reply.getOneUncancelable(io);
     _ = try queued_result;
-    const req_id = try runtime.sendPing(remote_id, &remote_pubkey, address, 1);
-    try std.testing.expect(try runtime.cancelRequest(remote_id, address, req_id));
+    const req_id = try runtime.sendPing(remote_id);
+    try std.testing.expect(try runtime.cancelRequest(req_id));
     const result = runtime.popRequestResult() orelse return error.MissingCanceledRequestResult;
     try std.testing.expect(result.terminal == .canceled);
     const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
@@ -1843,8 +2007,9 @@ test "running Runtime rejects oversized TALK before queued ownership admission" 
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 19074 } };
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, address);
 
-    const ping_req_id = try runtime.sendPing(remote_id, &remote_pubkey, address, 0);
+    const ping_req_id = try runtime.sendPing(remote_id);
     var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 1), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
@@ -1853,11 +2018,11 @@ test "running Runtime rejects oversized TALK before queued ownership admission" 
     const protocol = [_]u8{0x01};
     const request = [_]u8{0x02} ** 1_200;
     try std.testing.expect(protocol.len + request.len <= packet.MAX_PACKET_SIZE);
-    try std.testing.expectError(error.MessageTooLarge, runtime.sendTalkRequest(remote_id, &remote_pubkey, address, &protocol, &request));
+    try std.testing.expectError(error.MessageTooLarge, runtime.sendTalkRequest(remote_id, &protocol, &request));
 
     const response = [_]u8{0x03} ** 1_200;
     try std.testing.expect(response.len <= packet.MAX_PACKET_SIZE);
-    try std.testing.expectError(error.MessageTooLarge, runtime.sendTalkResponse(remote_id, address, .{ .bytes = [_]u8{0x04} ** 8, .len = 8 }, &response));
+    try std.testing.expectError(error.MessageTooLarge, runtime.sendTalkResponse(remote_id, address, &([_]u8{0x04} ** 8), &response));
 
     counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 1), counts.active);
@@ -1869,7 +2034,7 @@ test "running Runtime rejects oversized TALK before queued ownership admission" 
     try std.testing.expectEqual(@as(u64, 1), snapshot.sentMessageCount(metrics.MessageType.ping));
     try std.testing.expectEqual(@as(u64, 0), snapshot.sentMessageCount(metrics.MessageType.talkreq));
 
-    try std.testing.expect(try runtime.cancelRequest(remote_id, address, ping_req_id));
+    try std.testing.expect(try runtime.cancelRequest(ping_req_id));
     counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
@@ -1903,6 +2068,7 @@ test "running Runtime rejects exactly 128 FINDNODE distances before request admi
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 19075 } };
+    _ = address;
     const distances = [_]u16{1} ** 128;
 
     var counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
@@ -1912,7 +2078,7 @@ test "running Runtime rejects exactly 128 FINDNODE distances before request admi
     var snapshot = try runtime.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 0), snapshot.sentMessageCount(.findnode));
 
-    try std.testing.expectError(error.TooManyDistances, runtime.sendFindNode(remote_id, &remote_pubkey, address, &distances));
+    try std.testing.expectError(error.TooManyDistances, runtime.sendFindNode(remote_id, &distances));
 
     counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
@@ -1946,12 +2112,13 @@ test "running Runtime rejects invalid FINDNODE distance before request admission
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 19077 } };
+    _ = address;
 
     const before = runtime_mod.Testing.requestResultReservationCount(runtime);
     try std.testing.expectEqual(@as(usize, 0), before.outstanding);
     try std.testing.expectEqual(@as(usize, 0), before.unclaimed);
 
-    try std.testing.expectError(error.InvalidDistance, runtime.sendFindNode(remote_id, &remote_pubkey, address, &.{257}));
+    try std.testing.expectError(error.InvalidDistance, runtime.sendFindNode(remote_id, &.{257}));
 
     const counts = runtime_mod.Testing.activeQueuedAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
@@ -2099,9 +2266,10 @@ test "Runtime exposes named request cancellation" {
     try running.awaitStarted();
 
     const address = @import("types.zig").Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 19075 } };
-    const req_id = try runtime.sendPing(remote_id, &remote_pubkey, address, 0);
-    try std.testing.expect(try runtime.cancelRequest(remote_id, address, req_id));
-    try std.testing.expect(!try runtime.cancelRequest(remote_id, address, req_id));
+    try admitTestPeer(runtime, remote_id, &remote_pubkey, address);
+    const req_id = try runtime.sendPing(remote_id);
+    try std.testing.expect(try runtime.cancelRequest(req_id));
+    try std.testing.expect(!try runtime.cancelRequest(req_id));
     running.stop();
     try running.await();
     try std.testing.expect(running.run_result == null);
@@ -2278,14 +2446,14 @@ test "full or empty EventOutbox never duplicates reliable TALK response terminal
     try std.testing.expect(try runtime_a.addNode(id_b, &pubkey_b, address_b, local_enr_b));
     try std.testing.expect(try runtime_b.addNode(id_a, &pubkey_a, address_a, local_enr_a));
 
-    const ping_id = try runtime_a.sendPing(id_b, &pubkey_b, address_b, 0);
+    const ping_id = try runtime_a.sendPing(id_b);
     const pong_result = try awaitRequestResult(io, runtime_a);
     try expectRequestIdentity(&pong_result, endpoint_b, ping_id, .ping);
     try std.testing.expect(pong_result.terminal == .pong);
     try std.testing.expectEqual(@as(u64, 1), pong_result.terminal.pong.enr_seq);
     try std.testing.expectEqual(address_a.getPort(), pong_result.terminal.pong.recipient_port);
 
-    const findnode_id = try runtime_a.sendFindNode(id_b, &pubkey_b, address_b, &.{0});
+    const findnode_id = try runtime_a.sendFindNode(id_b, &.{0});
     const nodes_result = try awaitRequestResult(io, runtime_a);
     try expectRequestIdentity(&nodes_result, endpoint_b, findnode_id, .findnode);
     try std.testing.expect(nodes_result.terminal == .nodes);
@@ -2293,16 +2461,16 @@ test "full or empty EventOutbox never duplicates reliable TALK response terminal
     try std.testing.expectEqualSlices(u8, local_enr_b, nodes_result.terminal.nodes.slice()[0].slice());
     const snapshot_before_talk = try runtime_a.metricsSnapshot();
 
-    const talk_id = try runtime_a.sendTalkRequest(id_b, &pubkey_b, address_b, "test", "request");
-    var talk_cleanup = RuntimeRequestCleanup{ .runtime = runtime_a, .key = .init(endpoint_b, talk_id) };
+    const talk_id = try runtime_a.sendTalkRequest(id_b, "test", "request");
+    var talk_cleanup = RuntimeRequestCleanup{ .runtime = runtime_a, .handle = talk_id };
     defer talk_cleanup.deinit();
     var response_sent = false;
     for (0..2_000) |_| {
         while (runtime_b.popEvent()) |event_value| {
             var event = event_value;
             defer event.deinit(alloc);
-            if (event == .talkreq and std.mem.eql(u8, event.talkreq.req_id.slice(), talk_id.slice())) {
-                try runtime_b.sendTalkResponse(id_a, address_a, event.talkreq.req_id, "response bytes");
+            if (event == .talkreq and std.mem.eql(u8, event.talkreq.req_id.slice(), talk_id.request_id.slice())) {
+                try runtime_b.sendTalkResponse(id_a, address_a, event.talkreq.req_id.slice(), "response bytes");
                 response_sent = true;
             }
         }
@@ -2328,16 +2496,16 @@ test "full or empty EventOutbox never duplicates reliable TALK response terminal
     try std.testing.expectEqual(@as(usize, 0), counts.queued);
     try std.testing.expectEqual(@as(usize, 0), counts.permits);
 
-    const empty_talk_id = try runtime_a.sendTalkRequest(id_b, &pubkey_b, address_b, "test", "second request");
-    var empty_talk_cleanup = RuntimeRequestCleanup{ .runtime = runtime_a, .key = .init(endpoint_b, empty_talk_id) };
+    const empty_talk_id = try runtime_a.sendTalkRequest(id_b, "test", "second request");
+    var empty_talk_cleanup = RuntimeRequestCleanup{ .runtime = runtime_a, .handle = empty_talk_id };
     defer empty_talk_cleanup.deinit();
     response_sent = false;
     for (0..2_000) |_| {
         while (runtime_b.popEvent()) |event_value| {
             var event = event_value;
             defer event.deinit(alloc);
-            if (event == .talkreq and std.mem.eql(u8, event.talkreq.req_id.slice(), empty_talk_id.slice())) {
-                try runtime_b.sendTalkResponse(id_a, address_a, event.talkreq.req_id, "second response");
+            if (event == .talkreq and std.mem.eql(u8, event.talkreq.req_id.slice(), empty_talk_id.request_id.slice())) {
+                try runtime_b.sendTalkResponse(id_a, address_a, event.talkreq.req_id.slice(), "second response");
                 response_sent = true;
             }
         }

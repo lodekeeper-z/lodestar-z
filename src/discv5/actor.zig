@@ -79,14 +79,18 @@ pub const SendDatagramEffect = struct {
 };
 
 pub const OutboundRequestAction = union(enum) {
-    queued: message.ReqId,
+    queued: types.RequestHandle,
     send: SendDatagramEffect,
 
-    pub fn requestId(self: *const OutboundRequestAction) message.ReqId {
+    pub fn handle(self: *const OutboundRequestAction) types.RequestHandle {
         return switch (self.*) {
-            .queued => |req_id| req_id,
-            .send => |*effect| effect.requestId(),
+            .queued => |value| value,
+            .send => |effect| effect.handle,
         };
+    }
+
+    pub fn requestId(self: *const OutboundRequestAction) message.ReqId {
+        return self.handle().key.req_id;
     }
 };
 
@@ -378,11 +382,10 @@ pub const Actor = struct {
         context: TransitionContext,
         endpoint: types.Endpoint,
         pubkey: *const [33]u8,
-        enr_seq: u64,
         origin: types.RequestOrigin,
     ) !OutboundRequestAction {
         const req_id = randomReqId(context.io);
-        const ping = message.Ping{ .req_id = req_id, .enr_seq = enr_seq };
+        const ping = message.Ping{ .req_id = req_id, .enr_seq = self.local.seq };
         var buffer: [128]u8 = undefined;
         return outbound.prepareTracked(self, context, endpoint, pubkey, req_id, .ping, &.{}, try ping.encodeInto(&buffer), origin);
     }
@@ -547,10 +550,9 @@ pub const Actor = struct {
         env: Env,
         endpoint: types.Endpoint,
         pubkey: *const [33]u8,
-        enr_seq: u64,
         origin: types.RequestOrigin,
     ) !message.ReqId {
-        var action = try self.preparePing(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, enr_seq, origin);
+        var action = try self.preparePing(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, origin);
         const req_id = action.requestId();
         try outbound.emitPrepared(self, env, action);
         return req_id;
@@ -741,11 +743,18 @@ pub const Actor = struct {
         maintenance_flow.run(self, env, now_real_ns);
     }
 
-    pub fn cancelRequest(self: *Actor, env: Env, key: types.RequestKey) bool {
-        if (self.requests.containsRequest(key)) {
+    pub fn cancelRequest(self: *Actor, env: Env, handle_value: anytype) bool {
+        const handle: types.RequestHandle = if (@TypeOf(handle_value) == types.RequestHandle)
+            handle_value
+        else if (@TypeOf(handle_value) == types.RequestKey)
+            self.requests.handleFor(handle_value) orelse self.requests.queuedHandleFor(handle_value) orelse return false
+        else
+            @compileError("cancelRequest requires RequestHandle or internal RequestKey");
+        const key = handle.key;
+        if (self.requests.matchesHandle(handle)) {
             return completion.finish(self, env, key, .canceled, .canceled);
         }
-        const queued = self.requests.takeQueued(key) orelse return false;
+        const queued = self.requests.takeQueuedHandle(handle) orelse return false;
         self.publishRequestTerminal(env, key, queued.kind, queued.origin, .canceled);
         self.onRequestCancellation(env, key, queued.origin);
         outbound.drainEndpoint(self, env, key.endpoint);
@@ -1343,7 +1352,7 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .effects = &effects };
     try std.testing.expect(actor.addNode(lookup_peer_id, &lookup_pubkey, lookup_address, null, 0));
 
-    const blocker_req_id = try actor.sendPing(env, blocker_endpoint, &blocker_pubkey, 0, .api);
+    const blocker_req_id = try actor.sendPing(env, blocker_endpoint, &blocker_pubkey, .api);
     while (effects.pop()) |effect| {
         recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
             actor.applyEffectCompletion(env, effect, .failed);
@@ -1371,7 +1380,7 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
     try std.testing.expect(outbox.pop() == null);
 
-    try std.testing.expect(actor.cancelRequest(env, .init(blocker_endpoint, blocker_req_id)));
+    try std.testing.expect(actor.cancelRequest(env, types.RequestKey.init(blocker_endpoint, blocker_req_id)));
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
 

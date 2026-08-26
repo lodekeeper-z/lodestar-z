@@ -138,7 +138,7 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     const queued_id = try message.ReqId.fromSlice(&.{9});
     const queued_ping = message.Ping{ .req_id = queued_id, .enr_seq = 0 };
     var queued_buffer: [128]u8 = undefined;
-    try actor.requests.queue(try .init(.api, endpoint, &remote_pubkey, queued_id, .ping, &.{}, try queued_ping.encodeInto(&queued_buffer), std.math.maxInt(i64)));
+    _ = try actor.requests.queue(try .init(.api, endpoint, &remote_pubkey, queued_id, .ping, &.{}, try queued_ping.encodeInto(&queued_buffer), std.math.maxInt(i64)));
     harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
 
     const response = message.TalkResp{ .req_id = talk_id, .response = "owned response" };
@@ -226,7 +226,7 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     _ = actor.peers.markResponsive(remote_id, endpoint.addr, 0, null);
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x6c} ** 16, .recipient_key = [_]u8{0x6d} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, 1, .{ .maintenance = .health });
+    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .{ .maintenance = .health });
     try harness.drainEffects();
     const key = types.RequestKey.init(endpoint, req_id);
     try std.testing.expect(actor.peers.armHealthRequest(key, .connected_only));

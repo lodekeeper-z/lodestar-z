@@ -185,8 +185,8 @@ test "RequestBook keeps every request queued xor active in FIFO order" {
     const pubkey = [_]u8{3} ** 33;
     const first = try message.ReqId.fromSlice(&.{1});
     const second = try message.ReqId.fromSlice(&.{2});
-    try book.queue(try .init(.api, peer, &pubkey, first, .ping, &.{ 0, 256, 256 }, &.{1}, 0));
-    try book.queue(try .init(.api, peer, &pubkey, second, .ping, &.{}, &.{1}, 0));
+    _ = try book.queue(try .init(.api, peer, &pubkey, first, .ping, &.{ 0, 256, 256 }, &.{1}, 0));
+    _ = try book.queue(try .init(.api, peer, &pubkey, second, .ping, &.{}, &.{1}, 0));
     try std.testing.expectEqualSlices(u8, first.slice(), book.firstQueued(peer).?.req_id.slice());
     try std.testing.expect(book.firstQueued(peer).?.requested_distances.contains(0));
     try std.testing.expect(book.firstQueued(peer).?.requested_distances.contains(256));
@@ -211,7 +211,7 @@ test "terminal take consumes sending queued intent and rejects stale completions
     const pubkey = [_]u8{39} ** 33;
     const req_id = try message.ReqId.fromSlice(&.{1});
     const key = types.RequestKey.init(peer, req_id);
-    try book.queue(try .init(.api, peer, &pubkey, req_id, .ping, &.{}, &.{1}, 10));
+    _ = try book.queue(try .init(.api, peer, &pubkey, req_id, .ping, &.{}, &.{1}, 10));
     const handle = try book.beginSending(&ingress, key, .api, .pong, .{
         .awaiting_whoareyou = try probe(39),
     }, 10, true, true);
@@ -239,8 +239,8 @@ test "RequestBook takes an exact queued request without disturbing lane FIFO" {
     const pubkey = [_]u8{4} ** 33;
     const first = try message.ReqId.fromSlice(&.{1});
     const second = try message.ReqId.fromSlice(&.{2});
-    try book.queue(try .init(.api, peer, &pubkey, first, .ping, &.{}, &.{1}, 10));
-    try book.queue(try .init(.api, peer, &pubkey, second, .ping, &.{}, &.{2}, 10));
+    _ = try book.queue(try .init(.api, peer, &pubkey, first, .ping, &.{}, &.{1}, 10));
+    _ = try book.queue(try .init(.api, peer, &pubkey, second, .ping, &.{}, &.{2}, 10));
 
     const removed = book.takeQueued(.init(peer, second)) orelse return error.MissingQueuedRequest;
     try std.testing.expectEqualSlices(u8, second.slice(), removed.req_id.slice());
@@ -268,7 +268,7 @@ test "queued expiry removes mixed requests across lanes and preserves live FIFO 
     for (0..24) |index| {
         const lane = if (index < 16) endpoint(20) else if (index < 21) endpoint(21) else endpoint(22);
         const expired = index < 12 or (index >= 16 and index < 21);
-        try book.queue(try .init(
+        _ = try book.queue(try .init(
             .api,
             lane,
             &pubkey,
@@ -327,7 +327,7 @@ test "round robin drain selection reaches lane seventeen while first batch remai
     const pubkey = [_]u8{5} ** 33;
     for (1..18) |last| {
         const peer = endpoint(@intCast(last));
-        try book.queue(try .init(
+        _ = try book.queue(try .init(
             .api,
             peer,
             &pubkey,
@@ -389,8 +389,8 @@ fn queueAllocationLifecycle(alloc: std.mem.Allocator) !void {
     defer book.deinit(&ingress);
     const peer = endpoint(4);
     const pubkey = [_]u8{8} ** 33;
-    try book.queue(try .init(.api, peer, &pubkey, try message.ReqId.fromSlice(&.{1}), .ping, &.{}, &.{1}, 10));
-    try book.queue(try .init(.api, peer, &pubkey, try message.ReqId.fromSlice(&.{2}), .ping, &.{}, &.{2}, 10));
+    _ = try book.queue(try .init(.api, peer, &pubkey, try message.ReqId.fromSlice(&.{1}), .ping, &.{}, &.{1}, 10));
+    _ = try book.queue(try .init(.api, peer, &pubkey, try message.ReqId.fromSlice(&.{2}), .ping, &.{}, &.{2}, 10));
     book.assertInvariants();
 }
 
@@ -486,7 +486,7 @@ test "RequestBook shutdown releases active permits and only deinitializes queued
     }, 10, true);
     const queued_endpoint = endpoint(8);
     const pubkey = [_]u8{8} ** 33;
-    try book.queue(try .init(.api, queued_endpoint, &pubkey, try message.ReqId.fromSlice(&.{2}), .ping, &.{}, &.{1}, 10));
+    _ = try book.queue(try .init(.api, queued_endpoint, &pubkey, try message.ReqId.fromSlice(&.{2}), .ping, &.{}, &.{1}, 10));
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
     book.deinit(&ingress);
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
@@ -503,7 +503,7 @@ test "lookup finish detaches active and queued requests without cancellation" {
     }, 10, true);
     const queued_endpoint = endpoint(10);
     const pubkey = [_]u8{9} ** 33;
-    try book.queue(try .init(.{ .lookup = 42 }, queued_endpoint, &pubkey, try message.ReqId.fromSlice(&.{2}), .ping, &.{}, &.{1}, 10));
+    _ = try book.queue(try .init(.{ .lookup = 42 }, queued_endpoint, &pubkey, try message.ReqId.fromSlice(&.{2}), .ping, &.{}, &.{1}, 10));
 
     book.detachLookup(42);
     try std.testing.expectEqual(types.RequestOrigin.detached_lookup, book.get(active_key).?.origin);

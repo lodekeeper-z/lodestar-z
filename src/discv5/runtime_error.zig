@@ -79,6 +79,7 @@ pub const RequestError = CommandError || error{
     TooManyQueuedRequests,
     TooManyQueuedRequestsForEndpoint,
     TransportSendFailed,
+    UnknownPeer,
 };
 
 pub const FindNodeError = RequestError || error{ InvalidDistance, TooManyDistances };
@@ -86,6 +87,7 @@ pub const TalkRequestError = RequestError || error{MessageTooLarge};
 
 pub const TalkResponseError = CommandError || error{
     EndpointMismatch,
+    InvalidRequestId,
     MessageTooLarge,
     NoSession,
     NoSocketForAddressFamily,

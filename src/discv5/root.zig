@@ -5,9 +5,9 @@ pub const secp256k1 = @import("secp256k1.zig");
 pub const hex = @import("hex");
 
 const runtime = @import("runtime.zig");
-const message = @import("protocol/message.zig");
 const metrics = @import("metrics.zig");
 const rate_limit = @import("rate_limit.zig");
+const public_api = @import("public_api.zig");
 pub const Runtime = runtime.Runtime;
 pub const RuntimeError = runtime.Error;
 pub const Config = @import("config.zig").Config;
@@ -17,7 +17,8 @@ pub const BindAddresses = @import("config.zig").BindAddresses;
 pub const Event = @import("events.zig").Event;
 pub const EventKind = @import("events.zig").EventKind;
 pub const event_kind_count = @import("events.zig").event_kind_count;
-pub const ReqId = message.ReqId;
+pub const RequestId = public_api.RequestId;
+pub const RequestHandle = public_api.RequestHandle;
 pub const RateLimitConfig = rate_limit.Config;
 pub const MetricsSnapshot = metrics.MetricsSnapshot;
 pub const ContactMetricsSnapshot = @import("contact_book.zig").ContactMetricsSnapshot;
@@ -27,7 +28,6 @@ pub const LookupTerminalReason = @import("lookup_results.zig").LookupTerminalRea
 pub const RequestResult = @import("request_results.zig").RequestResult;
 pub const RequestTerminal = @import("request_results.zig").RequestTerminal;
 pub const RequestSendFailure = @import("request_results.zig").RequestSendFailure;
-pub const RequestKey = @import("types.zig").RequestKey;
 pub const RequestKind = @import("types.zig").RequestKind;
 pub const NodeId = enr.NodeId;
 pub const Enr = enr.Enr;
@@ -36,6 +36,11 @@ pub const MAX_LOOKUP_RESULTS = @import("service/lookup.zig").MAX_RESULTS;
 pub const MAX_REQUEST_RESULTS = @import("config.zig").MAX_REQUEST_RESULTS;
 
 test {
+    try @import("std").testing.expect(!@hasDecl(@This(), "ReqId"));
+    try @import("std").testing.expect(!@hasDecl(@This(), "RequestKey"));
+    const maximum = try RequestId.fromSlice(&([_]u8{0xaa} ** 8));
+    try @import("std").testing.expectEqual(@as(usize, 8), maximum.slice().len);
+    try @import("std").testing.expectError(error.InvalidRequestId, RequestId.fromSlice(&([_]u8{0xaa} ** 9)));
     _ = @import("wire_test_vectors.zig");
     _ = @import("enr.zig");
     _ = @import("enr_test.zig");

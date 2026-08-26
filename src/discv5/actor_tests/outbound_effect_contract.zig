@@ -53,7 +53,6 @@ const TestContext = struct {
             .{ .io = self.harness.io, .ingress = &self.harness.ingress },
             self.endpoint,
             &self.remote_pubkey,
-            0,
             .reliable_api,
         );
         return switch (action) {
@@ -230,7 +229,6 @@ test "bounded request effect output owns sending state without executing transpo
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
-        0,
         .reliable_api,
     );
 
@@ -255,7 +253,6 @@ test "full request effect output aborts the unaccepted sending state" {
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
-        0,
         .reliable_api,
     );
     var env = context.harness.env();
@@ -267,7 +264,6 @@ test "full request effect output aborts the unaccepted sending state" {
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         second_endpoint,
         &context.remote_pubkey,
-        0,
         .reliable_api,
     );
     const second_key = types.RequestKey.init(second_endpoint, second.requestId());
@@ -297,7 +293,6 @@ test "queued effect enqueue abort preserves intent and releases canonical sendin
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
-        0,
         .api,
     );
     try outbound.emitPrepared(&context.harness.actor, env, blocker);
@@ -305,7 +300,7 @@ test "queued effect enqueue abort preserves intent and releases canonical sendin
     queued_endpoint.addr.ip4.port += 1;
     const queued_id = try message.ReqId.fromSlice(&.{0x44});
     var plaintext: [128]u8 = undefined;
-    try context.harness.actor.requests.queue(try .init(
+    _ = try context.harness.actor.requests.queue(try .init(
         .api,
         queued_endpoint,
         &context.remote_pubkey,
@@ -346,7 +341,6 @@ test "sending endpoint establishment queues a second request before send complet
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
-        0,
         .api,
     );
     try outbound.emitPrepared(&context.harness.actor, env, first);
@@ -355,7 +349,6 @@ test "sending endpoint establishment queues a second request before send complet
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
-        0,
         .api,
     );
     switch (second) {
@@ -403,7 +396,6 @@ test "queued drain emits one FIFO effect per sent completion" {
         .{ .io = io, .ingress = &harness.ingress },
         endpoint,
         &remote_pubkey,
-        0,
         .api,
     );
     var blocker_effect = switch (blocker_action) {
@@ -417,7 +409,7 @@ test "queued drain emits one FIFO effect per sent completion" {
     const second_id = try message.ReqId.fromSlice(&.{0x32});
     var first_buffer: [128]u8 = undefined;
     var second_buffer: [128]u8 = undefined;
-    try harness.actor.requests.queue(try .init(
+    _ = try harness.actor.requests.queue(try .init(
         .api,
         endpoint,
         &remote_pubkey,
@@ -427,7 +419,7 @@ test "queued drain emits one FIFO effect per sent completion" {
         try (message.Ping{ .req_id = first_id, .enr_seq = 0 }).encodeInto(&first_buffer),
         std.math.maxInt(i64),
     ));
-    try harness.actor.requests.queue(try .init(
+    _ = try harness.actor.requests.queue(try .init(
         .api,
         endpoint,
         &remote_pubkey,
@@ -466,7 +458,6 @@ test "Actor tracked send helpers emit without executing transport" {
         context.harness.env(),
         context.endpoint,
         &context.remote_pubkey,
-        0,
         .api,
     );
     try std.testing.expectEqual(@as(usize, 1), context.harness.effects.count());
