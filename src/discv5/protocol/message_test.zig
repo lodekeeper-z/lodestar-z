@@ -256,6 +256,79 @@ test "discv5 messages: NODES encode/decode" {
     try std.testing.expectEqualSlices(u8, enr_b, decoded.enrs[1]);
 }
 
+test "discv5 messages: NODES decodeInto does not publish before the final container boundary" {
+    const malformed = [_]u8{
+        message.MSG_NODES,
+        0xc5, // [request-id, total, enrs, unexpected]
+        0x01,
+        0x01,
+        0xc1,
+        0x80,
+        0x80,
+    };
+    var storage = [_][]const u8{"sentinel"};
+    const sentinel = storage[0];
+
+    try std.testing.expectError(Error.InvalidEncoding, Nodes.decodeInto(&malformed, &storage));
+    try std.testing.expectEqual(sentinel.ptr, storage[0].ptr);
+    try std.testing.expectEqual(sentinel.len, storage[0].len);
+}
+
+test "discv5 messages: NODES decodeInto insufficient capacity leaves output unchanged" {
+    const valid = [_]u8{ message.MSG_NODES, 0xc4, 0x01, 0x01, 0xc1, 0x80 };
+    var storage = [_][]const u8{"sentinel"};
+    const sentinel = storage[0];
+
+    try std.testing.expectError(Error.BufferTooSmall, Nodes.decodeInto(&valid, storage[0..0]));
+    try std.testing.expectEqual(sentinel.ptr, storage[0].ptr);
+    try std.testing.expectEqual(sentinel.len, storage[0].len);
+}
+
+test "discv5 messages: NODES decodeInto trailing data leaves output unchanged" {
+    const trailing = [_]u8{ message.MSG_NODES, 0xc4, 0x01, 0x01, 0xc1, 0x80, 0x80 };
+    var storage = [_][]const u8{"sentinel"};
+    const sentinel = storage[0];
+
+    try std.testing.expectError(Error.InvalidEncoding, Nodes.decodeInto(&trailing, &storage));
+    try std.testing.expectEqual(sentinel.ptr, storage[0].ptr);
+    try std.testing.expectEqual(sentinel.len, storage[0].len);
+}
+
+test "discv5 messages: decoded message owns bounded NODES references" {
+    const encoded = [_]u8{ message.MSG_NODES, 0xc4, 0x01, 0x01, 0xc1, 0x80 };
+    const decoded = try message.DecodedMessage.decode(&encoded);
+    switch (decoded) {
+        .nodes => |nodes| {
+            try std.testing.expectEqual(@as(usize, 1), nodes.enrs_len);
+            try std.testing.expectEqualSlices(u8, &[_]u8{0x80}, nodes.enrs[0]);
+        },
+        else => return error.UnexpectedMessageType,
+    }
+}
+
+test "discv5 messages: decoded message initializes unused owned storage" {
+    const encoded_nodes = [_]u8{ message.MSG_NODES, 0xc4, 0x01, 0x01, 0xc1, 0x80 };
+    const decoded_nodes = try message.DecodedMessage.decode(&encoded_nodes);
+    switch (decoded_nodes) {
+        .nodes => |nodes| {
+            try std.testing.expectEqual(@as(usize, 1), nodes.enrs_len);
+            for (nodes.enrs[nodes.enrs_len..]) |unused| try std.testing.expectEqual(@as(usize, 0), unused.len);
+        },
+        else => return error.UnexpectedMessageType,
+    }
+
+    var encoded_findnode_buffer: [message.MAX_ENCODED_SIZE]u8 = undefined;
+    const encoded_findnode = try encodeFindNodeWireUnchecked(&encoded_findnode_buffer, &.{1});
+    const decoded_findnode = try message.DecodedMessage.decode(encoded_findnode);
+    switch (decoded_findnode) {
+        .findnode => |findnode| {
+            try std.testing.expectEqual(@as(usize, 1), findnode.distances_len);
+            for (findnode.distances[findnode.distances_len..]) |unused| try std.testing.expectEqual(@as(u16, 0), unused);
+        },
+        else => return error.UnexpectedMessageType,
+    }
+}
+
 test "discv5 messages: NODES decode returns encoded ENR bytes" {
     const alloc = std.testing.allocator;
     const enr_mod = @import("../enr.zig");

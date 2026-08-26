@@ -20,38 +20,31 @@ const MAX_NODES_RESPONSE = request_book.MAX_NODES_RESPONSE;
 const MAX_ENRS_PER_PACKET = config.MAX_ENRS_PER_NODES_PACKET;
 const MAX_RESPONSE_CHUNKS = config.MAX_NODES_RESPONSE_CHUNKS;
 
-pub fn dispatch(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
-    if (plaintext.len == 0) return;
-    switch (plaintext[0]) {
-        message.MSG_PING => handlePing(actor, env, plaintext, endpoint),
-        message.MSG_PONG => handlePong(actor, env, plaintext, endpoint),
-        message.MSG_FINDNODE => handleFindNode(actor, env, plaintext, endpoint),
-        message.MSG_NODES => handleNodes(actor, env, plaintext, endpoint),
-        message.MSG_TALKREQ => handleTalkReq(actor, env, plaintext, endpoint),
-        message.MSG_TALKRESP => handleTalkResp(actor, env, plaintext, endpoint),
-        else => {},
+pub fn dispatch(actor: *Actor, env: Env, decoded: *const message.DecodedMessage, endpoint: types.Endpoint) void {
+    switch (decoded.*) {
+        .ping => |*ping| handlePing(actor, env, ping, endpoint),
+        .pong => |*pong| handlePong(actor, env, pong, endpoint),
+        .findnode => |*findnode| handleFindNode(actor, env, findnode, endpoint),
+        .nodes => |*nodes| handleNodes(actor, env, nodes, endpoint),
+        .talkreq => |*request| handleTalkReq(actor, env, request, endpoint),
+        .talkresp => |*response| handleTalkResp(actor, env, response, endpoint),
     }
 }
 
-pub fn isExpectedResponse(actor: *Actor, plaintext: []const u8, endpoint: types.Endpoint) bool {
-    if (plaintext.len == 0) return false;
-    switch (plaintext[0]) {
-        message.MSG_PONG => {
-            const pong = message.Pong.decode(plaintext) catch return false;
+pub fn isExpectedResponse(actor: *Actor, decoded: *const message.DecodedMessage, endpoint: types.Endpoint) bool {
+    switch (decoded.*) {
+        .pong => |pong| {
             const active = actor.requests.get(.init(endpoint, pong.req_id)) orelse return false;
             return active.response == .pong;
         },
-        message.MSG_NODES => {
-            var enr_buffer: [MAX_NODES_RESPONSE][]const u8 = undefined;
-            const nodes = message.Nodes.decodeInto(plaintext, &enr_buffer) catch return false;
+        .nodes => |nodes| {
             if (nodes.total == 0 or nodes.total > MAX_NODES_RESPONSE) return false;
             const active = actor.requests.get(.init(endpoint, nodes.req_id)) orelse return false;
             if (active.response != .nodes) return false;
             if (active.response.nodes.total_responses) |expected| return expected == nodes.total;
             return true;
         },
-        message.MSG_TALKRESP => {
-            const response = message.TalkResp.decode(plaintext) catch return false;
+        .talkresp => |response| {
             const active = actor.requests.get(.init(endpoint, response.req_id)) orelse return false;
             return active.response == .talkresp;
         },
@@ -59,9 +52,8 @@ pub fn isExpectedResponse(actor: *Actor, plaintext: []const u8, endpoint: types.
     }
 }
 
-fn handlePing(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
-    const ping = message.Ping.decode(plaintext) catch return;
-    noteReceived(actor, plaintext);
+fn handlePing(actor: *Actor, env: Env, ping: *const message.Ping, endpoint: types.Endpoint) void {
+    noteReceived(actor, message.MSG_PING);
     actor.maybeRequestEnrUpdate(env, endpoint, ping.enr_seq);
     const pong = message.Pong{
         .req_id = ping.req_id,
@@ -77,9 +69,8 @@ fn handlePing(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.En
     outbound.sendResponse(actor, env, endpoint, encoded) catch {};
 }
 
-fn handlePong(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
-    const pong = message.Pong.decode(plaintext) catch return;
-    noteReceived(actor, plaintext);
+fn handlePong(actor: *Actor, env: Env, pong: *const message.Pong, endpoint: types.Endpoint) void {
+    noteReceived(actor, message.MSG_PONG);
     const key = types.RequestKey.init(endpoint, pong.req_id);
     const request = actor.requests.get(key) orelse return;
     if (request.response != .pong) return;
@@ -92,16 +83,12 @@ fn handlePong(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.En
     actor.maybeRequestEnrUpdate(env, endpoint, pong.enr_seq);
 }
 
-fn handleFindNode(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
-    // Public wire decoding accepts the full packet-derived cardinality. The
-    // smaller outbound actor/runtime policy does not apply to remote requests.
-    var distance_buffer: [message.MAX_FINDNODE_DISTANCES]u16 = undefined;
-    const findnode = message.FindNode.decodeInto(plaintext, &distance_buffer) catch return;
-    noteReceived(actor, plaintext);
+fn handleFindNode(actor: *Actor, env: Env, findnode: *const message.DecodedFindNode, endpoint: types.Endpoint) void {
+    noteReceived(actor, message.MSG_FINDNODE);
     var seen = [_]bool{false} ** 257;
     var references_buffer: [MAX_NODES_RESPONSE][]const u8 = undefined;
     var references = std.ArrayListUnmanaged([]const u8).initBuffer(&references_buffer);
-    for (findnode.distances) |distance| {
+    for (findnode.distancesSlice()) |distance| {
         if (distance > 256 or seen[distance]) continue;
         seen[distance] = true;
         if (distance == 0) {
@@ -127,11 +114,9 @@ fn handleFindNode(actor: *Actor, env: Env, plaintext: []const u8, endpoint: type
     }
 }
 
-fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
-    var enr_buffer: [MAX_NODES_RESPONSE][]const u8 = undefined;
-    const nodes = message.Nodes.decodeInto(plaintext, &enr_buffer) catch return;
+fn handleNodes(actor: *Actor, env: Env, nodes: *const message.DecodedNodes, endpoint: types.Endpoint) void {
     if (nodes.total == 0 or nodes.total > MAX_NODES_RESPONSE) return;
-    noteReceived(actor, plaintext);
+    noteReceived(actor, message.MSG_NODES);
     const key = types.RequestKey.init(endpoint, nodes.req_id);
     const active = actor.requests.get(key) orelse return;
     if (active.response != .nodes) return;
@@ -143,7 +128,7 @@ fn handleNodes(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.E
         accumulator.total_responses = total;
     }
     var discovered: [MAX_NODES_RESPONSE]enr.ValidatedEnr = undefined;
-    const discovered_len = retainNodes(actor, env, active, nodes.enrs, &endpoint.node_id, &discovered);
+    const discovered_len = retainNodes(actor, env, active, nodes.enrsSlice(), &endpoint.node_id, &discovered);
     accumulator.responses_received += 1;
     if (accumulator.responses_received < accumulator.total_responses.?) {
         for (discovered[0..discovered_len]) |*validated| actor.publishValidatedDiscovered(env.outbox, validated);
@@ -209,9 +194,8 @@ fn closerCandidates(actor: *const Actor, validated_enrs: []const enr.ValidatedEn
     return closer_len;
 }
 
-fn handleTalkReq(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
-    const request = message.TalkReq.decode(plaintext) catch return;
-    noteReceived(actor, plaintext);
+fn handleTalkReq(actor: *Actor, env: Env, request: *const message.TalkReq, endpoint: types.Endpoint) void {
+    noteReceived(actor, message.MSG_TALKREQ);
     const protocol_copy = actor.alloc.dupe(u8, request.protocol) catch {
         env.outbox.notePayloadDrop(.talk_req_received);
         return;
@@ -230,9 +214,8 @@ fn handleTalkReq(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types
     } });
 }
 
-fn handleTalkResp(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
-    const response = message.TalkResp.decode(plaintext) catch return;
-    noteReceived(actor, plaintext);
+fn handleTalkResp(actor: *Actor, env: Env, response: *const message.TalkResp, endpoint: types.Endpoint) void {
+    noteReceived(actor, message.MSG_TALKRESP);
     const key = types.RequestKey.init(endpoint, response.req_id);
     const request = actor.requests.get(key) orelse return;
     if (request.response != .talkresp) return;
@@ -257,6 +240,6 @@ fn recipientAddress(ip: message.Pong.RecipientIp, port: u16) types.Address {
     };
 }
 
-fn noteReceived(actor: *Actor, plaintext: []const u8) void {
-    if (metrics.MessageType.fromByte(plaintext[0])) |kind| actor.metrics.incReceived(kind);
+fn noteReceived(actor: *Actor, message_type: u8) void {
+    if (metrics.MessageType.fromByte(message_type)) |kind| actor.metrics.incReceived(kind);
 }

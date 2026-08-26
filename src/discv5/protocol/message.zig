@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rlp = @import("../rlp.zig");
 const packet = @import("packet.zig");
+const config = @import("../config.zig");
 
 pub const MSG_PING: u8 = 0x01;
 pub const MSG_PONG: u8 = 0x02;
@@ -271,22 +272,51 @@ pub const Nodes = struct {
         return out[0 .. 1 + rlp_bytes.len];
     }
 
-    pub fn decodeInto(data: []const u8, enrs_out: [][]const u8) Error!Nodes {
+    const Validated = struct {
+        req_id: ReqId,
+        total: u64,
+        encoded_enrs: rlp.Reader,
+        enrs_len: usize,
+    };
+
+    /// Validate the complete enclosing message before exposing any borrowed ENR
+    /// views through caller-owned output storage.
+    fn validate(data: []const u8) Error!Validated {
         var list = try readMessageList(data, MSG_NODES);
         const req_id_bytes = list.readBytes() catch return Error.InvalidEncoding;
         const req_id = try ReqId.fromSlice(req_id_bytes);
         const total = list.readUint64() catch return Error.InvalidEncoding;
 
         var enr_list = list.readList() catch return Error.InvalidEncoding;
+        const encoded_enrs = enr_list;
         var enrs_len: usize = 0;
         while (!enr_list.atEnd()) {
-            const enr_bytes = enr_list.readRawItem() catch return Error.InvalidEncoding;
-            if (enrs_len >= enrs_out.len) return Error.BufferTooSmall;
-            enrs_out[enrs_len] = enr_bytes;
+            _ = enr_list.readRawItem() catch return Error.InvalidEncoding;
             enrs_len += 1;
         }
         try expectEnd(&list);
-        return Nodes{ .req_id = req_id, .total = total, .enrs = enrs_out[0..enrs_len] };
+        return .{
+            .req_id = req_id,
+            .total = total,
+            .encoded_enrs = encoded_enrs,
+            .enrs_len = enrs_len,
+        };
+    }
+
+    pub fn decodeInto(data: []const u8, enrs_out: [][]const u8) Error!Nodes {
+        const validated = try validate(data);
+        if (enrs_out.len < validated.enrs_len) return Error.BufferTooSmall;
+
+        var enr_list = validated.encoded_enrs;
+        for (enrs_out[0..validated.enrs_len]) |*slot| {
+            slot.* = enr_list.readRawItem() catch unreachable;
+        }
+        std.debug.assert(enr_list.atEnd());
+        return .{
+            .req_id = validated.req_id,
+            .total = validated.total,
+            .enrs = enrs_out[0..validated.enrs_len],
+        };
     }
 };
 
@@ -356,6 +386,83 @@ pub const TalkResp = struct {
         return TalkResp{ .req_id = req_id, .response = response };
     }
 };
+
+pub const DecodedFindNode = struct {
+    req_id: ReqId,
+    distances: [MAX_FINDNODE_DISTANCES]u16,
+    distances_len: usize,
+
+    pub fn distancesSlice(self: *const DecodedFindNode) []const u16 {
+        return self.distances[0..self.distances_len];
+    }
+};
+
+pub const DecodedNodes = struct {
+    req_id: ReqId,
+    total: u64,
+    enrs: [config.MAX_NODES_RESPONSE][]const u8,
+    enrs_len: usize,
+
+    pub fn enrsSlice(self: *const DecodedNodes) []const []const u8 {
+        return self.enrs[0..self.enrs_len];
+    }
+};
+
+/// One complete, canonical interpretation of authenticated plaintext. Slice
+/// payloads borrow from the plaintext buffer, while bounded repeated fields own
+/// their index/value storage so expectation checking and dispatch share this
+/// exact value without another RLP pass.
+pub const DecodedMessage = union(enum) {
+    ping: Ping,
+    pong: Pong,
+    findnode: DecodedFindNode,
+    nodes: DecodedNodes,
+    talkreq: TalkReq,
+    talkresp: TalkResp,
+
+    pub fn decodeInto(out: *DecodedMessage, data: []const u8) Error!void {
+        if (data.len == 0) return Error.InvalidMessage;
+        switch (data[0]) {
+            MSG_PING => out.* = .{ .ping = try Ping.decode(data) },
+            MSG_PONG => out.* = .{ .pong = try Pong.decode(data) },
+            MSG_FINDNODE => {
+                out.* = .{ .findnode = .{
+                    .req_id = try ReqId.fromSlice(&.{}),
+                    .distances = [_]u16{0} ** MAX_FINDNODE_DISTANCES,
+                    .distances_len = 0,
+                } };
+                const decoded = try FindNode.decodeInto(data, &out.findnode.distances);
+                out.findnode.req_id = decoded.req_id;
+                out.findnode.distances_len = decoded.distances.len;
+            },
+            MSG_NODES => {
+                out.* = .{ .nodes = .{
+                    .req_id = try ReqId.fromSlice(&.{}),
+                    .total = 0,
+                    .enrs = [_][]const u8{&.{}} ** config.MAX_NODES_RESPONSE,
+                    .enrs_len = 0,
+                } };
+                const decoded = try Nodes.decodeInto(data, &out.nodes.enrs);
+                out.nodes.req_id = decoded.req_id;
+                out.nodes.total = decoded.total;
+                out.nodes.enrs_len = decoded.enrs.len;
+            },
+            MSG_TALKREQ => out.* = .{ .talkreq = try TalkReq.decode(data) },
+            MSG_TALKRESP => out.* = .{ .talkresp = try TalkResp.decode(data) },
+            else => return Error.UnexpectedType,
+        }
+    }
+
+    pub fn decode(data: []const u8) Error!DecodedMessage {
+        var decoded: DecodedMessage = undefined;
+        try decodeInto(&decoded, data);
+        return decoded;
+    }
+};
+
+comptime {
+    std.debug.assert(@sizeOf(DecodedMessage) <= 3 * 1024);
+}
 
 // =========== Tests ===========
 

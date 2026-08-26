@@ -2,6 +2,7 @@ const std = @import("std");
 const actor_mod = @import("../actor.zig");
 const enr = @import("../enr.zig");
 const handshake = @import("../protocol/handshake.zig");
+const message = @import("../protocol/message.zig");
 const packet = @import("../protocol/packet.zig");
 const secp = @import("../secp256k1.zig");
 const session_crypto = @import("../protocol/session.zig");
@@ -27,13 +28,26 @@ const RecoveryMaterial = struct {
     plaintext: types.PacketBytes,
 };
 
+/// Fully authenticated ingress value, constructed in place and passed by
+/// pointer through expectation checking, state publication, and RPC dispatch.
+/// Borrowed message and ENR views point into the current packet/plaintext stack
+/// buffers and must not escape this synchronous ingress call.
+const AuthenticatedMessage = struct {
+    endpoint: types.Endpoint,
+    decoded: message.DecodedMessage,
+    handshake_enr: ?enr.ValidatedEnr,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(AuthenticatedMessage) <= 4 * 1024);
+}
+
 pub fn handlePacket(actor: *Actor, env: Env, raw: []u8, from: types.Address) void {
     var parsed = packet.decode(raw, &actor.local_node_id) catch return;
-    switch (parsed.static_header.flag) {
-        packet.FLAG_MESSAGE => handleMessage(actor, env, &parsed, from),
-        packet.FLAG_WHOAREYOU => handleWhoareyou(actor, env, &parsed, from),
-        packet.FLAG_HANDSHAKE => handleHandshake(actor, env, &parsed, from),
-        else => {},
+    switch (parsed.form) {
+        .ordinary => |authdata| handleMessage(actor, env, &parsed, authdata, from),
+        .whoareyou => |authdata| handleWhoareyou(actor, env, &parsed, authdata, from),
+        .handshake => |authdata| handleHandshake(actor, env, &parsed, authdata, from),
     }
 }
 
@@ -54,9 +68,8 @@ fn decryptParsedMessage(
     ) catch null;
 }
 
-fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: types.Address) void {
-    if (parsed.authdata_raw.len != 32) return;
-    const endpoint = types.Endpoint{ .node_id = parsed.authdata_raw[0..32].*, .addr = from };
+fn handleMessage(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket, authdata: packet.OrdinaryAuthdata, from: types.Address) void {
+    const endpoint = types.Endpoint{ .node_id = authdata.src_id, .addr = from };
     const now_ns = outbound.nowNs(env.io);
 
     // Non-mutating pointer: unauthenticated ciphertext must not refresh
@@ -65,12 +78,15 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
     const stable = actor.sessions.peekPtr(endpoint, now_ns);
 
     var plaintext_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    defer std.crypto.secureZero(u8, &plaintext_buffer);
     var ad_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     if (stable) |stable_value| {
         if (decryptParsedMessage(parsed, &stable_value.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
-            if (!acceptExpectedMessage(actor, env, endpoint, plaintext)) return;
+            var authenticated_message: AuthenticatedMessage = undefined;
+            if (!decodeAuthenticated(&authenticated_message, endpoint, plaintext, null)) return;
+            if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
             switch (actor.sessions.acceptAuthenticated(endpoint, &parsed.static_header.nonce, now_ns)) {
-                .accepted => authenticated(actor, env, endpoint, plaintext),
+                .accepted => authenticated(actor, env, &authenticated_message),
                 .exhausted => if (sendWhoareyou(actor, env, endpoint, &parsed.static_header.nonce))
                     std.debug.assert(actor.sessions.remove(endpoint)),
                 .replay, .missing => {},
@@ -81,7 +97,9 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
 
     if (actor.requests.pendingKeys(endpoint)) |pending| {
         if (decryptParsedMessage(parsed, &pending.keys.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
-            if (!acceptExpectedMessage(actor, env, endpoint, plaintext)) return;
+            var authenticated_message: AuthenticatedMessage = undefined;
+            if (!decodeAuthenticated(&authenticated_message, endpoint, plaintext, null)) return;
+            if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
             var accepted = session_book.StableSession{
                 .initiator_key = pending.keys.initiator_key,
                 .recipient_key = pending.keys.recipient_key,
@@ -89,7 +107,7 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
             std.debug.assert(accepted.seen_nonces.insert(&parsed.static_header.nonce));
             actor.sessions.put(endpoint, accepted, now_ns);
             actor.requests.promotePending(pending);
-            authenticated(actor, env, endpoint, plaintext);
+            authenticated(actor, env, &authenticated_message);
             outbound.drainEndpoint(actor, env, endpoint);
             return;
         }
@@ -97,7 +115,9 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
 
     if (actor.responses.candidate(endpoint, now_ns)) |candidate| {
         if (decryptParsedMessage(parsed, &candidate.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
-            if (!acceptExpectedMessage(actor, env, endpoint, plaintext)) return;
+            var authenticated_message: AuthenticatedMessage = undefined;
+            if (!decodeAuthenticated(&authenticated_message, endpoint, plaintext, null)) return;
+            if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
             var accepted = session_book.StableSession{
                 .initiator_key = candidate.initiator_key,
                 .recipient_key = candidate.recipient_key,
@@ -105,29 +125,41 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: ty
             std.debug.assert(accepted.seen_nonces.insert(&parsed.static_header.nonce));
             std.debug.assert(actor.responses.removeCandidate(endpoint));
             actor.sessions.put(endpoint, accepted, now_ns);
-            authenticated(actor, env, endpoint, plaintext);
+            authenticated(actor, env, &authenticated_message);
             return;
         }
     }
     _ = sendWhoareyou(actor, env, endpoint, &parsed.static_header.nonce);
 }
 
-fn acceptExpectedMessage(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) bool {
+fn decodeAuthenticated(
+    out: *AuthenticatedMessage,
+    endpoint: types.Endpoint,
+    plaintext: []const u8,
+    validated_enr: ?*const enr.ValidatedEnr,
+) bool {
+    message.DecodedMessage.decodeInto(&out.decoded, plaintext) catch return false;
+    out.endpoint = endpoint;
+    out.handshake_enr = if (validated_enr) |value| value.* else null;
+    return true;
+}
+
+fn acceptExpectedMessage(actor: *Actor, env: Env, authenticated_message: *const AuthenticatedMessage) bool {
     if (env.expected_credit == null) return true;
-    if (!rpc.isExpectedResponse(actor, plaintext, endpoint)) return false;
+    if (!rpc.isExpectedResponse(actor, &authenticated_message.decoded, authenticated_message.endpoint)) return false;
     env.commitExpected();
     return true;
 }
 
-fn authenticated(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) void {
+fn authenticated(actor: *Actor, env: Env, authenticated_message: *const AuthenticatedMessage) void {
+    const endpoint = authenticated_message.endpoint;
     const responsive = actor.peers.markResponsive(endpoint.node_id, endpoint.addr, outbound.nowNs(env.io), null);
     actor.publishConnection(env.outbox, endpoint.node_id, responsive.transition);
     if (responsive.eviction_candidate) |candidate| actor.probeEviction(env, candidate);
-    rpc.dispatch(actor, env, plaintext, endpoint);
+    rpc.dispatch(actor, env, &authenticated_message.decoded, endpoint);
 }
 
-fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: types.Address) void {
-    if (parsed.authdata_raw.len != packet.WHOAREYOU_AUTHDATA_SIZE) return;
+fn handleWhoareyou(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket, whoareyou: packet.WhoareyouAuthdata, from: types.Address) void {
     // This exact reservation check is intentionally first. A competing
     // challenge must be rejected before key generation, signing, or wire output.
     const now_ns = outbound.nowNs(env.io);
@@ -160,7 +192,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
             .plaintext = types.PacketBytes.init(view.plaintext.slice()) catch unreachable,
         },
     };
-    const remote_seq = std.mem.readInt(u64, parsed.authdata_raw[16..24], .big);
+    const remote_seq = whoareyou.enr_seq;
     var challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
     @memcpy(challenge_data[0..packet.MASKING_IV_SIZE], &parsed.masking_iv);
     @memcpy(challenge_data[packet.MASKING_IV_SIZE..], parsed.header_raw);
@@ -273,16 +305,17 @@ test "invalid ephemeral candidates exhaust the fixed bound before wire output" {
     try std.testing.expectEqual(@as(usize, 0), recording.datagrams.items.len);
 }
 
-fn handleHandshake(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: types.Address) void {
-    const authdata = handshake.parseAuthdata(parsed.authdata_raw) catch return;
+fn handleHandshake(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket, authdata: handshake.Authdata, from: types.Address) void {
     const endpoint = types.Endpoint{ .node_id = authdata.src_id, .addr = from };
     const now_ns = outbound.nowNs(env.io);
     const challenge = actor.sessions.peekChallenge(endpoint, now_ns) orelse return;
     const known = actor.peers.known(&endpoint.node_id);
-    const supplied_enr_pubkey = if (authdata.maybe_enr) |raw|
-        handshake.pubkeyFromEnr(raw, endpoint.node_id) catch return
-    else
-        null;
+    const validated_enr: ?enr.ValidatedEnr = if (authdata.maybe_enr) |raw| blk: {
+        const validated = enr.ValidatedEnr.init(raw) catch return;
+        if (!std.mem.eql(u8, &validated.node_id, &endpoint.node_id)) return;
+        break :blk validated;
+    } else null;
+    const supplied_enr_pubkey = if (validated_enr) |*validated| validated.parsed.pubkey orelse return else null;
     const sender_pubkey = if (known) |value|
         value.pubkey
     else
@@ -303,6 +336,7 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         &challenge.challenge_data,
     ) catch return;
     var plaintext_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    defer std.crypto.secureZero(u8, &plaintext_buffer);
     var ad_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
     const plaintext = packet.decryptMessageInto(
         &plaintext_buffer,
@@ -313,6 +347,13 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
         &parsed.masking_iv,
         parsed.header_raw,
     ) catch return;
+    var authenticated_message: AuthenticatedMessage = undefined;
+    if (!decodeAuthenticated(
+        &authenticated_message,
+        endpoint,
+        plaintext,
+        if (validated_enr) |*validated| validated else null,
+    )) return;
     env.commitExpected();
     var stable = session_book.StableSession{
         .initiator_key = keys.recipient_key,
@@ -323,10 +364,16 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
 
     std.debug.assert(actor.sessions.removeChallenge(endpoint, env.ingress));
     actor.sessions.put(endpoint, stable, now_ns);
-    const responsive = actor.peers.acceptHandshake(endpoint.node_id, &sender_pubkey, endpoint.addr, authdata.maybe_enr, now_ns);
+    const responsive = actor.peers.acceptValidatedHandshake(
+        endpoint.node_id,
+        &sender_pubkey,
+        endpoint.addr,
+        if (authenticated_message.handshake_enr) |*validated| validated else null,
+        now_ns,
+    );
     actor.publishConnection(env.outbox, endpoint.node_id, responsive.transition);
     if (responsive.eviction_candidate) |candidate| actor.probeEviction(env, candidate);
-    rpc.dispatch(actor, env, plaintext, endpoint);
+    rpc.dispatch(actor, env, &authenticated_message.decoded, endpoint);
 }
 
 fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonce: *const [12]u8) bool {

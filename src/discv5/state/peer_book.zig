@@ -139,7 +139,25 @@ pub const PeerBook = struct {
 
     pub fn acceptHandshake(self: *PeerBook, node_id: types.NodeId, pubkey: *const [33]u8, address: types.Address, bytes: ?[]const u8, now_ns: i64) ResponsiveResult {
         if (bytes) |raw| {
-            if (self.entryFromEnr(raw, address, .connected, now_ns)) |entry| {
+            const validated = enr.ValidatedEnr.init(raw) catch {
+                self.rememberContact(node_id, pubkey, address, false);
+                return self.markResponsive(node_id, address, now_ns, null);
+            };
+            return self.acceptValidatedHandshake(node_id, pubkey, address, &validated, now_ns);
+        }
+        return self.acceptValidatedHandshake(node_id, pubkey, address, null, now_ns);
+    }
+
+    pub fn acceptValidatedHandshake(
+        self: *PeerBook,
+        node_id: types.NodeId,
+        pubkey: *const [33]u8,
+        address: types.Address,
+        validated: ?*const enr.ValidatedEnr,
+        now_ns: i64,
+    ) ResponsiveResult {
+        if (validated) |value| {
+            if (self.entryFromValidatedEnr(value, address, .connected, now_ns)) |entry| {
                 if (!std.mem.eql(u8, &entry.node_id, &node_id) or !std.mem.eql(u8, &entry.pubkey, pubkey))
                     return .{ .transition = .none, .eviction_candidate = null };
                 const was_connected = if (self.routing.getEntry(&node_id)) |existing| existing.status == .connected else false;
@@ -334,11 +352,6 @@ pub const PeerBook = struct {
             count += 1;
         }
         return count;
-    }
-
-    fn entryFromEnr(self: *PeerBook, bytes: []const u8, address: types.Address, status: kbucket.EntryStatus, now_ns: i64) ?kbucket.Entry {
-        const validated = enr.ValidatedEnr.init(bytes) catch return null;
-        return self.entryFromValidatedEnr(&validated, address, status, now_ns);
     }
 
     fn entryFromValidatedEnr(
