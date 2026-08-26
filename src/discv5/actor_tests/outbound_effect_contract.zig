@@ -49,7 +49,8 @@ const TestContext = struct {
     }
 
     fn preparePing(self: *TestContext) !actor_mod.SendDatagramEffect {
-        const action = try self.harness.actor.preparePing(
+        const action = try actor_mod.Testing.preparePingResolvedForTest(
+            &self.harness.actor,
             .{ .io = self.harness.io, .ingress = &self.harness.ingress },
             self.endpoint,
             &self.remote_pubkey,
@@ -155,9 +156,11 @@ test "cancel terminalizes canonical sending request before copied completions" {
     const failed_copy = effect;
     const key = effect.handle.key;
 
-    try std.testing.expect(context.harness.actor.cancelRequest(env, key));
+    try std.testing.expect(context.harness.actor.cancelRequest(env, effect.handle));
     const canceled = results.pop() orelse return error.MissingCanceledRequestResult;
-    try std.testing.expect(types.RequestKeyContext.eql(.{}, key, canceled.key));
+    try std.testing.expectEqual(key.endpoint.node_id, canceled.handle.node_id);
+    try std.testing.expectEqualSlices(u8, key.req_id.slice(), canceled.handle.request_id.slice());
+    try std.testing.expectEqual(effect.handle.generation, canceled.handle.generation);
     try std.testing.expectEqual(types.RequestKind.ping, canceled.kind);
     try std.testing.expect(canceled.terminal == .canceled);
     try std.testing.expect(results.pop() == null);
@@ -185,7 +188,9 @@ test "shutdown terminalizes canonical sending request before copied completions"
 
     context.harness.actor.finishAllRequests(env);
     const stopped = results.pop() orelse return error.MissingStoppedRequestResult;
-    try std.testing.expect(types.RequestKeyContext.eql(.{}, key, stopped.key));
+    try std.testing.expectEqual(key.endpoint.node_id, stopped.handle.node_id);
+    try std.testing.expectEqualSlices(u8, key.req_id.slice(), stopped.handle.request_id.slice());
+    try std.testing.expectEqual(effect.handle.generation, stopped.handle.generation);
     try std.testing.expectEqual(types.RequestKind.ping, stopped.kind);
     try std.testing.expect(stopped.terminal == .runtime_stopped);
     try std.testing.expect(results.pop() == null);
@@ -201,7 +206,8 @@ test "sent FINDNODE effect activates the nodes response state" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb5, 0xb6, 83, 9283);
     defer context.deinit();
 
-    const action = try context.harness.actor.prepareFindNode(
+    const action = try actor_mod.Testing.prepareFindNodeResolvedForTest(
+        &context.harness.actor,
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
@@ -225,7 +231,8 @@ test "bounded request effect output owns sending state without executing transpo
     defer context.deinit();
     var storage: [1]actor_mod.ActorEffect = undefined;
     var effects = actor_mod.EffectQueue.init(&storage);
-    const action = try context.harness.actor.preparePing(
+    const action = try actor_mod.Testing.preparePingResolvedForTest(
+        &context.harness.actor,
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
@@ -249,7 +256,8 @@ test "full request effect output aborts the unaccepted sending state" {
     var storage: [1]actor_mod.ActorEffect = undefined;
     var effects = actor_mod.EffectQueue.init(&storage);
 
-    const first = try context.harness.actor.preparePing(
+    const first = try actor_mod.Testing.preparePingResolvedForTest(
+        &context.harness.actor,
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
@@ -260,7 +268,8 @@ test "full request effect output aborts the unaccepted sending state" {
     try outbound.emitPrepared(&context.harness.actor, env, first);
     var second_endpoint = context.endpoint;
     second_endpoint.addr.ip4.port += 1;
-    const second = try context.harness.actor.preparePing(
+    const second = try actor_mod.Testing.preparePingResolvedForTest(
+        &context.harness.actor,
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         second_endpoint,
         &context.remote_pubkey,
@@ -289,7 +298,8 @@ test "queued effect enqueue abort preserves intent and releases canonical sendin
     var effects = actor_mod.EffectQueue.init(&storage);
     var env = context.harness.env();
     env.effects = &effects;
-    const blocker = try context.harness.actor.preparePing(
+    const blocker = try actor_mod.Testing.preparePingResolvedForTest(
+        &context.harness.actor,
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
@@ -337,7 +347,8 @@ test "sending endpoint establishment queues a second request before send complet
     defer context.deinit();
 
     const env = context.harness.env();
-    const first = try context.harness.actor.preparePing(
+    const first = try actor_mod.Testing.preparePingResolvedForTest(
+        &context.harness.actor,
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
@@ -345,7 +356,8 @@ test "sending endpoint establishment queues a second request before send complet
     );
     try outbound.emitPrepared(&context.harness.actor, env, first);
 
-    const second = try context.harness.actor.preparePing(
+    const second = try actor_mod.Testing.preparePingResolvedForTest(
+        &context.harness.actor,
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,
@@ -392,17 +404,17 @@ test "queued drain emits one FIFO effect per sent completion" {
         .recipient_key = [_]u8{0xbe} ** 16,
     }, outbound.nowNs(io));
 
-    const blocker_action = try harness.actor.preparePing(
+    const blocker_action = try actor_mod.Testing.preparePingResolvedForTest(
+        &harness.actor,
         .{ .io = io, .ingress = &harness.ingress },
         endpoint,
         &remote_pubkey,
         .api,
     );
-    var blocker_effect = switch (blocker_action) {
+    const blocker_effect = switch (blocker_action) {
         .send => |effect| effect,
         .queued => return error.UnexpectedQueuedRequest,
     };
-    const blocker_key = types.RequestKey.init(endpoint, blocker_effect.requestId());
     harness.actor.applySendCompletion(harness.env(), blocker_effect, .sent);
 
     const first_id = try message.ReqId.fromSlice(&.{0x31});
@@ -430,7 +442,7 @@ test "queued drain emits one FIFO effect per sent completion" {
         std.math.maxInt(i64),
     ));
 
-    try std.testing.expect(harness.actor.cancelRequest(harness.env(), blocker_key));
+    try std.testing.expect(harness.actor.cancelRequest(harness.env(), blocker_action.handle()));
     try std.testing.expectEqual(@as(usize, 2), harness.actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), harness.effects.count());
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
@@ -454,7 +466,8 @@ test "Actor tracked send helpers emit without executing transport" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xbf, 0xc0, 87, 9287);
     defer context.deinit();
 
-    _ = try context.harness.actor.sendPing(
+    _ = try actor_mod.Testing.sendPingResolvedForTest(
+        &context.harness.actor,
         context.harness.env(),
         context.endpoint,
         &context.remote_pubkey,
@@ -464,7 +477,8 @@ test "Actor tracked send helpers emit without executing transport" {
     try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
     context.harness.failEffects();
 
-    _ = try context.harness.actor.sendTalkRequest(
+    _ = try actor_mod.Testing.sendTalkRequestResolvedForTest(
+        &context.harness.actor,
         context.harness.env(),
         context.endpoint,
         &context.remote_pubkey,
@@ -481,7 +495,8 @@ test "sent TALKREQ effect activates the talk response state" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb7, 0xb8, 84, 9284);
     defer context.deinit();
 
-    const action = try context.harness.actor.prepareTalkRequest(
+    const action = try actor_mod.Testing.prepareTalkRequestResolvedForTest(
+        &context.harness.actor,
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
         &context.remote_pubkey,

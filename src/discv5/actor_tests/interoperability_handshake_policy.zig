@@ -8,6 +8,7 @@ const outbound = @import("../flow/outbound.zig");
 const handshake = @import("../protocol/handshake.zig");
 const message = @import("../protocol/message.zig");
 const packet = @import("../protocol/packet.zig");
+const public_api = @import("../public_api.zig");
 const request_results = @import("../request_results.zig");
 const session_crypto = @import("../protocol/session.zig");
 const secp = @import("../secp256k1.zig");
@@ -40,12 +41,12 @@ const ReliableRequestCleanup = struct {
     actor: *actor_mod.Actor,
     env: actor_mod.Env,
     results: *request_results.RequestResultOutbox,
-    key: ?types.RequestKey = null,
+    handle: ?types.RequestHandle = null,
     state: enum { unclaimed, claimed, consumed } = .unclaimed,
 
-    fn claim(self: *ReliableRequestCleanup, key: types.RequestKey) void {
+    fn claim(self: *ReliableRequestCleanup, handle: types.RequestHandle) void {
         if (!self.results.claim()) unreachable;
-        self.key = key;
+        self.handle = handle;
         self.state = .claimed;
     }
 
@@ -59,9 +60,10 @@ const ReliableRequestCleanup = struct {
             .unclaimed => self.results.cancelUnclaimed(),
             .consumed => {},
             .claimed => {
-                const key = self.key.?;
+                const handle = self.handle.?;
+                const key = handle.key;
                 if (self.actor.requests.get(key) != null) {
-                    if (!self.actor.cancelRequest(self.env, key)) unreachable;
+                    if (!self.actor.cancelRequest(self.env, handle)) unreachable;
                 }
                 if (self.results.pop() != null) return;
                 std.debug.assert(self.actor.requests.get(key) == null);
@@ -135,7 +137,8 @@ test "WHOAREYOU permit admits a valid HANDSHAKE through an exhausted source quot
     const same_ip_other_port = types.Address{ .ip4 = .{ .bytes = address_a.ip4.bytes, .port = address_a.ip4.port + 1 } };
     try std.testing.expect(!ingress_b.acceptForTesting(same_ip_other_port, 0));
 
-    _ = try actor_a.sendTalkRequest(
+    _ = try actor_mod.Testing.sendTalkRequestResolvedForTest(
+        &actor_a,
         env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
@@ -224,7 +227,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
     try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, address_a, null, now_ns));
 
-    const ping_id = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
+    const ping_id = try actor_mod.Testing.sendPingResolvedForTest(&actor_a, env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();
@@ -232,7 +235,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try link_b_to_a.deliverNext();
 
     try expectNoEvent(&outbox_a, alloc);
-    try std.testing.expect(actor_a.requests.get(.init(.{ .node_id = id_b, .addr = address_b }, ping_id)) == null);
+    try std.testing.expect(actor_a.requests.get(ping_id.key) == null);
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
     try std.testing.expect(actor_a.sessions.get(.{ .node_id = id_b, .addr = address_b }, now_ns) != null);
@@ -242,11 +245,12 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expect(results_a.reserve());
     var result_cleanup = ReliableRequestCleanup{ .actor = &actor_a, .env = env_a, .results = &results_a };
     defer result_cleanup.deinit();
-    const talk_id = try actor_a.sendTalkRequestWithOrigin(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, "test", "request", .reliable_api);
+    const talk_id = try actor_mod.Testing.sendTalkRequestResolvedWithOriginForTest(&actor_a, env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, "test", "request", .reliable_api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
-    result_cleanup.claim(.init(.{ .node_id = id_b, .addr = address_b }, talk_id));
+    result_cleanup.claim(talk_id);
 
-    const unrelated_ping_id = try actor_b.sendPing(
+    const unrelated_ping_id = try actor_mod.Testing.sendPingResolvedForTest(
+        &actor_b,
         env_b,
         .{ .node_id = id_a, .addr = address_a },
         &pubkey_a,
@@ -266,7 +270,7 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     unrelated_credit.rollback(&ingress_a);
     try std.testing.expect(actor_b.cancelRequest(
         .{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b },
-        types.RequestKey.init(.{ .node_id = id_a, .addr = address_a }, unrelated_ping_id),
+        unrelated_ping_id,
     ));
 
     try link_a_to_b.deliverNext();
@@ -275,8 +279,8 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expect(request_event == .talkreq);
     try std.testing.expectEqualStrings("test", request_event.talkreq.protocol);
     try std.testing.expectEqualStrings("request", request_event.talkreq.request);
-    try std.testing.expectEqualSlices(u8, talk_id.slice(), request_event.talkreq.req_id.slice());
-    try actor_b.sendTalkResponse(env_b, .{ .node_id = id_a, .addr = address_a }, request_event.talkreq.req_id, "response");
+    try std.testing.expectEqualSlices(u8, talk_id.key.req_id.slice(), request_event.talkreq.req_id.slice());
+    try actor_b.sendTalkResponse(env_b, .{ .node_id = id_a, .addr = address_a }, public_api.requestIdToWire(request_event.talkreq.req_id), "response");
     try drainEffects(&actor_b, env_b, &effects_b, &sender_b);
     const response_admission = ingress_a.admit(address_b, 1);
     var response_credit = switch (response_admission) {
@@ -289,9 +293,10 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     const response_result = results_a.pop() orelse return error.MissingTalkResponse;
     result_cleanup.consume();
     try std.testing.expectEqual(types.RequestKind.talkreq, response_result.kind);
-    try std.testing.expect(response_result.key.endpoint.addr.eql(&address_b));
-    try std.testing.expectEqual(id_b, response_result.key.endpoint.node_id);
-    try std.testing.expectEqualSlices(u8, talk_id.slice(), response_result.key.req_id.slice());
+    try std.testing.expect(response_result.handle.address.eql(&address_b));
+    try std.testing.expectEqual(id_b, response_result.handle.node_id);
+    try std.testing.expectEqualSlices(u8, talk_id.key.req_id.slice(), response_result.handle.request_id.slice());
+    try std.testing.expectEqual(talk_id.generation, response_result.handle.generation);
     try std.testing.expect(response_result.terminal == .talk_response);
     try std.testing.expectEqualStrings("response", response_result.terminal.talk_response.slice());
     try std.testing.expect(results_a.pop() == null);
@@ -320,7 +325,8 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     try std.testing.expect(added_event == .enr_added);
     const distance_c: u16 = @as(u16, @import("../kbucket.zig").logDistance(&id_b, &id_c).?) + 1;
     const distance_d: u16 = @as(u16, @import("../kbucket.zig").logDistance(&id_b, &id_d).?) + 1;
-    _ = try actor_a.sendFindNode(
+    _ = try actor_mod.Testing.sendFindNodeResolvedForTest(
+        &actor_a,
         env_a,
         .{ .node_id = id_b, .addr = address_b },
         &pubkey_b,
@@ -537,7 +543,7 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
     actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
     const peer_before = actor_b.peers.known(&id_a) orelse return error.MissingKnownPeer;
     try std.testing.expectEqual(@as(usize, 1), actor_b.peers.contacts.count());
-    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
+    _ = try actor_mod.Testing.sendPingResolvedForTest(&actor_a, env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     const endpoint = types.Endpoint{ .node_id = id_a, .addr = address_a };
@@ -773,7 +779,7 @@ fn signedEnrHandshake(kind: SignedEnrKind, later_evidence: LaterEndpointEvidence
         try std.testing.expect(actor_b.peers.routing.getEntry(&id_a).?.raw_enr_relay_eligible);
     }
 
-    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
+    _ = try actor_mod.Testing.sendPingResolvedForTest(&actor_a, env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();
@@ -863,7 +869,7 @@ fn contactHandshake(runtime_contact_trusted: bool) !ContactHandshakeResult {
         actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
     }
     try std.testing.expectEqual(runtime_contact_trusted, actor_b.peers.known(&id_a).?.runtime_contact_trusted);
-    _ = try actor_a.sendPing(env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
+    _ = try actor_mod.Testing.sendPingResolvedForTest(&actor_a, env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
     try link_b_to_a.deliverNext();

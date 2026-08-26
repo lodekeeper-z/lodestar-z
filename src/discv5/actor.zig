@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const admission = @import("admission.zig");
 const addr_votes = @import("service/addr_votes.zig");
 const config_mod = @import("config.zig");
@@ -15,6 +16,7 @@ const outbound = @import("flow/outbound.zig");
 const maintenance_flow = @import("flow/maintenance.zig");
 const session_flow = @import("flow/session.zig");
 const peer_book = @import("state/peer_book.zig");
+const public_api = @import("public_api.zig");
 const request_book = @import("state/request_book.zig");
 const response_book = @import("state/response_book.zig");
 const request_results = @import("request_results.zig");
@@ -380,6 +382,16 @@ pub const Actor = struct {
     pub fn preparePing(
         self: *Actor,
         context: TransitionContext,
+        node_id: types.NodeId,
+        origin: types.RequestOrigin,
+    ) !OutboundRequestAction {
+        const known = self.peers.known(&node_id) orelse return error.UnknownPeer;
+        return self.preparePingResolved(context, .{ .node_id = node_id, .addr = known.addr }, &known.pubkey, origin);
+    }
+
+    fn preparePingResolved(
+        self: *Actor,
+        context: TransitionContext,
         endpoint: types.Endpoint,
         pubkey: *const [33]u8,
         origin: types.RequestOrigin,
@@ -545,20 +557,31 @@ pub const Actor = struct {
         }
     }
 
-    pub fn sendPing(
+    fn sendPingResolved(
         self: *Actor,
         env: Env,
         endpoint: types.Endpoint,
         pubkey: *const [33]u8,
         origin: types.RequestOrigin,
-    ) !message.ReqId {
-        var action = try self.preparePing(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, origin);
-        const req_id = action.requestId();
+    ) !types.RequestHandle {
+        var action = try self.preparePingResolved(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, origin);
+        const handle = action.handle();
         try outbound.emitPrepared(self, env, action);
-        return req_id;
+        return handle;
     }
 
     pub fn prepareFindNode(
+        self: *Actor,
+        context: TransitionContext,
+        node_id: types.NodeId,
+        distances: []const u16,
+        origin: types.RequestOrigin,
+    ) !OutboundRequestAction {
+        const known = self.peers.known(&node_id) orelse return error.UnknownPeer;
+        return self.prepareFindNodeResolved(context, .{ .node_id = node_id, .addr = known.addr }, &known.pubkey, distances, origin);
+    }
+
+    fn prepareFindNodeResolved(
         self: *Actor,
         context: TransitionContext,
         endpoint: types.Endpoint,
@@ -576,32 +599,33 @@ pub const Actor = struct {
         return outbound.prepareTracked(self, context, endpoint, pubkey, req_id, .findnode, distances, try findnode.encodeInto(&buffer), origin);
     }
 
-    pub fn sendFindNode(
+    fn sendFindNodeResolved(
         self: *Actor,
         env: Env,
         endpoint: types.Endpoint,
         pubkey: *const [33]u8,
         distances: []const u16,
         origin: types.RequestOrigin,
-    ) !message.ReqId {
-        var action = try self.prepareFindNode(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, distances, origin);
-        const req_id = action.requestId();
+    ) !types.RequestHandle {
+        var action = try self.prepareFindNodeResolved(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, distances, origin);
+        const handle = action.handle();
         try outbound.emitPrepared(self, env, action);
-        return req_id;
-    }
-
-    pub fn sendTalkRequest(
-        self: *Actor,
-        env: Env,
-        endpoint: types.Endpoint,
-        pubkey: *const [33]u8,
-        protocol_name: []const u8,
-        request: []const u8,
-    ) !message.ReqId {
-        return self.sendTalkRequestWithOrigin(env, endpoint, pubkey, protocol_name, request, .api);
+        return handle;
     }
 
     pub fn prepareTalkRequest(
+        self: *Actor,
+        context: TransitionContext,
+        node_id: types.NodeId,
+        protocol_name: []const u8,
+        request: []const u8,
+        origin: types.RequestOrigin,
+    ) !OutboundRequestAction {
+        const known = self.peers.known(&node_id) orelse return error.UnknownPeer;
+        return self.prepareTalkRequestResolved(context, .{ .node_id = node_id, .addr = known.addr }, &known.pubkey, protocol_name, request, origin);
+    }
+
+    fn prepareTalkRequestResolved(
         self: *Actor,
         context: TransitionContext,
         endpoint: types.Endpoint,
@@ -618,7 +642,7 @@ pub const Actor = struct {
         return outbound.prepareTracked(self, context, endpoint, pubkey, req_id, .talkreq, &.{}, plaintext, origin);
     }
 
-    pub fn sendTalkRequestWithOrigin(
+    fn sendTalkRequestResolved(
         self: *Actor,
         env: Env,
         endpoint: types.Endpoint,
@@ -626,11 +650,11 @@ pub const Actor = struct {
         protocol_name: []const u8,
         request: []const u8,
         origin: types.RequestOrigin,
-    ) !message.ReqId {
-        var action = try self.prepareTalkRequest(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, protocol_name, request, origin);
-        const req_id = action.requestId();
+    ) !types.RequestHandle {
+        var action = try self.prepareTalkRequestResolved(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, protocol_name, request, origin);
+        const handle = action.handle();
         try outbound.emitPrepared(self, env, action);
-        return req_id;
+        return handle;
     }
 
     pub fn sendTalkResponse(self: *Actor, env: Env, endpoint: types.Endpoint, req_id: message.ReqId, response: []const u8) !void {
@@ -743,19 +767,13 @@ pub const Actor = struct {
         maintenance_flow.run(self, env, now_real_ns);
     }
 
-    pub fn cancelRequest(self: *Actor, env: Env, handle_value: anytype) bool {
-        const handle: types.RequestHandle = if (@TypeOf(handle_value) == types.RequestHandle)
-            handle_value
-        else if (@TypeOf(handle_value) == types.RequestKey)
-            self.requests.handleFor(handle_value) orelse self.requests.queuedHandleFor(handle_value) orelse return false
-        else
-            @compileError("cancelRequest requires RequestHandle or internal RequestKey");
+    pub fn cancelRequest(self: *Actor, env: Env, handle: types.RequestHandle) bool {
         const key = handle.key;
         if (self.requests.matchesHandle(handle)) {
             return completion.finish(self, env, key, .canceled, .canceled);
         }
         const queued = self.requests.takeQueuedHandle(handle) orelse return false;
-        self.publishRequestTerminal(env, key, queued.kind, queued.origin, .canceled);
+        self.publishRequestTerminal(env, handle, queued.kind, queued.origin, .canceled);
         self.onRequestCancellation(env, key, queued.origin);
         outbound.drainEndpoint(self, env, key.endpoint);
         return true;
@@ -825,7 +843,7 @@ pub const Actor = struct {
     pub fn publishRequestTerminal(
         self: *Actor,
         env: Env,
-        key: types.RequestKey,
+        handle: types.RequestHandle,
         kind: types.RequestKind,
         origin: types.RequestOrigin,
         terminal: request_results.RequestTerminal,
@@ -839,7 +857,11 @@ pub const Actor = struct {
             .send_failure, .timeout, .canceled, .runtime_stopped => {},
         }
         const result_outbox = env.request_results orelse unreachable;
-        result_outbox.publishAssumeReserved(.{ .key = key, .kind = kind, .terminal = terminal });
+        result_outbox.publishAssumeReserved(.{
+            .handle = public_api.handleFromInternal(handle),
+            .kind = kind,
+            .terminal = terminal,
+        });
     }
 
     pub fn finishAllRequests(self: *Actor, env: Env) void {
@@ -855,7 +877,7 @@ pub const Actor = struct {
             const snapshot = self.requests.firstQueuedRequest() orelse break;
             const queued = self.requests.takeQueued(snapshot.key) orelse unreachable;
             std.debug.assert(std.meta.activeTag(queued.origin) != .lookup);
-            self.publishRequestTerminal(env, snapshot.key, snapshot.kind, queued.origin, .runtime_stopped);
+            self.publishRequestTerminal(env, queued.handle(), snapshot.kind, queued.origin, .runtime_stopped);
         }
         std.debug.assert(self.requests.firstQueuedRequest() == null);
     }
@@ -918,7 +940,7 @@ pub const Actor = struct {
         const known_seq = self.peers.knownEnrSeq(&endpoint.node_id) orelse return;
         if (known_seq >= advertised_seq or self.requests.hasActiveFindNode(&endpoint.node_id)) return;
         const known = self.peers.known(&endpoint.node_id) orelse return;
-        _ = self.sendFindNode(env, endpoint, &known.pubkey, &.{0}, .{ .maintenance = .enr_refresh }) catch {};
+        _ = self.sendFindNodeResolved(env, endpoint, &known.pubkey, &.{0}, .{ .maintenance = .enr_refresh }) catch {};
     }
 
     pub fn observeAddressVote(self: *Actor, env: Env, voter: types.Address, observed: types.Address) void {
@@ -1059,7 +1081,7 @@ pub const Actor = struct {
             const send_result = blk: {
                 const lookup = self.lookups.getPtr(id) orelse return;
                 if (lookup.localCandidate(&peer_id)) |candidate| {
-                    break :blk self.sendFindNode(
+                    break :blk self.sendFindNodeResolved(
                         env,
                         .{ .node_id = peer_id, .addr = candidate.addr },
                         &candidate.pubkey,
@@ -1071,7 +1093,7 @@ pub const Actor = struct {
                     lookup.onFailure(&peer_id, self.lookup_config);
                     continue;
                 };
-                break :blk self.sendFindNode(
+                break :blk self.sendFindNodeResolved(
                     env,
                     .{ .node_id = peer_id, .addr = known.addr },
                     &known.pubkey,
@@ -1203,6 +1225,47 @@ pub const Actor = struct {
         }
     }
 };
+
+/// Tuple-based request construction exists only in test builds so fixtures can
+/// exercise transport details without creating a supported production boundary.
+pub const Testing = if (builtin.is_test) struct {
+    fn actorPtr(value: anytype) *Actor {
+        return switch (@TypeOf(value)) {
+            *Actor => value,
+            **Actor => value.*,
+            *const *Actor => value.*,
+            else => @compileError("test request helper requires Actor lvalue or pointer"),
+        };
+    }
+
+    pub fn preparePingResolvedForTest(actor_value: anytype, context: TransitionContext, endpoint: types.Endpoint, pubkey: *const [33]u8, origin: types.RequestOrigin) !OutboundRequestAction {
+        return actorPtr(actor_value).preparePingResolved(context, endpoint, pubkey, origin);
+    }
+
+    pub fn prepareFindNodeResolvedForTest(actor_value: anytype, context: TransitionContext, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16, origin: types.RequestOrigin) !OutboundRequestAction {
+        return actorPtr(actor_value).prepareFindNodeResolved(context, endpoint, pubkey, distances, origin);
+    }
+
+    pub fn prepareTalkRequestResolvedForTest(actor_value: anytype, context: TransitionContext, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) !OutboundRequestAction {
+        return actorPtr(actor_value).prepareTalkRequestResolved(context, endpoint, pubkey, protocol_name, request, origin);
+    }
+
+    pub fn sendPingResolvedForTest(actor_value: anytype, env: Env, endpoint: types.Endpoint, pubkey: *const [33]u8, origin: types.RequestOrigin) !types.RequestHandle {
+        return actorPtr(actor_value).sendPingResolved(env, endpoint, pubkey, origin);
+    }
+
+    pub fn sendFindNodeResolvedForTest(actor_value: anytype, env: Env, endpoint: types.Endpoint, pubkey: *const [33]u8, distances: []const u16, origin: types.RequestOrigin) !types.RequestHandle {
+        return actorPtr(actor_value).sendFindNodeResolved(env, endpoint, pubkey, distances, origin);
+    }
+
+    pub fn sendTalkRequestResolvedForTest(actor_value: anytype, env: Env, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8) !types.RequestHandle {
+        return actorPtr(actor_value).sendTalkRequestResolved(env, endpoint, pubkey, protocol_name, request, .api);
+    }
+
+    pub fn sendTalkRequestResolvedWithOriginForTest(actor_value: anytype, env: Env, endpoint: types.Endpoint, pubkey: *const [33]u8, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) !types.RequestHandle {
+        return actorPtr(actor_value).sendTalkRequestResolved(env, endpoint, pubkey, protocol_name, request, origin);
+    }
+} else struct {};
 
 fn randomReqId(io: std.Io) message.ReqId {
     var id = message.ReqId{ .bytes = [_]u8{0} ** 8, .len = 4 };
@@ -1352,7 +1415,7 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     const env = Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .effects = &effects };
     try std.testing.expect(actor.addNode(lookup_peer_id, &lookup_pubkey, lookup_address, null, 0));
 
-    const blocker_req_id = try actor.sendPing(env, blocker_endpoint, &blocker_pubkey, .api);
+    const blocker_req_id = try Testing.sendPingResolvedForTest(&actor, env, blocker_endpoint, &blocker_pubkey, .api);
     while (effects.pop()) |effect| {
         recording.sender().send(effect.destination(), effect.packetBytes()) catch |err| {
             actor.applyEffectCompletion(env, effect, .failed);
@@ -1380,7 +1443,7 @@ test "discv5 actor: lookup local backpressure defers until bounded maintenance r
     try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
     try std.testing.expect(outbox.pop() == null);
 
-    try std.testing.expect(actor.cancelRequest(env, types.RequestKey.init(blocker_endpoint, blocker_req_id)));
+    try std.testing.expect(actor.cancelRequest(env, blocker_req_id));
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
 

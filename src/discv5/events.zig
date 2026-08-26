@@ -1,7 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const enr = @import("enr.zig");
-const message = @import("protocol/message.zig");
+const public_api = @import("public_api.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -10,7 +10,7 @@ const Io = std.Io;
 pub const TalkReqEvent = struct {
     peer_id: types.NodeId,
     peer_addr: types.Address,
-    req_id: message.ReqId,
+    req_id: public_api.RequestId,
     protocol: []u8,
     request: []u8,
 
@@ -226,7 +226,7 @@ test "payload drops are classified by intended event kind" {
 test "every event maps to a stable kind and TS-aligned event name" {
     const peer_id = [_]u8{1} ** 32;
     const addr = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } };
-    const req_id = try message.ReqId.fromSlice(&.{1});
+    const req_id = try public_api.RequestId.fromSlice(&.{1});
     var empty_bytes = [_]u8{};
     const empty: []u8 = &empty_bytes;
     const Expectation = struct {

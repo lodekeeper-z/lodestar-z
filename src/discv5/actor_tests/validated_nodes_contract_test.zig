@@ -164,22 +164,22 @@ test "validated NODES boundary rejects invalid signatures and preserves reliable
     try std.testing.expect(results.claim());
     var env = harness.env();
     env.request_results = &results;
-    const req_id = try actor.sendFindNode(env, endpoint, &responder_pubkey, &.{ distance_a, distance_b }, .reliable_api);
+    const req_id = try actor_mod.Testing.sendFindNodeResolvedForTest(&actor, env, endpoint, &responder_pubkey, &.{ distance_a, distance_b }, .reliable_api);
     try harness.drainEffects();
 
     var invalid_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const invalid_nodes = message.Nodes{ .req_id = req_id, .total = 3, .enrs = &.{invalid} };
+    const invalid_nodes = message.Nodes{ .req_id = req_id.key.req_id, .total = 3, .enrs = &.{invalid} };
     try deliverEncrypted(actor, env, endpoint, &stable.recipient_key, try invalid_nodes.encodeInto(&invalid_buffer), 0x31);
-    const after_invalid = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
+    const after_invalid = &actor.requests.get(req_id.key).?.response.nodes;
     try std.testing.expectEqual(@as(usize, 0), after_invalid.validated_enrs.slice().len);
     try std.testing.expect(actor.peers.findEnr(&returned_a.node_id) == null);
     try std.testing.expect(harness.outbox.pop() == null);
     try std.testing.expect(results.pop() == null);
 
     var first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const first = message.Nodes{ .req_id = req_id, .total = 3, .enrs = &.{returned_a.raw} };
+    const first = message.Nodes{ .req_id = req_id.key.req_id, .total = 3, .enrs = &.{returned_a.raw} };
     try deliverEncrypted(actor, env, endpoint, &stable.recipient_key, try first.encodeInto(&first_buffer), 0x32);
-    const partial = &actor.requests.get(.init(endpoint, req_id)).?.response.nodes;
+    const partial = &actor.requests.get(req_id.key).?.response.nodes;
     try std.testing.expectEqual(@as(usize, 1), partial.validated_enrs.slice().len);
     try std.testing.expectEqual(returned_a.node_id, partial.validated_enrs.slice()[0].node_id);
     const learned_a = actor.peers.routing.getEntry(&returned_a.node_id) orelse return error.MissingLearnedPeer;
@@ -191,9 +191,9 @@ test "validated NODES boundary rejects invalid signatures and preserves reliable
     try expectDiscovered(&discovered_a, returned_a);
 
     var final_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const final = message.Nodes{ .req_id = req_id, .total = 3, .enrs = &.{returned_b.raw} };
+    const final = message.Nodes{ .req_id = req_id.key.req_id, .total = 3, .enrs = &.{returned_b.raw} };
     try deliverEncrypted(actor, env, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 0x33);
-    try std.testing.expect(actor.requests.get(.init(endpoint, req_id)) == null);
+    try std.testing.expect(actor.requests.get(req_id.key) == null);
     const result = results.pop() orelse return error.MissingRequestResult;
     try std.testing.expect(result.terminal == .nodes);
     try std.testing.expectEqual(@as(usize, 2), result.terminal.nodes.slice().len);
@@ -238,7 +238,7 @@ test "expected NODES response accepts the 16-entry decode boundary" {
     errdefer if (result_pending) results.release();
     var env = harness.env();
     env.request_results = &results;
-    const req_id = try actor.sendFindNode(env, endpoint, &responder_pubkey, &.{1}, .reliable_api);
+    const req_id = try actor_mod.Testing.sendFindNodeResolvedForTest(&actor, env, endpoint, &responder_pubkey, &.{1}, .reliable_api);
     try harness.drainEffects();
     switch (harness.ingress.admit(endpoint.addr, 0)) {
         .ordinary => {},
@@ -255,14 +255,17 @@ test "expected NODES response accepts the 16-entry decode boundary" {
     var response_enrs: [config.MAX_NODES_RESPONSE][]const u8 = undefined;
     for (&response_enrs) |*raw| raw.* = &invalid_enr;
     var nodes_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const nodes = message.Nodes{ .req_id = req_id, .total = 1, .enrs = &response_enrs };
+    const nodes = message.Nodes{ .req_id = req_id.key.req_id, .total = 1, .enrs = &response_enrs };
     try deliverEncrypted(actor, env, endpoint, &stable.recipient_key, try nodes.encodeInto(&nodes_buffer), 0xa2);
 
     try std.testing.expect(!expected_credit.armed);
-    try std.testing.expect(actor.requests.get(.init(endpoint, req_id)) == null);
+    try std.testing.expect(actor.requests.get(req_id.key) == null);
     const result = results.pop() orelse return error.MissingRequestResult;
     result_pending = false;
-    try std.testing.expectEqual(types.RequestKey.init(endpoint, req_id), result.key);
+    try std.testing.expectEqual(endpoint.node_id, result.handle.node_id);
+    try std.testing.expect(endpoint.addr.eql(&result.handle.address));
+    try std.testing.expectEqualSlices(u8, req_id.key.req_id.slice(), result.handle.request_id.slice());
+    try std.testing.expectEqual(req_id.generation, result.handle.generation);
     try std.testing.expectEqual(types.RequestKind.findnode, result.kind);
     try std.testing.expect(result.terminal == .nodes);
     try std.testing.expectEqual(@as(usize, 0), result.terminal.nodes.slice().len);
@@ -298,7 +301,8 @@ test "validated NODES multipart values survive as lookup closer IDs" {
     actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
     const distance_a = wireDistance(&returned_a.node_id, &responder_id);
     const distance_b = wireDistance(&returned_b.node_id, &responder_id);
-    const req_id = try actor.sendFindNode(
+    const req_id = try actor_mod.Testing.sendFindNodeResolvedForTest(
+        &actor,
         harness.env(),
         endpoint,
         &responder_pubkey,
@@ -308,10 +312,10 @@ test "validated NODES multipart values survive as lookup closer IDs" {
     try harness.drainEffects();
 
     var first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const first = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{returned_a.raw} };
+    const first = message.Nodes{ .req_id = req_id.key.req_id, .total = 2, .enrs = &.{returned_a.raw} };
     try deliverEncrypted(actor, harness.env(), endpoint, &stable.recipient_key, try first.encodeInto(&first_buffer), 0x34);
     var final_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const final = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{returned_b.raw} };
+    const final = message.Nodes{ .req_id = req_id.key.req_id, .total = 2, .enrs = &.{returned_b.raw} };
     try deliverEncrypted(actor, harness.env(), endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 0x35);
 
     const completed_lookup = actor.lookups.getPtr(lookup_id) orelse return error.MissingLookup;
@@ -373,7 +377,8 @@ test "discv5 lookup duplicate uses newer routed ENR for dispatch and result" {
     try std.testing.expectEqual(responder_id, lookup.nextPeer(actor.lookup_config).?);
     lookup.reliable_result = true;
     actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
-    const responder_req_id = try actor.sendFindNode(
+    const responder_req_id = try actor_mod.Testing.sendFindNodeResolvedForTest(
+        &actor,
         env,
         responder_endpoint,
         &responder_pubkey,
@@ -383,7 +388,7 @@ test "discv5 lookup duplicate uses newer routed ENR for dispatch and result" {
     try harness.drainEffects();
 
     var stale_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const stale_nodes = message.Nodes{ .req_id = responder_req_id, .total = 1, .enrs = &.{older.raw} };
+    const stale_nodes = message.Nodes{ .req_id = responder_req_id.key.req_id, .total = 1, .enrs = &.{older.raw} };
     try deliverEncrypted(actor, env, responder_endpoint, &responder_session.recipient_key, try stale_nodes.encodeInto(&stale_buffer), 0xc8);
     try harness.drainEffects();
 
@@ -466,7 +471,8 @@ test "discv5 lookup-local contact dispatch replaces full untrusted fallback rete
     var lookup = try lookup_mod.Lookup.init(alloc, returned.node_id, &.{responder_id}, 0, actor.lookup_config);
     try std.testing.expectEqual(responder_id, lookup.nextPeer(actor.lookup_config).?);
     actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
-    const req_id = try actor.sendFindNode(
+    const req_id = try actor_mod.Testing.sendFindNodeResolvedForTest(
+        &actor,
         harness.env(),
         endpoint,
         &responder_pubkey,
@@ -476,7 +482,7 @@ test "discv5 lookup-local contact dispatch replaces full untrusted fallback rete
     try harness.drainEffects();
 
     var nodes_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const nodes = message.Nodes{ .req_id = req_id, .total = 1, .enrs = &.{returned.raw} };
+    const nodes = message.Nodes{ .req_id = req_id.key.req_id, .total = 1, .enrs = &.{returned.raw} };
     try deliverEncrypted(actor, harness.env(), endpoint, &stable.recipient_key, try nodes.encodeInto(&nodes_buffer), 0xa7);
     try harness.drainEffects();
 

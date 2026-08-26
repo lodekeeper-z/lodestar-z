@@ -783,32 +783,26 @@ fn executeSendEffect(runtime: *RuntimeImpl, effect: actor_mod.ActorEffect) !void
 }
 
 fn executePingEffect(runtime: *RuntimeImpl, node_id: types.NodeId, origin: types.RequestOrigin) !types.RequestHandle {
-    const known = runtime.actor.peers.known(&node_id) orelse return error.UnknownPeer;
     return executeRequestEffect(runtime, try runtime.actor.preparePing(
         .{ .io = runtime.io, .ingress = &runtime.admission },
-        .{ .node_id = node_id, .addr = known.addr },
-        &known.pubkey,
+        node_id,
         origin,
     ));
 }
 
 fn executeFindNodeEffect(runtime: *RuntimeImpl, node_id: types.NodeId, distances: []const u16, origin: types.RequestOrigin) !types.RequestHandle {
-    const known = runtime.actor.peers.known(&node_id) orelse return error.UnknownPeer;
     return executeRequestEffect(runtime, try runtime.actor.prepareFindNode(
         .{ .io = runtime.io, .ingress = &runtime.admission },
-        .{ .node_id = node_id, .addr = known.addr },
-        &known.pubkey,
+        node_id,
         distances,
         origin,
     ));
 }
 
 fn executeTalkRequestEffect(runtime: *RuntimeImpl, node_id: types.NodeId, protocol_name: []const u8, request: []const u8, origin: types.RequestOrigin) !types.RequestHandle {
-    const known = runtime.actor.peers.known(&node_id) orelse return error.UnknownPeer;
     return executeRequestEffect(runtime, try runtime.actor.prepareTalkRequest(
         .{ .io = runtime.io, .ingress = &runtime.admission },
-        .{ .node_id = node_id, .addr = known.addr },
-        &known.pubkey,
+        node_id,
         protocol_name,
         request,
         origin,

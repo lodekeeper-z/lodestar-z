@@ -159,7 +159,7 @@ fn pruneQueued(actor: *Actor, env: Env, now_ns: i64) void {
         const count = actor.requests.collectExpiredQueuedBatch(&keys, now_ns, &scan);
         for (keys[0..count]) |key| {
             const queued = actor.requests.takeQueued(key) orelse unreachable;
-            actor.publishRequestTerminal(env, key, queued.kind, queued.origin, .timeout);
+            actor.publishRequestTerminal(env, queued.handle(), queued.kind, queued.origin, .timeout);
             actor.onRequestCompletion(env, key, queued.origin, false, &.{});
         }
     }

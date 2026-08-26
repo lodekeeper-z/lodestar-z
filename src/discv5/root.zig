@@ -36,11 +36,34 @@ pub const MAX_LOOKUP_RESULTS = @import("service/lookup.zig").MAX_RESULTS;
 pub const MAX_REQUEST_RESULTS = @import("config.zig").MAX_REQUEST_RESULTS;
 
 test {
-    try @import("std").testing.expect(!@hasDecl(@This(), "ReqId"));
-    try @import("std").testing.expect(!@hasDecl(@This(), "RequestKey"));
+    const std = @import("std");
+    try std.testing.expect(!@hasDecl(@This(), "ReqId"));
+    try std.testing.expect(!@hasDecl(@This(), "RequestKey"));
+    try std.testing.expect(@FieldType(@FieldType(Event, "talkreq"), "req_id") == RequestId);
+    try std.testing.expect(@FieldType(RequestResult, "handle") == RequestHandle);
     const maximum = try RequestId.fromSlice(&([_]u8{0xaa} ** 8));
-    try @import("std").testing.expectEqual(@as(usize, 8), maximum.slice().len);
-    try @import("std").testing.expectError(error.InvalidRequestId, RequestId.fromSlice(&([_]u8{0xaa} ** 9)));
+    try std.testing.expectEqual(@as(usize, 8), maximum.slice().len);
+    try std.testing.expectError(error.InvalidRequestId, RequestId.fromSlice(&([_]u8{0xaa} ** 9)));
+
+    var empty_bytes = [_]u8{};
+    var event: Event = .{ .talkreq = .{
+        .peer_id = [_]u8{0x11} ** 32,
+        .peer_addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } },
+        .req_id = maximum,
+        .protocol = &empty_bytes,
+        .request = &empty_bytes,
+    } };
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, maximum.slice(), event.talkreq.req_id.slice());
+
+    const handle = RequestHandle{
+        .node_id = [_]u8{0x22} ** 32,
+        .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9001 } },
+        .request_id = maximum,
+        .generation = 7,
+    };
+    const result = RequestResult{ .handle = handle, .kind = .ping, .terminal = .timeout };
+    try std.testing.expectEqual(@as(u64, 7), result.handle.generation);
     _ = @import("wire_test_vectors.zig");
     _ = @import("enr.zig");
     _ = @import("enr_test.zig");

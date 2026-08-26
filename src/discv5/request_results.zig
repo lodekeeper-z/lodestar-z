@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const enr = @import("enr.zig");
 const message = @import("protocol/message.zig");
+const public_api = @import("public_api.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -54,7 +55,7 @@ pub const RequestTerminal = union(enum) {
 };
 
 pub const RequestResult = struct {
-    key: types.RequestKey,
+    handle: public_api.RequestHandle,
     kind: types.RequestKind,
     terminal: RequestTerminal,
 };

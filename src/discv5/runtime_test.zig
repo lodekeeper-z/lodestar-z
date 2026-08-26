@@ -248,8 +248,10 @@ fn awaitRequestClosure(context: *PlaneClosure) void {
 }
 
 fn expectRequestIdentity(result: *const runtime_mod.RequestResult, endpoint: types.Endpoint, handle: public_api.RequestHandle, kind: types.RequestKind) !void {
-    try std.testing.expect(types.EndpointContext.eql(.{}, result.key.endpoint, endpoint));
-    try std.testing.expectEqualSlices(u8, handle.request_id.slice(), result.key.req_id.slice());
+    try std.testing.expectEqual(endpoint.node_id, result.handle.node_id);
+    try std.testing.expect(endpoint.addr.eql(&result.handle.address));
+    try std.testing.expectEqualSlices(u8, handle.request_id.slice(), result.handle.request_id.slice());
+    try std.testing.expectEqual(handle.generation, result.handle.generation);
     try std.testing.expectEqual(kind, result.kind);
 }
 
@@ -1088,8 +1090,8 @@ test "repeated maintenance wake is coalesced and stale queued wake is harmless" 
         const result = runtime.popRequestResult() orelse return error.MissingTimeoutResult;
         try std.testing.expect(result.terminal == .timeout);
         try std.testing.expectEqual(types.RequestKind.ping, result.kind);
-        if (std.mem.eql(u8, &first_id, &result.key.endpoint.node_id)) saw_first = true;
-        if (std.mem.eql(u8, &second_id, &result.key.endpoint.node_id)) saw_second = true;
+        if (std.mem.eql(u8, &first_id, &result.handle.node_id)) saw_first = true;
+        if (std.mem.eql(u8, &second_id, &result.handle.node_id)) saw_second = true;
     }
     try std.testing.expect(saw_first);
     try std.testing.expect(saw_second);
@@ -1187,7 +1189,7 @@ test "failed maintenance enqueue rolls back pending state for retry" {
     try std.testing.expect(!(try barrier_result));
     const timeout_result = runtime.popRequestResult() orelse return error.MissingTimeoutResult;
     try std.testing.expect(timeout_result.terminal == .timeout);
-    try std.testing.expectEqualSlices(u8, &remote_id, &timeout_result.key.endpoint.node_id);
+    try std.testing.expectEqualSlices(u8, &remote_id, &timeout_result.handle.node_id);
 
     runtime.stop();
     try loop_group.await(io);
@@ -1580,7 +1582,8 @@ test "shutdown detaches and removes queued lookup behind endpoint establishment"
     try std.testing.expect(runtime.popLookupResult() == null);
 
     const request_result = runtime.popRequestResult() orelse return error.MissingStoppedRequestResult;
-    try std.testing.expectEqualSlices(u8, ping_id.request_id.slice(), request_result.key.req_id.slice());
+    try std.testing.expectEqualSlices(u8, ping_id.request_id.slice(), request_result.handle.request_id.slice());
+    try std.testing.expectEqual(ping_id.generation, request_result.handle.generation);
     try std.testing.expect(request_result.terminal == .runtime_stopped);
     try std.testing.expect(runtime.popRequestResult() == null);
 
@@ -1768,10 +1771,10 @@ test "reliable request results cover active and queued cancellation exactly once
     var saw_active = false;
     var saw_queued = false;
     for ([_]runtime_mod.RequestResult{ first, second }) |result| {
-        if (types.RequestKeyContext.eql(.{}, result.key, public_api.handleToInternal(active_id).key)) {
+        if (result.handle.generation == active_id.generation) {
             try std.testing.expectEqual(types.RequestKind.ping, result.kind);
             saw_active = true;
-        } else if (types.RequestKeyContext.eql(.{}, result.key, public_api.handleToInternal(queued_id).key)) {
+        } else if (result.handle.generation == queued_id.generation) {
             try std.testing.expectEqual(types.RequestKind.talkreq, result.kind);
             saw_queued = true;
         } else return error.UnexpectedRequestResult;
@@ -1878,10 +1881,10 @@ test "Runtime shutdown terminates active and queued reliable requests" {
     var saw_active = false;
     var saw_queued = false;
     for ([_]runtime_mod.RequestResult{ first, second }) |result| {
-        if (types.RequestKeyContext.eql(.{}, result.key, public_api.handleToInternal(active_id).key)) {
+        if (result.handle.generation == active_id.generation) {
             try std.testing.expectEqual(types.RequestKind.ping, result.kind);
             saw_active = true;
-        } else if (types.RequestKeyContext.eql(.{}, result.key, public_api.handleToInternal(queued_id).key)) {
+        } else if (result.handle.generation == queued_id.generation) {
             try std.testing.expectEqual(types.RequestKind.findnode, result.kind);
             saw_queued = true;
         } else return error.UnexpectedRequestResult;

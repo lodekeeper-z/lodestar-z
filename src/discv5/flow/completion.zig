@@ -21,7 +21,7 @@ pub const Outcome = union(enum) {
 pub fn finish(actor: *Actor, env: Env, key: types.RequestKey, outcome: Outcome, terminal: request_results.RequestTerminal) bool {
     var request = actor.requests.takeTerminal(key) orelse return false;
     const origin = request.origin();
-    actor.publishRequestTerminal(env, key, request.kind(), origin, terminal);
+    actor.publishRequestTerminal(env, request.handle(key), request.kind(), origin, terminal);
     request.release(env.ingress);
     switch (outcome) {
         .success => |closer| actor.onRequestCompletion(env, key, origin, true, closer),

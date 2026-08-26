@@ -10,6 +10,7 @@ const completion = @import("completion.zig");
 const lookup = @import("../service/lookup.zig");
 const request_results = @import("../request_results.zig");
 const request_book = @import("../state/request_book.zig");
+const public_api = @import("../public_api.zig");
 const types = @import("../types.zig");
 
 const Actor = actor_mod.Actor;
@@ -223,7 +224,7 @@ fn handleTalkReq(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types
     env.outbox.publish(.{ .talkreq = .{
         .peer_id = endpoint.node_id,
         .peer_addr = endpoint.addr,
-        .req_id = request.req_id,
+        .req_id = public_api.requestIdFromWire(request.req_id),
         .protocol = protocol_copy,
         .request = request_copy,
     } });

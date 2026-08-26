@@ -1,5 +1,6 @@
 const std = @import("std");
 const admission = @import("admission.zig");
+const actor_mod = @import("actor.zig");
 const message = @import("protocol/message.zig");
 const public_api = @import("public_api.zig");
 const runtime_error = @import("runtime_error.zig");
@@ -89,7 +90,8 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             pubkey: [33]u8,
         ) !public_api.RequestHandle {
             const storage = impl(runtime);
-            var action = try storage.actor.preparePing(
+            var action = try actor_mod.Testing.preparePingResolvedForTest(
+                &storage.actor,
                 .{ .io = storage.io, .ingress = &storage.admission },
                 endpoint,
                 &pubkey,
@@ -194,7 +196,8 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             const storage = impl(runtime);
             std.debug.assert(storage.actor.requests.get(key) == null);
             if (storage.request_result_outbox.pop()) |result| {
-                std.debug.assert(types.RequestKeyContext.eql(.{}, result.key, key));
+                const internal = public_api.handleToInternal(result.handle);
+                std.debug.assert(types.RequestKeyContext.eql(.{}, internal.key, key));
                 return;
             }
             std.debug.assert(storage.actor.requests.get(key) == null);

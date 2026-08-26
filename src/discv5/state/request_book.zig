@@ -202,6 +202,12 @@ pub const TerminalRequest = union(enum) {
         };
     }
 
+    pub fn handle(self: *const TerminalRequest, key: types.RequestKey) RequestHandle {
+        return .{ .key = key, .generation = switch (self.*) {
+            inline else => |request| request.generation,
+        } };
+    }
+
     pub fn release(self: *TerminalRequest, admission: *admission_mod.IngressAdmission) void {
         switch (self.*) {
             inline else => |*request| request.admission.release(admission),

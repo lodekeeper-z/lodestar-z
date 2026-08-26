@@ -32,6 +32,56 @@ fn drainEffects(
     }
 }
 
+test "TALKREQ publication preserves empty and eight-byte request IDs" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x21} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x22} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 21 }, .port = 9021 } },
+    };
+    var harness = try ActorHarness.init(alloc, io, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 2, .command_capacity = 1 },
+    });
+    defer harness.deinit();
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0x23} ** 16,
+        .recipient_key = [_]u8{0x24} ** 16,
+    };
+    harness.actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+
+    const maximum = [_]u8{0xaa} ** 8;
+    const boundaries = [_][]const u8{ &.{}, &maximum };
+    for (boundaries, 0..) |bytes, index| {
+        const talk = message.TalkReq{
+            .req_id = try message.ReqId.fromSlice(bytes),
+            .protocol = "boundary",
+            .request = "request",
+        };
+        var plaintext_buffer: [128]u8 = undefined;
+        try deliverEncrypted(
+            &harness.actor,
+            io,
+            harness.recording.sender(),
+            &harness.ingress,
+            &harness.outbox,
+            endpoint,
+            &stable.recipient_key,
+            try talk.encodeInto(&plaintext_buffer),
+            @intCast(index + 1),
+        );
+        var event = harness.outbox.pop() orelse return error.MissingTalkRequestEvent;
+        defer event.deinit(alloc);
+        try std.testing.expect(event == .talkreq);
+        try std.testing.expectEqualSlices(u8, bytes, event.talkreq.req_id.slice());
+    }
+}
+
 test "addEnr treats an older ENR for a known newer node as usable without an event" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -133,7 +183,7 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     const actor = &harness.actor;
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x66} ** 16, .recipient_key = [_]u8{0x67} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const talk_id = try actor.sendTalkRequest(harness.env(), endpoint, &remote_pubkey, "test", "request");
+    const talk_id = try actor_mod.Testing.sendTalkRequestResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, "test", "request");
     try harness.drainEffects();
     const queued_id = try message.ReqId.fromSlice(&.{9});
     const queued_ping = message.Ping{ .req_id = queued_id, .enr_seq = 0 };
@@ -141,7 +191,7 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     _ = try actor.requests.queue(try .init(.api, endpoint, &remote_pubkey, queued_id, .ping, &.{}, try queued_ping.encodeInto(&queued_buffer), std.math.maxInt(i64)));
     harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
 
-    const response = message.TalkResp{ .req_id = talk_id, .response = "owned response" };
+    const response = message.TalkResp{ .req_id = talk_id.key.req_id, .response = "owned response" };
     var response_buffer: [128]u8 = undefined;
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     actor.alloc = failing.allocator();
@@ -151,7 +201,7 @@ test "full event outbox preserves non-reliable completion and queued drain witho
     actor.alloc = alloc;
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
-    try std.testing.expect(actor.requests.get(.init(endpoint, talk_id)) == null);
+    try std.testing.expect(actor.requests.get(talk_id.key) == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expect(actor.requests.get(.init(endpoint, queued_id)) != null);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
@@ -226,12 +276,12 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     _ = actor.peers.markResponsive(remote_id, endpoint.addr, 0, null);
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x6c} ** 16, .recipient_key = [_]u8{0x6d} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const req_id = try actor.sendPing(harness.env(), endpoint, &remote_pubkey, .{ .maintenance = .health });
+    const req_id = try actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .{ .maintenance = .health });
     try harness.drainEffects();
-    const key = types.RequestKey.init(endpoint, req_id);
+    const key = req_id.key;
     try std.testing.expect(actor.peers.armHealthRequest(key, .connected_only));
     harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
-    const pong = message.Pong{ .req_id = req_id, .enr_seq = 1, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 };
+    const pong = message.Pong{ .req_id = req_id.key.req_id, .enr_seq = 1, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 };
     var pong_buffer: [128]u8 = undefined;
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try pong.encodeInto(&pong_buffer), 12);
 
@@ -419,15 +469,15 @@ test "detached late multipart NODES still learns emits and releases final permit
     const lookup_id: u32 = 42;
     const lookup = try lookup_mod.Lookup.init(alloc, [_]u8{0} ** 32, &.{}, 0, actor.lookup_config);
     actor.lookups.putAssumeCapacityNoClobber(lookup_id, lookup);
-    const req_id = try actor.sendFindNode(harness.env(), endpoint, &remote_pubkey, &.{distance}, .{ .lookup = lookup_id });
+    const req_id = try actor_mod.Testing.sendFindNodeResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, &.{distance}, .{ .lookup = lookup_id });
     try harness.drainEffects();
     actor.finishLookup(harness.env(), lookup_id, .completed);
     try std.testing.expect(harness.outbox.pop() == null);
-    try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(.init(endpoint, req_id)).?.origin);
+    try std.testing.expectEqual(types.RequestOrigin.detached_lookup, actor.requests.get(req_id.key).?.origin);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     var first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const first = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{discovered_enr} };
+    const first = message.Nodes{ .req_id = req_id.key.req_id, .total = 2, .enrs = &.{discovered_enr} };
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try first.encodeInto(&first_buffer), 13);
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
@@ -437,7 +487,7 @@ test "detached late multipart NODES still learns emits and releases final permit
     try std.testing.expect(discovered_event == .discovered_enr);
 
     var final_buffer: [128]u8 = undefined;
-    const final = message.Nodes{ .req_id = req_id, .total = 2, .enrs = &.{} };
+    const final = message.Nodes{ .req_id = req_id.key.req_id, .total = 2, .enrs = &.{} };
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try final.encodeInto(&final_buffer), 14);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
@@ -497,10 +547,10 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x86} ** 16, .recipient_key = [_]u8{0x87} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
 
-    const first_req = try actor.sendFindNode(env, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
+    const first_req = try actor_mod.Testing.sendFindNodeResolvedForTest(&actor, env, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
     try drainEffects(&actor, env, &effects, &recording);
     var first_chunk_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const first_chunk = message.Nodes{ .req_id = first_req, .total = 2, .enrs = &.{raw_a} };
+    const first_chunk = message.Nodes{ .req_id = first_req.key.req_id, .total = 2, .enrs = &.{raw_a} };
     var fail_first = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     actor.alloc = fail_first.allocator();
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try first_chunk.encodeInto(&first_chunk_buffer), 15);
@@ -512,22 +562,22 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     defer first_discovered.deinit(alloc);
     try std.testing.expect(first_discovered == .discovered_enr);
     var first_final_buffer: [128]u8 = undefined;
-    const first_final = message.Nodes{ .req_id = first_req, .total = 2, .enrs = &.{} };
+    const first_final = message.Nodes{ .req_id = first_req.key.req_id, .total = 2, .enrs = &.{} };
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try first_final.encodeInto(&first_final_buffer), 16);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
     try std.testing.expect(outbox.pop() == null);
 
-    const final_req = try actor.sendFindNode(env, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
+    const final_req = try actor_mod.Testing.sendFindNodeResolvedForTest(&actor, env, endpoint, &remote_pubkey, &.{ distance_a, distance_b }, .api);
     try drainEffects(&actor, env, &effects, &recording);
     var successful_first_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const successful_first = message.Nodes{ .req_id = final_req, .total = 2, .enrs = &.{raw_a} };
+    const successful_first = message.Nodes{ .req_id = final_req.key.req_id, .total = 2, .enrs = &.{raw_a} };
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try successful_first.encodeInto(&successful_first_buffer), 17);
     var repeated_discovered = outbox.pop() orelse return error.MissingRepeatedDiscovered;
     defer repeated_discovered.deinit(alloc);
     try std.testing.expect(repeated_discovered == .discovered_enr);
     var final_chunk_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
-    const final_chunk = message.Nodes{ .req_id = final_req, .total = 2, .enrs = &.{raw_b} };
+    const final_chunk = message.Nodes{ .req_id = final_req.key.req_id, .total = 2, .enrs = &.{raw_b} };
     var fail_final = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     actor.alloc = fail_final.allocator();
     try deliverEncrypted(&actor, io, recording.sender(), &ingress, &outbox, endpoint, &stable.recipient_key, try final_chunk.encodeInto(&final_chunk_buffer), 18);
