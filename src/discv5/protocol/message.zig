@@ -423,32 +423,46 @@ pub const DecodedMessage = union(enum) {
     pub fn decodeInto(out: *DecodedMessage, data: []const u8) Error!void {
         if (data.len == 0) return Error.InvalidMessage;
         switch (data[0]) {
-            MSG_PING => out.* = .{ .ping = try Ping.decode(data) },
-            MSG_PONG => out.* = .{ .pong = try Pong.decode(data) },
+            MSG_PING => {
+                const decoded = try Ping.decode(data);
+                out.* = .{ .ping = decoded };
+            },
+            MSG_PONG => {
+                const decoded = try Pong.decode(data);
+                out.* = .{ .pong = decoded };
+            },
             MSG_FINDNODE => {
-                out.* = .{ .findnode = .{
-                    .req_id = try ReqId.fromSlice(&.{}),
+                var candidate: DecodedMessage = .{ .findnode = .{
+                    .req_id = .{ .bytes = [_]u8{0} ** 8, .len = 0 },
                     .distances = [_]u16{0} ** MAX_FINDNODE_DISTANCES,
                     .distances_len = 0,
                 } };
-                const decoded = try FindNode.decodeInto(data, &out.findnode.distances);
-                out.findnode.req_id = decoded.req_id;
-                out.findnode.distances_len = decoded.distances.len;
+                const decoded = try FindNode.decodeInto(data, &candidate.findnode.distances);
+                candidate.findnode.req_id = decoded.req_id;
+                candidate.findnode.distances_len = decoded.distances.len;
+                out.* = candidate;
             },
             MSG_NODES => {
-                out.* = .{ .nodes = .{
-                    .req_id = try ReqId.fromSlice(&.{}),
+                var candidate: DecodedMessage = .{ .nodes = .{
+                    .req_id = .{ .bytes = [_]u8{0} ** 8, .len = 0 },
                     .total = 0,
                     .enrs = [_][]const u8{&.{}} ** config.MAX_NODES_RESPONSE,
                     .enrs_len = 0,
                 } };
-                const decoded = try Nodes.decodeInto(data, &out.nodes.enrs);
-                out.nodes.req_id = decoded.req_id;
-                out.nodes.total = decoded.total;
-                out.nodes.enrs_len = decoded.enrs.len;
+                const decoded = try Nodes.decodeInto(data, &candidate.nodes.enrs);
+                candidate.nodes.req_id = decoded.req_id;
+                candidate.nodes.total = decoded.total;
+                candidate.nodes.enrs_len = decoded.enrs.len;
+                out.* = candidate;
             },
-            MSG_TALKREQ => out.* = .{ .talkreq = try TalkReq.decode(data) },
-            MSG_TALKRESP => out.* = .{ .talkresp = try TalkResp.decode(data) },
+            MSG_TALKREQ => {
+                const decoded = try TalkReq.decode(data);
+                out.* = .{ .talkreq = decoded };
+            },
+            MSG_TALKRESP => {
+                const decoded = try TalkResp.decode(data);
+                out.* = .{ .talkresp = decoded };
+            },
             else => return Error.UnexpectedType,
         }
     }
@@ -483,6 +497,92 @@ fn appendExtraShortListField(alloc: Allocator, encoded: []const u8) ![]u8 {
     with_extra[1] += 1;
     with_extra[encoded.len] = 0x80;
     return with_extra;
+}
+
+fn decodedMessageSentinel() DecodedMessage {
+    return .{ .findnode = .{
+        .req_id = .{ .bytes = [_]u8{0xa5} ** 8, .len = 8 },
+        .distances = [_]u16{0xa5a5} ** MAX_FINDNODE_DISTANCES,
+        .distances_len = MAX_FINDNODE_DISTANCES,
+    } };
+}
+
+fn expectDecodedMessageSentinel(actual: *const DecodedMessage) !void {
+    switch (actual.*) {
+        .findnode => |findnode| {
+            try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 8), &findnode.req_id.bytes);
+            try std.testing.expectEqual(@as(u8, 8), findnode.req_id.len);
+            try std.testing.expectEqualSlices(
+                u16,
+                &([_]u16{0xa5a5} ** MAX_FINDNODE_DISTANCES),
+                &findnode.distances,
+            );
+            try std.testing.expectEqual(@as(usize, MAX_FINDNODE_DISTANCES), findnode.distances_len);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "DecodedMessage decodeInto preserves sentinel on FINDNODE errors" {
+    const alloc = std.testing.allocator;
+    var encoded_buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const request = FindNode{
+        .req_id = try ReqId.fromSlice(&.{0x01}),
+        .distances = &.{ 1, 256 },
+    };
+    const encoded = try request.encodeInto(&encoded_buf);
+    const with_trailing = try appendTrailingByte(alloc, encoded);
+    defer alloc.free(with_trailing);
+
+    const malformed_final_boundary = encoded[0 .. encoded.len - 1];
+    const semantic_invalid = [_]u8{ MSG_FINDNODE, 0xc5, 0x01, 0xc3, 0x82, 0x01, 0x01 };
+    const cases = .{
+        .{ malformed_final_boundary, Error.InvalidEncoding },
+        .{ with_trailing, Error.InvalidEncoding },
+        .{ semantic_invalid[0..], Error.InvalidMessage },
+    };
+    inline for (cases) |case| {
+        var decoded = decodedMessageSentinel();
+        try std.testing.expectError(case[1], DecodedMessage.decodeInto(&decoded, case[0]));
+        try expectDecodedMessageSentinel(&decoded);
+    }
+}
+
+test "DecodedMessage decodeInto preserves sentinel on NODES errors" {
+    const alloc = std.testing.allocator;
+    var encoded_buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const response = Nodes{
+        .req_id = try ReqId.fromSlice(&.{0x01}),
+        .total = 1,
+        .enrs = &.{&.{0x80}},
+    };
+    const encoded = try response.encodeInto(&encoded_buf);
+    const with_trailing = try appendTrailingByte(alloc, encoded);
+    defer alloc.free(with_trailing);
+
+    const malformed_final_boundary = encoded[0 .. encoded.len - 1];
+    const malformed_enr = [_]u8{ MSG_NODES, 0xc5, 0x01, 0x01, 0xc2, 0x82, 0x01 };
+    const malformed_cases = .{
+        .{ malformed_final_boundary, Error.InvalidEncoding },
+        .{ with_trailing, Error.InvalidEncoding },
+        .{ malformed_enr[0..], Error.InvalidEncoding },
+    };
+    inline for (malformed_cases) |case| {
+        var decoded = decodedMessageSentinel();
+        try std.testing.expectError(case[1], DecodedMessage.decodeInto(&decoded, case[0]));
+        try expectDecodedMessageSentinel(&decoded);
+    }
+
+    const too_many_enrs = [_][]const u8{&.{0x80}} ** (config.MAX_NODES_RESPONSE + 1);
+    const oversized_response = Nodes{
+        .req_id = try ReqId.fromSlice(&.{0x01}),
+        .total = 1,
+        .enrs = &too_many_enrs,
+    };
+    const oversized_encoded = try oversized_response.encodeInto(&encoded_buf);
+    var decoded = decodedMessageSentinel();
+    try std.testing.expectError(Error.BufferTooSmall, DecodedMessage.decodeInto(&decoded, oversized_encoded));
+    try expectDecodedMessageSentinel(&decoded);
 }
 
 test "discv5 messages: PING encode/decode" {
