@@ -1199,35 +1199,10 @@ pub const Actor = struct {
 
     fn updateLocalAddress(self: *Actor, address: types.Address) bool {
         const current = self.local.raw orelse return false;
-        const parsed = enr.decode(current.slice()) catch return false;
-        const next_seq = std.math.add(u64, @max(parsed.seq, self.local.seq), 1) catch return false;
-        var builder = enr.Builder.init(self.alloc, self.local_key_pair, next_seq);
-        builder.ip = parsed.ip;
-        builder.udp = parsed.udp;
-        builder.tcp = parsed.tcp;
-        builder.quic = parsed.quic;
-        builder.ip6 = parsed.ip6;
-        builder.udp6 = parsed.udp6;
-        builder.tcp6 = parsed.tcp6;
-        builder.quic6 = parsed.quic6;
-        builder.eth2 = parsed.eth2_raw;
-        builder.attnets = parsed.attnets;
-        builder.syncnets = parsed.syncnets;
-        builder.custody_group_count = parsed.custody_group_count;
-        switch (address) {
-            .ip4 => |value| {
-                builder.ip = value.bytes;
-                builder.udp = value.port;
-            },
-            .ip6 => |value| {
-                builder.ip6 = value.bytes;
-                builder.udp6 = value.port;
-            },
-        }
-        const encoded = builder.encode() catch return false;
-        defer self.alloc.free(encoded);
-        const replacement = enr.RawEnr.init(encoded) catch return false;
-        self.local = .{ .raw = replacement, .seq = builder.seq };
+        const document = enr.ValidatedEnr.init(current.slice()) catch return false;
+        const next_seq = std.math.add(u64, @max(document.parsed.seq, self.local.seq), 1) catch return false;
+        const replacement = document.withEndpoint(&self.local_key_pair, next_seq, address) catch return false;
+        self.local = .{ .raw = replacement, .seq = next_seq };
         return true;
     }
 

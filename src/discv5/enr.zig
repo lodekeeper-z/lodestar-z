@@ -120,7 +120,117 @@ pub const ValidatedEnr = struct {
             .node_id = node_id,
         };
     }
+
+    /// Re-sign the complete bounded ENR document after changing one effective
+    /// UDP endpoint. Opaque key/value pairs and the untouched address family
+    /// are copied from the signed document rather than reconstructed from the
+    /// typed projection.
+    pub fn withEndpoint(self: *const ValidatedEnr, key_pair: *const secp.KeyPair, seq: u64, address: Address) !RawEnr {
+        const pubkey = secp.compressedPubkey(key_pair);
+        const document_pubkey = self.parsed.pubkey orelse return Error.InvalidPublicKey;
+        if (!std.mem.eql(u8, &pubkey, &document_pubkey)) return Error.InvalidPublicKey;
+
+        var patches: [3]EndpointPatch = undefined;
+        var patch_count: usize = 0;
+        switch (address) {
+            .ip4 => |endpoint| {
+                patches[patch_count] = EndpointPatch.fromBytes("ip", &endpoint.bytes);
+                patch_count += 1;
+                patches[patch_count] = EndpointPatch.fromPort("udp", endpoint.port);
+                patch_count += 1;
+                if (self.parsed.ip6 != null and self.parsed.udp6 == null) {
+                    if (self.parsed.udp) |shared_port| {
+                        if (shared_port != endpoint.port) {
+                            patches[patch_count] = EndpointPatch.fromPort("udp6", shared_port);
+                            patch_count += 1;
+                        }
+                    }
+                }
+            },
+            .ip6 => |endpoint| {
+                patches[patch_count] = EndpointPatch.fromBytes("ip6", &endpoint.bytes);
+                patch_count += 1;
+                patches[patch_count] = EndpointPatch.fromPort("udp6", endpoint.port);
+                patch_count += 1;
+            },
+        }
+
+        var content_buf: [MAX_ENR_SIZE]u8 = undefined;
+        var content_writer = rlp.Writer.initBuffer(&content_buf);
+        const content_start = try content_writer.beginListBounded();
+        try writeUpdatedContent(&content_writer, self.raw.slice(), seq, patches[0..patch_count]);
+        try content_writer.finishList(content_start);
+
+        var hash: [32]u8 = undefined;
+        Keccak256.hash(content_writer.bytes(), &hash, .{});
+        const signature = try secp.sign(&hash, key_pair);
+
+        // beginListBounded reserves a four-byte prefix and compacts it in
+        // finishList. Allow that temporary slack while keeping the finished
+        // document constrained by RawEnr.init to EIP-778's 300-byte limit.
+        var full_buf: [MAX_ENR_SIZE + 4]u8 = undefined;
+        var full_writer = rlp.Writer.initBuffer(&full_buf);
+        const full_start = try full_writer.beginListBounded();
+        try full_writer.writeBytesBounded(&signature);
+        try writeUpdatedContent(&full_writer, self.raw.slice(), seq, patches[0..patch_count]);
+        try full_writer.finishList(full_start);
+        return RawEnr.init(full_writer.bytes());
+    }
 };
+
+const EndpointPatch = struct {
+    key: []const u8,
+    bytes: [16]u8 = undefined,
+    len: u8,
+
+    fn fromBytes(key: []const u8, bytes: []const u8) EndpointPatch {
+        std.debug.assert(bytes.len <= 16);
+        var patch = EndpointPatch{ .key = key, .len = @intCast(bytes.len) };
+        @memcpy(patch.bytes[0..bytes.len], bytes);
+        return patch;
+    }
+
+    fn fromPort(key: []const u8, port: u16) EndpointPatch {
+        if (port == 0) return fromBytes(key, &.{});
+        if (port <= std.math.maxInt(u8)) return fromBytes(key, &.{@intCast(port)});
+        return fromBytes(key, &.{ @intCast(port >> 8), @intCast(port & 0xff) });
+    }
+
+    fn value(self: *const EndpointPatch) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+fn writeUpdatedContent(writer: *rlp.Writer, raw: []const u8, seq: u64, patches: []const EndpointPatch) !void {
+    var reader = rlp.Reader.init(raw);
+    var list = try reader.readList();
+    if (!reader.atEnd()) return Error.InvalidEnr;
+    _ = try list.readBytes();
+    _ = try list.readUint64();
+
+    try writer.writeUint64Bounded(seq);
+    var patch_index: usize = 0;
+    while (!list.atEnd()) {
+        const key = try list.readBytes();
+        const value = try list.readBytes();
+        while (patch_index < patches.len and std.mem.order(u8, patches[patch_index].key, key) == .lt) : (patch_index += 1) {
+            try writer.writeBytesBounded(patches[patch_index].key);
+            try writer.writeBytesBounded(patches[patch_index].value());
+        }
+        if (patch_index < patches.len and std.mem.eql(u8, patches[patch_index].key, key)) {
+            try writer.writeBytesBounded(patches[patch_index].key);
+            try writer.writeBytesBounded(patches[patch_index].value());
+            patch_index += 1;
+        } else {
+            try writer.writeBytesBounded(key);
+            try writer.writeBytesBounded(value);
+        }
+    }
+    while (patch_index < patches.len) : (patch_index += 1) {
+        try writer.writeBytesBounded(patches[patch_index].key);
+        try writer.writeBytesBounded(patches[patch_index].value());
+    }
+}
 
 comptime {
     std.debug.assert(@sizeOf(ValidatedEnr) <= 512);
@@ -229,7 +339,11 @@ pub fn decode(data: []const u8) Error!Enr {
             const val = list.readBytes() catch return Error.InvalidEnr;
             if (readFixed(1, val)) |v| enr.syncnets = v;
         } else {
-            return Error.InvalidEnr;
+            // EIP-778 records are extensible. Validate that the opaque value is
+            // a byte string and retain the complete signed document in
+            // ValidatedEnr.raw; the typed Enr value is only a projection of
+            // fields understood by this implementation.
+            _ = list.readBytes() catch return Error.InvalidEnr;
         }
     }
 
@@ -496,6 +610,7 @@ pub fn countSubnets(attnets: [8]u8) u32 {
 
 fn encodeUnknownEnrForTest(alloc: Allocator, key_pair: secp.KeyPair) ![]u8 {
     const pubkey = secp.compressedPubkey(&key_pair);
+    const ip6 = [_]u8{0} ** 15 ++ .{1};
 
     var content_buf: [MAX_ENR_SIZE]u8 = undefined;
     var content_writer = rlp.Writer.initBuffer(&content_buf);
@@ -503,8 +618,12 @@ fn encodeUnknownEnrForTest(alloc: Allocator, key_pair: secp.KeyPair) ![]u8 {
     try content_writer.writeUint64Bounded(1);
     try content_writer.writeBytesBounded("id");
     try content_writer.writeBytesBounded("v4");
+    try content_writer.writeBytesBounded("ip6");
+    try content_writer.writeBytesBounded(&ip6);
     try content_writer.writeBytesBounded("secp256k1");
     try content_writer.writeBytesBounded(&pubkey);
+    try content_writer.writeBytesBounded("udp");
+    try content_writer.writeBytesBounded(&.{ 0x23, 0x28 });
     try content_writer.writeBytesBounded("x-test");
     try content_writer.writeBytesBounded("opaque");
     try content_writer.finishList(content_start);
@@ -520,21 +639,124 @@ fn encodeUnknownEnrForTest(alloc: Allocator, key_pair: secp.KeyPair) ![]u8 {
     try full_writer.writeUint64Bounded(1);
     try full_writer.writeBytesBounded("id");
     try full_writer.writeBytesBounded("v4");
+    try full_writer.writeBytesBounded("ip6");
+    try full_writer.writeBytesBounded(&ip6);
     try full_writer.writeBytesBounded("secp256k1");
     try full_writer.writeBytesBounded(&pubkey);
+    try full_writer.writeBytesBounded("udp");
+    try full_writer.writeBytesBounded(&.{ 0x23, 0x28 });
     try full_writer.writeBytesBounded("x-test");
     try full_writer.writeBytesBounded("opaque");
     try full_writer.finishList(full_start);
     return alloc.dupe(u8, full_writer.bytes());
 }
 
-test "ENR rejects unknown signed key value" {
+fn hasPairForTest(data: []const u8, expected_key: []const u8, expected_value: []const u8) !bool {
+    var reader = rlp.Reader.init(data);
+    var list = try reader.readList();
+    _ = try list.readBytes();
+    _ = try list.readUint64();
+    while (!list.atEnd()) {
+        const key = try list.readBytes();
+        const value = try list.readBytes();
+        if (std.mem.eql(u8, key, expected_key) and std.mem.eql(u8, value, expected_value)) return true;
+    }
+    return false;
+}
+
+fn encodePaddedEnrForTest(alloc: Allocator, key_pair: secp.KeyPair, padding_len: usize) ![]u8 {
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const ip6 = [_]u8{0} ** 15 ++ .{1};
+    const padding = [_]u8{0x5a} ** MAX_ENR_SIZE;
+
+    var content_writer = rlp.Writer.init();
+    defer content_writer.deinit(alloc);
+    const content_start = try content_writer.beginList(alloc);
+    try content_writer.writeUint64(alloc, 1);
+    try content_writer.writeBytes(alloc, "id");
+    try content_writer.writeBytes(alloc, "v4");
+    try content_writer.writeBytes(alloc, "ip");
+    try content_writer.writeBytes(alloc, &.{ 127, 0, 0, 1 });
+    try content_writer.writeBytes(alloc, "ip6");
+    try content_writer.writeBytes(alloc, &ip6);
+    try content_writer.writeBytes(alloc, "secp256k1");
+    try content_writer.writeBytes(alloc, &pubkey);
+    try content_writer.writeBytes(alloc, "udp");
+    try content_writer.writeBytes(alloc, &.{ 0x23, 0x28 });
+    try content_writer.writeBytes(alloc, "udp6");
+    try content_writer.writeBytes(alloc, &.{ 0x23, 0x28 });
+    try content_writer.writeBytes(alloc, "x-pad");
+    try content_writer.writeBytes(alloc, padding[0..padding_len]);
+    try content_writer.finishList(content_start);
+
+    var hash: [32]u8 = undefined;
+    Keccak256.hash(content_writer.bytes(), &hash, .{});
+    const signature = try secp.sign(&hash, &key_pair);
+
+    var full_writer = rlp.Writer.init();
+    defer full_writer.deinit(alloc);
+    const full_start = try full_writer.beginList(alloc);
+    try full_writer.writeBytes(alloc, &signature);
+    var content_reader = rlp.Reader.init(content_writer.bytes());
+    var content = try content_reader.readList();
+    while (!content.atEnd()) try full_writer.writeRawItem(alloc, try content.readRawItem());
+    try full_writer.finishList(full_start);
+    return full_writer.toOwnedSlice(alloc);
+}
+
+test "ENR accepts and preserves unknown signed key value" {
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x42} ** 32));
     const encoded = try encodeUnknownEnrForTest(std.testing.allocator, key_pair);
     defer std.testing.allocator.free(encoded);
 
-    try std.testing.expectError(error.InvalidEnr, decode(encoded));
-    try std.testing.expectError(error.InvalidEnr, ValidatedEnr.init(encoded));
+    const parsed = try decode(encoded);
+    try std.testing.expectEqual(@as(u64, 1), parsed.seq);
+
+    const validated = try ValidatedEnr.init(encoded);
+    try std.testing.expectEqualSlices(u8, encoded, validated.raw.slice());
+}
+
+test "ENR endpoint update preserves opaque fields and untouched effective IPv6 port" {
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x42} ** 32));
+    const encoded = try encodeUnknownEnrForTest(std.testing.allocator, key_pair);
+    defer std.testing.allocator.free(encoded);
+    const validated = try ValidatedEnr.init(encoded);
+
+    const updated = try validated.withEndpoint(&key_pair, 2, .{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = 9_100,
+    } });
+    const reparsed = try decode(updated.slice());
+
+    try std.testing.expectEqual(@as(u64, 2), reparsed.seq);
+    try std.testing.expectEqual(Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9_100 } }, reparsed.udpAddress4().?);
+    try std.testing.expectEqual(Address{ .ip6 = .{ .bytes = [_]u8{0} ** 15 ++ .{1}, .port = 9_000 } }, reparsed.udpAddress6().?);
+    try std.testing.expect(try hasPairForTest(updated.slice(), "x-test", "opaque"));
+}
+
+test "ENR endpoint update supports the exact 300 byte wire limit" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x43} ** 32));
+    var encoded: ?[]u8 = null;
+    for (0..MAX_ENR_SIZE + 1) |padding_len| {
+        const candidate = try encodePaddedEnrForTest(alloc, key_pair, padding_len);
+        if (candidate.len == MAX_ENR_SIZE) {
+            encoded = candidate;
+            break;
+        }
+        alloc.free(candidate);
+    }
+    const raw = encoded orelse return error.CouldNotConstructMaxSizeEnr;
+    defer alloc.free(raw);
+    const validated = try ValidatedEnr.init(raw);
+
+    const updated = try validated.withEndpoint(&key_pair, 2, .{ .ip4 = .{
+        .bytes = .{ 192, 0, 2, 1 },
+        .port = 9_100,
+    } });
+
+    try std.testing.expectEqual(@as(usize, MAX_ENR_SIZE), updated.slice().len);
+    _ = try decode(updated.slice());
 }
 
 test "ENR nodeIdFromCompressedPubkey" {

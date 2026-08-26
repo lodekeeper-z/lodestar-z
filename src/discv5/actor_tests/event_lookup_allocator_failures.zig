@@ -241,7 +241,7 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 }
 
-test "LocalRecord replacement is atomic across allocator failure" {
+test "LocalRecord update remains canonical when event publication allocation fails" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x75} ** 32));
@@ -272,22 +272,11 @@ test "LocalRecord replacement is atomic across allocator failure" {
     actor.alloc = alloc;
 
     try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(@as(u64, 1), actor.local.seq);
-    try std.testing.expectEqualSlices(u8, before.slice(), actor.local.raw.?.slice());
-    try std.testing.expectEqual(@as(usize, 1), actor.votes_ip4.currentVoteCount());
-    try std.testing.expect(harness.outbox.pop() == null);
-
-    actor.observeAddressVote(
-        harness.env(),
-        .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 2 } },
-        .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 2 }, .port = 9100 } },
-    );
     try std.testing.expectEqual(@as(u64, 2), actor.local.seq);
     try std.testing.expect(!std.mem.eql(u8, before.slice(), actor.local.raw.?.slice()));
     try std.testing.expectEqual(@as(usize, 0), actor.votes_ip4.currentVoteCount());
-    var updated = harness.outbox.pop() orelse return error.MissingLocalEnrUpdated;
-    defer updated.deinit(alloc);
-    try std.testing.expect(updated == .local_enr_updated);
+    try std.testing.expectEqual(@as(u64, 1), harness.outbox.droppedCount());
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "lookup transport failure completes through emitted effect ownership" {
