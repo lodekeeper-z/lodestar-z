@@ -70,6 +70,7 @@ pub const SetLocalEnrError = CommandError || error{
 pub const RequestError = CommandError || error{
     DuplicateChallenge,
     DuplicateRequest,
+    GenerationExhausted,
     NoSocketForAddressFamily,
     OutOfMemory,
     PermitGenerationExhausted,

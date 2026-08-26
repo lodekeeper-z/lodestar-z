@@ -9,11 +9,11 @@ Each logical fact has one canonical owner. Indexes may reference that fact, but 
 | Logical fact | Current representations / owners |
 | --- | --- |
 | A reliable result will eventually be published | `Runtime.sendPing()` reserves the request-result outbox; `RuntimeImpl.handleSendPing()` claims or releases it; `RequestOrigin.reliable_api` marks the request; `Actor.publishRequestTerminal()` selects and publishes to the outbox. |
-| A request is accepted but not yet visible as active | Runtime command queue owns `SendPing`; `RequestBook.PreparedRequest` owns admission and request state during `flow/outbound.dispatch()`; the caller relies on `errdefer` while transport is cancelable. |
-| An endpoint is establishing a session | `PreparedRequest.establish`; `RequestBook.EndpointLane.establishing`; active request phase `awaiting_whoareyou`; challenge nonce index. |
-| A datagram corresponds to a future request | Stack-local encoded packet and nonce; `RecoveryState`; `PreparedRequest`; only implicit control flow connects them until `commitPrepared()`. |
-| Send completion | Represented by control flow crossing `Actor -> flow/outbound -> transport.Sender`; failure is normalized again in Runtime. There is no explicit domain completion event. |
-| Cancellation ownership | Runtime task cancellation interrupts `Sender.send`; `errdefer prepared.abort()` repairs Actor-owned admission state; Runtime shutdown then drains/terminalizes other accepted ownership. |
+| A request is accepted but not yet active | `RequestBook` owns a generation-tagged `.sending` entry with the compact `ResponseExpectation`, admission permit, recovery state, and indexes. `SendDatagramEffect` carries only its exact `RequestHandle` and packet bytes. |
+| An endpoint is establishing a session | `RequestBook.EndpointLane.establishing` stores the exact request handle; the canonical sending or active request owns `awaiting_whoareyou`; the challenge nonce index stores the same handle. |
+| A datagram corresponds to a future request | `SendDatagramEffect.handle` identifies the canonical sending entry by request key and generation; `SendDatagramEffect.packet` owns the bounded encoded datagram. |
+| Send completion | Runtime reports `.sent`, `.failed`, or `.runtime_stopped` to `Actor.applySendCompletion()`. Actor applies the completion only when the handle still names the exact `.sending` generation. |
+| Cancellation ownership | Runtime maps canceled execution to `.runtime_stopped`; `RequestBook.abortSending()` removes only the exact generation, clears matching indexes, and releases its permit. Runtime shutdown synthesizes completion for other accepted effects. |
 
 The transaction currently spans Runtime command/result ownership, Actor/RequestBook state, ingress admission, and cancelable transport execution.
 
@@ -33,22 +33,22 @@ Runtime accepts command and claims result reservation
 
 | Fact | Target owner |
 | --- | --- |
-| Prepared request, compact response expectation, admission permit, nonce recovery, request key | `SendDatagramEffect` until completion; `RequestBook` materializes full active response state after `.sent`; no owner after `.failed`. |
-| Bounded encoded datagram | `SendDatagramEffect`; destination and request kind derive from its owned preparation rather than duplicate fields. |
+| Canonical request state, compact response expectation, admission permit, nonce recovery, request key | Generation-tagged `RequestBook` `.sending` entry until completion. Exact `.sent` activates the response accumulator and transitions it to `.active`; exact `.failed` or `.runtime_stopped` removes it. |
+| Bounded encoded datagram | `SendDatagramEffect.packet`; `SendDatagramEffect.handle` resolves destination, request kind, and canonical ownership without copying request state. |
 | Cancelable send operation | Runtime only. |
-| Send success/failure | Explicit `SendCompletion` event consumed by Actor exactly once. |
-| Active request and endpoint-establishing state | `RequestBook` only, created by applying successful completion. |
-| Reliable result reservation | Runtime result plane until command acceptance; active request origin after successful completion; explicit release on preparation/send failure. |
+| Send success/failure | Explicit completion applied by Actor only while the exact handle remains `.sending`; duplicate or stale completions are ignored. |
+| Sending, active, and endpoint-establishing state | `RequestBook` only. Sending and active response representations are distinct union variants. |
+| Reliable result reservation | Runtime result plane until command acceptance; canonical request origin after `beginSending()`; explicit terminal publication after exact send failure or request completion. |
 
 ### Slice constraints
 
 - Preserve request ID, packet bytes, nonce, deadline, admission budget, metrics, and queue behavior.
 - Actor must not call `transport.Sender.send` on reliable PING, FINDNODE, or TALKREQ command paths.
-- Before send completion, the request must not be visible in `RequestBook.active` or endpoint establishment state.
-- The effect must own exactly one admission permit before completion.
-- `.sent` transfers request ownership into `RequestBook` and records the sent metric.
-- `.failed` releases the permit and leaves no active request or endpoint-establishing state.
-- Runtime cancellation during send must apply `.failed` before propagating `error.Canceled`.
+- Before send completion, the request occupies bounded `RequestBook` capacity as `.sending`, is hidden from active lookups, and retains only a compact response expectation.
+- The canonical `.sending` entry owns exactly one admission permit; the effect owns no permit or response state.
+- Exact `.sent` activates the response state, transitions the entry to `.active`, and records the sent metric once.
+- Exact `.failed` releases the permit and removes matching request, challenge, and endpoint-establishing indexes.
+- Runtime cancellation during send must apply `.runtime_stopped` before propagating shutdown.
 - Existing direct/internal Actor callers remain behavior-compatible through a temporary synchronous adapter; later slices remove that adapter path by path.
 
 ## Acceptance measurements
@@ -56,7 +56,7 @@ Runtime accepts command and claims result reservation
 The slice is accepted only if it:
 
 1. removes transport from the Actor preparation transition for reliable PING, FINDNODE, and TALKREQ;
-2. gives the prepared request and packet one bounded owner;
+2. gives canonical sending state and the packet one bounded owner each;
 3. replaces implicit send/commit/`errdefer` choreography with one explicit completion transition;
 4. does not add another authoritative request or result-reservation fact;
 5. preserves focused send-failure, cancellation, session-establishment, request-result, and shutdown behavior;
@@ -68,12 +68,12 @@ The slice is accepted only if it:
 | --- | ---: | ---: |
 | Reliable-command `Sender.send` sites owned by Runtime | 0 | 1 shared executor |
 | Reliable-command `Sender.send` sites executed inside Actor/flow orchestration | 1 | 0 |
-| Full active response accumulators represented before send | 1 per prepared request | 0 |
+| Full active response accumulators constructed before successful send completion | 1 per request | 0 |
 | Mirrored effect fields for destination, request kind, and queued source | N/A | 0 |
 | Tracked-request `sendTracked` orchestration entry points | 1 | 0 |
 | Explicit send-completion domain handlers | 0 | 1 |
 | Cancelable sends executed while the Actor-domain transition remains on the call stack | 1 | 0 for reliable commands |
-| Bounded effect/action size | rejected 11,864 / 11,872 bytes | 4,112 / 4,120 bytes |
+| Request effect size | rejected 11,864 bytes | 1,376 bytes (`RequestHandle` plus `PacketBytes`) |
 
 These counts are scoped to the tracked reliable-request send transition; they do not describe response, retry, maintenance, lookup, or shutdown paths.
 
@@ -81,8 +81,8 @@ These counts are scoped to the tracked reliable-request send transition; they do
 - Runtime uses its own transport and admission fields for those commands; the Actor preparation context contains no sender.
 - `sendTracked` was removed. Internal health, eviction, and queue-drain paths use the same preparation/completion contract through a synchronous compatibility executor.
 - The old `errdefer prepared.abort()` send choreography was replaced by `.failed` completion. A mutation that suppressed failure resolution left the permit live and failed the ownership test.
-- The rejected first effect representation was 11,864 bytes and prematurely embedded the full active NODES accumulator. `ResponseExpectation` postpones that accumulator until commit; the final effect is 4,112 bytes and the action union is 4,120 bytes, guarded by a four-packet-budget test.
-- Destination, request kind, and queued-source flags were removed from the effect because they derive from its canonical prepared request or `RequestBook` queue state. A mutation that ignored the queued entry produced simultaneous queued/active ownership and was caught by `RequestBook.assertInvariants`.
+- The rejected first effect representation was 11,864 bytes and prematurely embedded the full active NODES accumulator. The canonical `.sending` entry retains `ResponseExpectation`; exact successful completion activates the NODES accumulator. The request effect is 1,376 bytes.
+- Destination, request kind, and queued-source flags were removed from the effect because they resolve through its canonical request handle or `RequestBook` queue state. A mutation that ignored the queued entry produced simultaneous queued/active ownership and was caught by `RequestBook.assertInvariants`.
 - Sessionless sends use the request-owned retry datagram directly. Established-session sends retain one transient ciphertext; their separately retained plaintext is a distinct recovery fact.
 
 ## Completed architecture: one Runtime-owned effect lifecycle
@@ -101,7 +101,7 @@ Runtime delivers command | packet | maintenance | completion
 
 `ActorEffect` has five canonical variants:
 
-- `request`: prepared PING, FINDNODE, TALKREQ, health, eviction, lookup, ENR refresh, and queued-redrain requests;
+- `request`: request handle plus packet for PING, FINDNODE, TALKREQ, health, eviction, lookup, ENR refresh, and queued-redrain requests;
 - `response`: PONG, NODES, and TALKRESP plus the moved response-recovery permit;
 - `retry`: retained probes and fresh retry transitions plus any replacement permit;
 - `handshake`: request/response challenge source, candidate keys, packet, and completion clocks;
@@ -123,8 +123,8 @@ Runtime delivers command | packet | maintenance | completion
 
 ### Canonical completion ownership
 
-- **Request `.sent`:** materialize `RequestBook` active state, metrics, health scheduling, and at most one stable-session FIFO continuation.
-- **Request `.failed`:** release preparation and resolve health, eviction, or lookup ownership exactly once.
+- **Request `.sent`:** activate the exact `RequestBook` sending generation, record metrics, schedule health work, and emit at most one stable-session FIFO continuation.
+- **Request `.failed`:** abort the exact sending generation, release its permit and indexes, and resolve health, eviction, or lookup ownership exactly once.
 - **Response `.sent`:** move the recovery permit into `ResponseBook`; failure releases it.
 - **Retry `.sent`:** commit retry deadline/state/permit swap; failure preserves old active state, releases any replacement permit, and advances the retry deadline.
 - **Handshake `.sent`:** commit request pending keys or response candidate keys; failure leaves the challenged state unchanged.
@@ -135,10 +135,10 @@ Runtime delivers command | packet | maintenance | completion
 
 - Runtime drains the single FIFO after every command, inbound packet, maintenance turn, and completion-generated continuation.
 - Queue storage is preallocated as `max(A, min(P, M + 1))`, where `A` is the active-request limit, `P` is the canonical ingress permit capacity, and `M` is the maximum NODES response chunk count.
-- Request effects are bounded by active plus move-owned prepared request ownership. An atomic authenticated FINDNODE turn is bounded by `M` response chunks plus one eviction probe, while all permit-bearing effects are also bounded by `P`.
+- Request effects are bounded by canonical sending entries, which share the active-request capacity `A`. An atomic authenticated FINDNODE turn is bounded by `M` response chunks plus one eviction probe, while all permit-bearing effects are also bounded by `P`.
 - Runtime pops before applying completion and drains before the next command, so the request and atomic-ingress bounds are alternatives rather than additive queue residents. No per-effect allocation occurs.
 - Queue redrain emits one head. `.sent` removes that head and may emit exactly the next head only under a stable session.
-- Runtime execution is deliberately synchronous in the actor-loop task. Therefore there are no detached transport tasks or replacement generations that can produce late completions. The move-owned effect value is the identity and is consumed once.
+- Runtime execution is deliberately synchronous in the actor-loop task, but copied, stale, delayed, or reordered completions remain harmless because the `RequestHandle` key and generation jointly identify ownership. Generations are checked, never wrapped, and exhausted rather than reused.
 - Cancellation during send maps to `runtime_stopped`; ordinary transport failure maps to `failed`; all remaining queued values are synthesized as `runtime_stopped` during terminalization.
 
 ## Remaining ownership work
@@ -147,4 +147,4 @@ The outbound transport redesign is complete. Remaining concerns are separate dom
 
 - Reliable result reservation is represented by Runtime outbox reservation state and `RequestOrigin.reliable_api`; a future consume-and-resolve result capability may consolidate that representation.
 - Peer/contact/routing canonicalization is independent of transport execution ownership.
-- If Runtime transport is later made concurrent or detached, that new design must add explicit generation identity and a late-completion registry. The current synchronous executor intentionally has neither race.
+- If Runtime transport is later made concurrent or detached, the existing request generation identity remains the ownership boundary; any additional registry must preserve exact-handle completion and exhaustion semantics.

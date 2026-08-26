@@ -122,6 +122,7 @@ test "copied request effect completion is accepted exactly once" {
     const duplicate = effect;
 
     context.harness.actor.applySendCompletion(context.harness.env(), effect, .sent);
+    try std.testing.expect(context.harness.actor.requests.completeSending(duplicate.handle) == null);
     context.harness.actor.applySendCompletion(context.harness.env(), duplicate, .sent);
 
     try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.activeCount());

@@ -161,7 +161,6 @@ pub const ResponseExpectation = union(enum) {
 
 pub const ActiveRequest = struct {
     generation: u64,
-    lifecycle: enum { sending, active },
     origin: types.RequestOrigin,
     response: Response,
     phase: Phase,
@@ -171,10 +170,25 @@ pub const ActiveRequest = struct {
     queued_intent: bool,
 };
 
+const SendingRequest = struct {
+    generation: u64,
+    origin: types.RequestOrigin,
+    response: ResponseExpectation,
+    phase: Phase,
+    admission: AdmissionPermit,
+    deadline_ns: i64,
+    queued_intent: bool,
+};
+
+const StoredRequest = union(enum) {
+    sending: SendingRequest,
+    active: ActiveRequest,
+};
+
 pub const QueuedRequest = request_queue.QueuedRequest;
 const EndpointLane = request_queue.EndpointLane;
 
-const ActiveMap = std.HashMap(types.RequestKey, ActiveRequest, types.RequestKeyContext, std.hash_map.default_max_load_percentage);
+const ActiveMap = std.HashMap(types.RequestKey, StoredRequest, types.RequestKeyContext, std.hash_map.default_max_load_percentage);
 const LaneMap = std.HashMap(types.Endpoint, EndpointLane, types.EndpointContext, std.hash_map.default_max_load_percentage);
 
 pub const SendCompletionView = struct {
@@ -223,7 +237,9 @@ pub const RequestBook = struct {
     pub fn deinit(self: *RequestBook, admission: *admission_mod.IngressAdmission) void {
         var active = self.active.iterator();
         while (active.next()) |entry| {
-            entry.value_ptr.admission.release(admission);
+            switch (entry.value_ptr.*) {
+                inline else => |*request| request.admission.release(admission),
+            }
         }
         self.active.deinit();
         var lanes = self.lanes.iterator();
@@ -270,21 +286,20 @@ pub const RequestBook = struct {
         }
         const challenge_index = challengeForPhase(key.endpoint.addr, phase);
         if (challenge_index) |index| if (self.challenge_by_nonce.contains(index)) return error.DuplicateChallenge;
+        const generation = std.math.add(u64, self.next_generation, 1) catch return error.GenerationExhausted;
+        const handle = RequestHandle{ .key = key, .generation = self.next_generation };
+        self.next_generation = generation;
         var permit = try admission.acquire(key.endpoint.addr, admission_mod.requestPacketBudget(response.kind()));
         errdefer permit.release(admission);
-        const handle = RequestHandle{ .key = key, .generation = self.next_generation };
-        self.next_generation +%= 1;
-        if (self.next_generation == 0) self.next_generation = 1;
-        self.active.putAssumeCapacityNoClobber(key, .{
+        self.active.putAssumeCapacityNoClobber(key, .{ .sending = .{
             .generation = handle.generation,
-            .lifecycle = .sending,
             .origin = origin,
-            .response = response.activate(),
+            .response = response,
             .phase = phase,
             .admission = permit.move(),
             .deadline_ns = deadline_ns,
             .queued_intent = queued_intent,
-        });
+        } });
         if (challenge_index) |index| self.challenge_by_nonce.putAssumeCapacityNoClobber(index, handle);
         if (establish) self.setEstablishing(handle);
         return handle;
@@ -292,11 +307,19 @@ pub const RequestBook = struct {
 
     pub fn completeSending(self: *RequestBook, handle: RequestHandle) ?SendCompletionView {
         const request = self.active.getPtr(handle.key) orelse return null;
-        if (request.generation != handle.generation or request.lifecycle != .sending) return null;
-        if (request.queued_intent) self.discardQueuedIntent(handle.key);
-        request.lifecycle = .active;
-        request.queued_intent = false;
-        return .{ .key = handle.key, .origin = request.origin, .kind = request.response.kind() };
+        if (request.* != .sending or request.sending.generation != handle.generation) return null;
+        const sending = request.sending;
+        if (sending.queued_intent) self.discardQueuedIntent(handle.key);
+        request.* = .{ .active = .{
+            .generation = sending.generation,
+            .origin = sending.origin,
+            .response = sending.response.activate(),
+            .phase = sending.phase,
+            .admission = sending.admission,
+            .deadline_ns = sending.deadline_ns,
+            .queued_intent = false,
+        } };
+        return .{ .key = handle.key, .origin = sending.origin, .kind = sending.response.kind() };
     }
 
     pub fn abortSending(
@@ -305,11 +328,11 @@ pub const RequestBook = struct {
         admission: *admission_mod.IngressAdmission,
     ) ?SendCompletionView {
         const current = self.active.get(handle.key) orelse return null;
-        if (current.generation != handle.generation or current.lifecycle != .sending) return null;
+        if (current != .sending or current.sending.generation != handle.generation) return null;
         var removed = self.active.fetchRemove(handle.key).?.value;
-        self.clearIndexes(handle, &removed);
-        const view = SendCompletionView{ .key = handle.key, .origin = removed.origin, .kind = removed.response.kind() };
-        removed.admission.release(admission);
+        self.clearIndexes(handle, removed.sending.phase);
+        const view = SendCompletionView{ .key = handle.key, .origin = removed.sending.origin, .kind = removed.sending.response.kind() };
+        removed.sending.admission.release(admission);
         return view;
     }
 
@@ -347,7 +370,7 @@ pub const RequestBook = struct {
     pub fn activeCount(self: *const RequestBook) usize {
         var count: usize = 0;
         var requests = self.active.iterator();
-        while (requests.next()) |entry| if (entry.value_ptr.lifecycle == .active) {
+        while (requests.next()) |entry| if (entry.value_ptr.* == .active) {
             count += 1;
         };
         return count;
@@ -356,7 +379,7 @@ pub const RequestBook = struct {
     pub fn sendingCount(self: *const RequestBook) usize {
         var count: usize = 0;
         var requests = self.active.iterator();
-        while (requests.next()) |entry| if (entry.value_ptr.lifecycle == .sending) {
+        while (requests.next()) |entry| if (entry.value_ptr.* == .sending) {
             count += 1;
         };
         return count;
@@ -374,8 +397,8 @@ pub const RequestBook = struct {
     pub fn firstActive(self: *const RequestBook) ?RequestSnapshot {
         var active = self.active.iterator();
         while (active.next()) |entry| {
-            if (entry.value_ptr.lifecycle != .active) continue;
-            return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.response.kind() };
+            if (entry.value_ptr.* != .active) continue;
+            return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.active.response.kind() };
         }
         return null;
     }
@@ -383,7 +406,10 @@ pub const RequestBook = struct {
     pub fn firstRequest(self: *const RequestBook) ?RequestSnapshot {
         var requests = self.active.iterator();
         const entry = requests.next() orelse return null;
-        return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.response.kind() };
+        return .{ .key = entry.key_ptr.*, .kind = switch (entry.value_ptr.*) {
+            .sending => |request| request.response.kind(),
+            .active => |request| request.response.kind(),
+        } };
     }
 
     pub fn firstQueuedRequest(self: *const RequestBook) ?RequestSnapshot {
@@ -426,7 +452,7 @@ pub const RequestBook = struct {
         var iterator = self.active.iterator();
         while (iterator.next()) |entry| {
             if (!std.mem.eql(u8, &entry.key_ptr.endpoint.node_id, node_id)) continue;
-            if (entry.value_ptr.lifecycle == .active and entry.value_ptr.response == .nodes) return true;
+            if (entry.value_ptr.* == .active and entry.value_ptr.active.response == .nodes) return true;
         }
         return false;
     }
@@ -440,8 +466,7 @@ pub const RequestBook = struct {
     pub fn challenge(self: *const RequestBook, nonce: *const [12]u8, from: types.Address) !ChallengePreparation {
         const challenge_key = types.ChallengeKey.init(from, nonce);
         const handle = self.challenge_by_nonce.get(challenge_key) orelse return error.InvalidChallenge;
-        const active = self.active.get(handle.key) orelse return error.InvalidChallenge;
-        if (active.generation != handle.generation or active.lifecycle != .active) return error.InvalidChallenge;
+        const active = self.getActive(handle) orelse return error.InvalidChallenge;
         const recovery = switch (active.phase) {
             .awaiting_whoareyou => |value| value.recovery,
             .awaiting_response => |value| if (value.wait.canChallenge()) value.recovery else return error.InvalidChallenge,
@@ -464,8 +489,7 @@ pub const RequestBook = struct {
         keys: PendingSessionKeys,
         deadline_ns: i64,
     ) void {
-        const active = self.active.getPtr(preparation.handle.key) orelse return;
-        if (active.generation != preparation.handle.generation or active.lifecycle != .active) return;
+        const active = self.getActivePtr(preparation.handle) orelse return;
         active.phase = .{ .awaiting_response = .{
             .recovery = preparation.recovery,
             .wait = .{ .handshake_sent = keys },
@@ -478,8 +502,7 @@ pub const RequestBook = struct {
     pub fn pendingKeys(self: *const RequestBook, endpoint: types.Endpoint) ?PendingKeysView {
         const lane = self.lanes.get(endpoint) orelse return null;
         const handle = lane.establishing orelse return null;
-        const active = self.active.get(handle.key) orelse return null;
-        if (active.generation != handle.generation or active.lifecycle != .active) return null;
+        const active = self.getActive(handle) orelse return null;
         const response = switch (active.phase) {
             .awaiting_whoareyou => return null,
             .awaiting_response => |value| value,
@@ -488,8 +511,7 @@ pub const RequestBook = struct {
     }
 
     pub fn promotePending(self: *RequestBook, view: PendingKeysView) void {
-        const active = self.active.getPtr(view.handle.key) orelse return;
-        if (active.generation != view.handle.generation or active.lifecycle != .active) return;
+        const active = self.getActivePtr(view.handle) orelse return;
         switch (active.phase) {
             .awaiting_whoareyou => return,
             .awaiting_response => |*response| response.wait = response.wait.afterPromotion(),
@@ -504,7 +526,16 @@ pub const RequestBook = struct {
 
     pub fn get(self: *RequestBook, key: types.RequestKey) ?*ActiveRequest {
         const request = self.active.getPtr(key) orelse return null;
-        return if (request.lifecycle == .active) request else null;
+        return switch (request.*) {
+            .sending => null,
+            .active => |*active| active,
+        };
+    }
+
+    pub fn getSending(self: *const RequestBook, handle: RequestHandle) ?ResponseExpectation {
+        const request = self.active.get(handle.key) orelse return null;
+        if (request != .sending or request.sending.generation != handle.generation) return null;
+        return request.sending.response;
     }
 
     pub fn containsRequest(self: *const RequestBook, key: types.RequestKey) bool {
@@ -571,7 +602,7 @@ pub const RequestBook = struct {
             };
             scan.index = iterator.index;
             scan.slots_scanned += scan.index - previous;
-            if (entry.value_ptr.lifecycle == .active and now_ns >= entry.value_ptr.deadline_ns) {
+            if (entry.value_ptr.* == .active and now_ns >= entry.value_ptr.active.deadline_ns) {
                 out[count] = entry.key_ptr.*;
                 count += 1;
             }
@@ -584,17 +615,19 @@ pub const RequestBook = struct {
     }
     pub fn canReplaceChallenge(self: *const RequestBook, key: types.RequestKey, nonce: *const [12]u8) bool {
         const indexed = self.challenge_by_nonce.get(.init(key.endpoint.addr, nonce)) orelse return true;
-        return types.RequestKeyContext.eql(.{}, indexed.key, key);
+        const current = self.currentHandle(key) orelse return false;
+        return handleEql(indexed, current);
     }
 
     pub fn canEstablish(self: *const RequestBook, key: types.RequestKey) bool {
         const lane = self.lanes.get(key.endpoint) orelse return true;
         const establishing = lane.establishing orelse return true;
-        return types.RequestKeyContext.eql(.{}, establishing.key, key);
+        const current = self.currentHandle(key) orelse return false;
+        return handleEql(establishing, current);
     }
 
     pub fn commitRetry(self: *RequestBook, key: types.RequestKey, deadline_ns: i64) void {
-        const active = self.active.getPtr(key) orelse unreachable;
+        const active = self.get(key) orelse unreachable;
         active.attempts += 1;
         active.deadline_ns = deadline_ns;
     }
@@ -607,7 +640,7 @@ pub const RequestBook = struct {
         next_admission: AdmissionPermit,
         admission: *admission_mod.IngressAdmission,
     ) void {
-        const active = self.active.getPtr(key) orelse unreachable;
+        const active = self.get(key) orelse unreachable;
         var recovery = switch (active.phase) {
             .awaiting_whoareyou => unreachable,
             .awaiting_response => |response| response.recovery,
@@ -663,19 +696,23 @@ pub const RequestBook = struct {
     }
 
     pub fn take(self: *RequestBook, key: types.RequestKey) ?ActiveRequest {
-        const removed = self.active.fetchRemove(key) orelse return null;
-        self.clearIndexes(.{ .key = key, .generation = removed.value.generation }, &removed.value);
-        if (removed.value.queued_intent) self.discardQueuedIntent(key);
-        return removed.value;
+        const current = self.active.get(key) orelse return null;
+        if (current != .active) return null;
+        const removed = self.active.fetchRemove(key).?.value.active;
+        self.clearIndexes(.{ .key = key, .generation = removed.generation }, removed.phase);
+        if (removed.queued_intent) self.discardQueuedIntent(key);
+        return removed;
     }
 
     pub fn detachLookup(self: *RequestBook, lookup_id: u32) void {
         var active = self.active.iterator();
-        while (active.next()) |entry| switch (entry.value_ptr.origin) {
-            .lookup => |id| if (id == lookup_id) {
-                entry.value_ptr.origin = .detached_lookup;
+        while (active.next()) |entry| switch (entry.value_ptr.*) {
+            inline else => |*request| switch (request.origin) {
+                .lookup => |id| if (id == lookup_id) {
+                    request.origin = .detached_lookup;
+                },
+                else => {},
             },
-            else => {},
         };
         var lanes = self.lanes.iterator();
         while (lanes.next()) |entry| {
@@ -699,13 +736,16 @@ pub const RequestBook = struct {
             if (entry.value_ptr.establishing) |handle| {
                 std.debug.assert(types.EndpointContext.eql(.{}, handle.key.endpoint, entry.key_ptr.*));
                 const request = self.active.get(handle.key) orelse unreachable;
-                std.debug.assert(request.generation == handle.generation);
+                const generation = switch (request) {
+                    inline else => |value| value.generation,
+                };
+                std.debug.assert(generation == handle.generation);
             }
             for (entry.value_ptr.queued.items.items[entry.value_ptr.queued.head..]) |queued| {
                 const queued_key = types.RequestKey.init(queued.endpoint, queued.req_id);
                 std.debug.assert(types.EndpointContext.eql(.{}, queued.endpoint, entry.key_ptr.*));
                 if (self.active.get(queued_key)) |request| {
-                    std.debug.assert(request.lifecycle == .sending and request.queued_intent);
+                    std.debug.assert(request == .sending and request.sending.queued_intent);
                 }
             }
         }
@@ -714,8 +754,14 @@ pub const RequestBook = struct {
         while (challenges.next()) |entry| {
             const handle = entry.value_ptr.*;
             const request = self.active.get(handle.key) orelse unreachable;
-            std.debug.assert(request.generation == handle.generation);
-            const expected = challengeForPhase(handle.key.endpoint.addr, request.phase) orelse unreachable;
+            const generation = switch (request) {
+                inline else => |value| value.generation,
+            };
+            std.debug.assert(generation == handle.generation);
+            const phase = switch (request) {
+                inline else => |value| value.phase,
+            };
+            const expected = challengeForPhase(handle.key.endpoint.addr, phase) orelse unreachable;
             std.debug.assert(std.meta.eql(entry.key_ptr.*, expected));
         }
     }
@@ -725,6 +771,25 @@ pub const RequestBook = struct {
         if (!lane.found_existing) lane.value_ptr.* = .{};
         std.debug.assert(lane.value_ptr.establishing == null or handleEql(lane.value_ptr.establishing.?, handle));
         lane.value_ptr.establishing = handle;
+    }
+
+    fn currentHandle(self: *const RequestBook, key: types.RequestKey) ?RequestHandle {
+        const request = self.active.get(key) orelse return null;
+        return .{ .key = key, .generation = switch (request) {
+            inline else => |value| value.generation,
+        } };
+    }
+
+    fn getActive(self: *const RequestBook, handle: RequestHandle) ?ActiveRequest {
+        const request = self.active.get(handle.key) orelse return null;
+        if (request != .active or request.active.generation != handle.generation) return null;
+        return request.active;
+    }
+
+    fn getActivePtr(self: *RequestBook, handle: RequestHandle) ?*ActiveRequest {
+        const request = self.active.getPtr(handle.key) orelse return null;
+        if (request.* != .active or request.active.generation != handle.generation) return null;
+        return &request.active;
     }
 
     fn containsQueued(self: *const RequestBook, key: types.RequestKey) bool {
@@ -745,8 +810,8 @@ pub const RequestBook = struct {
         self.removeEmptyLane(key.endpoint);
     }
 
-    fn clearIndexes(self: *RequestBook, handle: RequestHandle, active: *const ActiveRequest) void {
-        if (challengeForPhase(handle.key.endpoint.addr, active.phase)) |index| {
+    fn clearIndexes(self: *RequestBook, handle: RequestHandle, phase: Phase) void {
+        if (challengeForPhase(handle.key.endpoint.addr, phase)) |index| {
             if (self.challenge_by_nonce.get(index)) |indexed| if (handleEql(indexed, handle)) {
                 _ = self.challenge_by_nonce.remove(index);
             };

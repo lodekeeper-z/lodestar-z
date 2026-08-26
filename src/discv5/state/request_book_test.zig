@@ -484,6 +484,53 @@ test "lookup finish detaches active and queued requests without cancellation" {
     try std.testing.expectEqual(@as(usize, 1), book.queuedCount());
 }
 
+test "FINDNODE sending retains compact expectation until successful completion" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(19), try message.ReqId.fromSlice(&.{1}));
+    const requested = requestedDistances(&.{ 0, 256 });
+    const handle = try book.beginSending(&ingress, key, .api, book.makeExpectation(.findnode, &requested), .{
+        .awaiting_whoareyou = try probe(19),
+    }, 1, true, false);
+
+    const sending = book.getSending(handle) orelse return error.MissingSendingRequest;
+    try std.testing.expect(sending == .nodes);
+    try std.testing.expect(sending.nodes.contains(0));
+    try std.testing.expect(sending.nodes.contains(256));
+    try std.testing.expect(book.get(key) == null);
+
+    try std.testing.expect(book.completeSending(handle) != null);
+    const active = book.get(key) orelse return error.MissingActiveRequest;
+    try std.testing.expect(active.response == .nodes);
+    try std.testing.expect(active.response.nodes.requested_distances.contains(0));
+    try std.testing.expect(active.response.nodes.requested_distances.contains(256));
+}
+
+test "request generation exhaustion leaves admission and indexes unchanged" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    book.next_generation = std.math.maxInt(u64);
+    const key = types.RequestKey.init(endpoint(20), try message.ReqId.fromSlice(&.{1}));
+    const nonce = [_]u8{20} ** 12;
+
+    try std.testing.expectError(error.GenerationExhausted, book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(20),
+    }, 1, true, false));
+
+    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), book.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), book.sendingCount());
+    try std.testing.expectEqual(@as(usize, 0), book.queuedCount());
+    try std.testing.expect(!book.containsRequest(key));
+    try std.testing.expect(!book.hasChallenge(&nonce, key.endpoint.addr));
+    try std.testing.expect(!book.shouldQueue(key.endpoint));
+    try std.testing.expectEqual(std.math.maxInt(u64), book.next_generation);
+}
+
 test "canonical sending rejects duplicate request keys before completion" {
     const sending_limits = config_mod.Limits{
         .max_active_requests = 1,
@@ -501,6 +548,30 @@ test "canonical sending rejects duplicate request keys before completion" {
     defer _ = book.abortSending(first, &ingress);
 
     try std.testing.expectError(error.DuplicateRequest, book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(23),
+    }, 1, true, false));
+    try std.testing.expectEqual(@as(usize, 1), book.sendingCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+}
+
+test "sending request consumes active capacity for a distinct key" {
+    const sending_limits = config_mod.Limits{
+        .max_active_requests = 1,
+        .max_queued_requests = 1,
+        .max_queued_requests_per_endpoint = 1,
+    };
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, sending_limits);
+    defer book.deinit(&ingress);
+    const first_key = types.RequestKey.init(endpoint(22), try message.ReqId.fromSlice(&.{1}));
+    const first = try book.beginSending(&ingress, first_key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(22),
+    }, 1, true, false);
+    defer _ = book.abortSending(first, &ingress);
+    const second_key = types.RequestKey.init(endpoint(23), try message.ReqId.fromSlice(&.{2}));
+
+    try std.testing.expectError(error.TooManyActiveRequests, book.beginSending(&ingress, second_key, .api, .pong, .{
         .awaiting_whoareyou = try probe(23),
     }, 1, true, false));
     try std.testing.expectEqual(@as(usize, 1), book.sendingCount());
@@ -533,6 +604,45 @@ test "canonical sending rejects duplicate challenge nonces before completion" {
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
 }
 
+test "stale challenge handle cannot authorize a reused request key generation" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(35), try message.ReqId.fromSlice(&.{1}));
+    const old = try book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(35),
+    }, 1, true, false);
+    try std.testing.expect(book.abortSending(old, &ingress) != null);
+    const current = try book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(36),
+    }, 1, true, false);
+    defer _ = book.abortSending(current, &ingress);
+    const nonce = [_]u8{36} ** 12;
+    book.challenge_by_nonce.getPtr(.init(key.endpoint.addr, &nonce)).?.* = old;
+
+    try std.testing.expect(!book.canReplaceChallenge(key, &nonce));
+}
+
+test "stale lane handle cannot authorize a reused request key generation" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(37), try message.ReqId.fromSlice(&.{1}));
+    const old = try book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(37),
+    }, 1, true, false);
+    try std.testing.expect(book.abortSending(old, &ingress) != null);
+    const current = try book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(38),
+    }, 1, true, false);
+    defer _ = book.abortSending(current, &ingress);
+    book.lanes.getPtr(key.endpoint).?.establishing = old;
+
+    try std.testing.expect(!book.canEstablish(key));
+}
+
 test "stale sending handle cannot mutate a reused request key generation" {
     var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 2);
     defer ingress.deinit();
@@ -548,6 +658,9 @@ test "stale sending handle cannot mutate a reused request key generation" {
     }, 1, true, false);
     try std.testing.expect(old.generation != current.generation);
 
+    try std.testing.expect(book.abortSending(old, &ingress) == null);
+    try std.testing.expectEqual(@as(usize, 1), book.sendingCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
     try std.testing.expect(book.completeSending(old) == null);
     try std.testing.expectEqual(@as(usize, 1), book.sendingCount());
     try std.testing.expect(book.completeSending(current) != null);
