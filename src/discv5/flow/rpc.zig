@@ -1,5 +1,6 @@
 const std = @import("std");
 const actor_mod = @import("../actor.zig");
+const config = @import("../config.zig");
 const enr = @import("../enr.zig");
 const kbucket = @import("../kbucket.zig");
 const message = @import("../protocol/message.zig");
@@ -15,8 +16,8 @@ const Actor = actor_mod.Actor;
 const Env = actor_mod.Env;
 
 const MAX_NODES_RESPONSE = request_book.MAX_NODES_RESPONSE;
-const MAX_ENRS_PER_PACKET: usize = @max((@import("../protocol/packet.zig").MAX_PACKET_SIZE - 92) / enr.MAX_ENR_SIZE, 1);
-const MAX_RESPONSE_CHUNKS: usize = std.math.divCeil(usize, MAX_NODES_RESPONSE, MAX_ENRS_PER_PACKET) catch unreachable;
+const MAX_ENRS_PER_PACKET = config.MAX_ENRS_PER_NODES_PACKET;
+const MAX_RESPONSE_CHUNKS = config.MAX_NODES_RESPONSE_CHUNKS;
 
 pub fn dispatch(actor: *Actor, env: Env, plaintext: []const u8, endpoint: types.Endpoint) void {
     if (plaintext.len == 0) return;

@@ -16,6 +16,7 @@ const util = @import("util.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const MAX_RECEIVE_ERROR_BACKOFF_MS: u64 = 100;
+const MAX_ATOMIC_INGRESS_EFFECTS: usize = config_mod.MAX_NODES_RESPONSE_CHUNKS + 1;
 const runtime_error = @import("runtime_error.zig");
 const InitError = runtime_error.InitError;
 const RunError = runtime_error.RunError;
@@ -240,6 +241,16 @@ const RuntimeImpl = struct {
         };
     }
 
+    /// Request-side effects inject into distinct active or prepared request slots.
+    /// Other producers are atomic per inbound packet; FINDNODE is the maximum:
+    /// one eviction probe followed by the bounded multipart NODES response.
+    /// Runtime drains the FIFO after every command and pops before completion,
+    /// so these bounds are alternatives rather than additive queue residents.
+    fn effectCapacity(limits: config_mod.Limits) !usize {
+        const permit_capacity = try admission_mod.permitCapacity(limits);
+        return @max(limits.max_active_requests, @min(permit_capacity, MAX_ATOMIC_INGRESS_EFFECTS));
+    }
+
     fn initRaw(io: Io, allocator: Allocator, config: config_mod.Config, options: config_mod.Options) !RuntimeImpl {
         try config.validate();
         try options.validate();
@@ -257,7 +268,7 @@ const RuntimeImpl = struct {
         errdefer actor.deinit(&admission);
         const commands = try allocator.alloc(Command, config.limits.command_capacity);
         errdefer allocator.free(commands);
-        const effect_storage = try allocator.alloc(actor_mod.ActorEffect, try @import("admission.zig").permitCapacity(config.limits) + 1);
+        const effect_storage = try allocator.alloc(actor_mod.ActorEffect, try effectCapacity(config.limits));
         return .{
             .io = io,
             .allocator = allocator,

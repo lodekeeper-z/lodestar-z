@@ -171,6 +171,39 @@ fn initTestRuntime(io: std.Io, alloc: std.mem.Allocator, secret_byte: u8, limits
     }, options);
 }
 
+test "Runtime effect FIFO follows the bounded production burst" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+
+    const default_runtime = try initTestRuntime(io, alloc, 0xcd, .{}, .{});
+    defer default_runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 1_024), runtime_mod.Testing.effectCapacity(default_runtime));
+
+    const permit_limited = try initTestRuntime(io, alloc, 0xce, .{
+        .max_active_requests = 1,
+        .response_recovery_capacity = 1,
+        .challenge_capacity = 1,
+    }, .{});
+    defer permit_limited.deinit();
+    try std.testing.expectEqual(@as(usize, 4), runtime_mod.Testing.effectCapacity(permit_limited));
+
+    const ingress_limited = try initTestRuntime(io, alloc, 0xcf, .{
+        .max_active_requests = 1,
+        .response_recovery_capacity = 3,
+        .challenge_capacity = 2,
+    }, .{});
+    defer ingress_limited.deinit();
+    try std.testing.expectEqual(@as(usize, 7), runtime_mod.Testing.effectCapacity(ingress_limited));
+
+    const request_limited = try initTestRuntime(io, alloc, 0xd0, .{
+        .max_active_requests = 8,
+        .response_recovery_capacity = 1,
+        .challenge_capacity = 1,
+    }, .{});
+    defer request_limited.deinit();
+    try std.testing.expectEqual(@as(usize, 8), runtime_mod.Testing.effectCapacity(request_limited));
+}
+
 fn awaitRequestResult(io: std.Io, runtime: *runtime_mod.Runtime) !runtime_mod.RequestResult {
     for (0..2_000) |_| {
         if (runtime.popRequestResult()) |result| return result;

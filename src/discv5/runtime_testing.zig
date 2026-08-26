@@ -79,6 +79,10 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             transport.Testing.setSendGate(&impl(runtime).transport, gate);
         }
 
+        pub fn effectCapacity(runtime: *Runtime) usize {
+            return impl(runtime).effect_storage.len;
+        }
+
         pub fn enqueuePingEffect(
             runtime: *Runtime,
             endpoint: types.Endpoint,
