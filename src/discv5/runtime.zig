@@ -54,6 +54,7 @@ const RuntimeImpl = struct {
     options: config_mod.Options,
     command_queue: Io.Queue(Command),
     command_buffer: []Command,
+    control: Io.Event = .unset,
     effect_storage: []actor_mod.ActorEffect,
     effects: actor_mod.EffectQueue,
     group: Io.Group = .init,
@@ -287,8 +288,9 @@ const RuntimeImpl = struct {
         self.allocator.free(self.command_buffer);
     }
 
-    /// Run the single domain actor on the caller task. The caller schedules
-    /// this method in its own group, calls stop, awaits that group, then deinit.
+    /// Run the Runtime-owned driver under a Future held only by this caller.
+    /// `stop` signals `control`; this controller is the sole Future cancel/join
+    /// owner, so stop never races a caller-side await or a driver-side join.
     fn run(self: *RuntimeImpl) (error{ AlreadyRunning, RuntimeStopped } || Io.ConcurrentError || Io.Cancelable)!void {
         if (self.lifecycle.cmpxchgStrong(.ready, .running, .acq_rel, .acquire)) |actual| return switch (actual) {
             .ready => unreachable,
@@ -296,28 +298,52 @@ const RuntimeImpl = struct {
             .stopping, .terminalizing, .stopped => error.RuntimeStopped,
         };
         defer self.shutdown();
+
+        var driver_future = self.io.async(driver, .{self});
+        var driver_reaped = false;
+        defer if (!driver_reaped) driver_future.cancel(self.io) catch {};
+
+        self.control.wait(self.io) catch |err| switch (err) {
+            error.Canceled => {
+                self.io.recancel();
+                return error.Canceled;
+            },
+        };
+        const driver_result = driver_future.cancel(self.io);
+        driver_reaped = true;
+        driver_result catch |err| switch (err) {
+            error.Canceled => if (self.lifecycle.load(.acquire) != .stopping) return error.Canceled,
+            error.ConcurrencyUnavailable => return error.ConcurrencyUnavailable,
+        };
+    }
+
+    fn driver(self: *RuntimeImpl) (Io.ConcurrentError || Io.Cancelable)!void {
+        defer self.control.set(self.io);
+        defer self.group.cancel(self.io);
+        if (self.lifecycle.load(.acquire) != .running) return;
         if (self.transport.ip4 != null) try self.group.concurrent(self.io, receiveLoop, .{ self, types.Address.Family.ip4 });
         if (self.transport.ip6 != null) try self.group.concurrent(self.io, receiveLoop, .{ self, types.Address.Family.ip6 });
         try self.group.concurrent(self.io, maintenanceLoop, .{self});
-        self.actorLoop() catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-        };
+        try self.actorLoop();
     }
 
     fn stop(self: *RuntimeImpl) void {
         while (true) switch (self.lifecycle.load(.acquire)) {
             .ready => if (self.lifecycle.cmpxchgWeak(.ready, .terminalizing, .acq_rel, .acquire) == null) {
                 self.command_queue.close(self.io);
+                self.control.set(self.io);
                 self.terminalize();
                 self.lifecycle.store(.stopped, .release);
                 return;
             },
             .running => if (self.lifecycle.cmpxchgWeak(.running, .stopping, .acq_rel, .acquire) == null) {
                 self.command_queue.close(self.io);
+                self.control.set(self.io);
                 return;
             },
             .stopping, .terminalizing, .stopped => {
                 self.command_queue.close(self.io);
+                self.control.set(self.io);
                 return;
             },
         };
@@ -325,12 +351,12 @@ const RuntimeImpl = struct {
 
     fn shutdown(self: *RuntimeImpl) void {
         self.command_queue.close(self.io);
+        self.control.set(self.io);
         // Commands carry caller-stack reply queues and, in some cases, owned
         // allocations. Intake closure bounds this drain by command capacity;
         // Abort accepted commands so neither replies nor ownership dangle and
         // shutdown performs no new domain or transport work.
         self.drainAcceptedCommands();
-        self.group.cancel(self.io);
         self.terminalize();
         self.lifecycle.store(.stopped, .release);
     }

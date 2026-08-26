@@ -396,11 +396,12 @@ const RuntimePingContext = struct {
     remote_id: types.NodeId,
     remote_pubkey: [33]u8,
     remote_address: types.Address,
+    req_id: ?@import("protocol/message.zig").ReqId = null,
     result_error: ?anyerror = null,
 };
 
 fn sendRuntimePing(context: *RuntimePingContext) void {
-    _ = context.runtime.sendPing(context.remote_id, &context.remote_pubkey, context.remote_address, 0) catch |err| {
+    context.req_id = context.runtime.sendPing(context.remote_id, &context.remote_pubkey, context.remote_address, 0) catch |err| {
         context.result_error = err;
         return;
     };
@@ -572,7 +573,7 @@ test "Runtime send cancellation closes drains joins and releases command state" 
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     }, .{});
     defer runtime.deinit();
-    var gate = transport_mod.Testing.SendGate{};
+    var gate = transport_mod.Testing.SendGate{ .cancelable = true };
     runtime_mod.Testing.setSendGate(runtime, &gate);
     var run_error: ?anyerror = null;
     var runtime_group: std.Io.Group = .init;
@@ -617,6 +618,7 @@ test "Runtime send cancellation closes drains joins and releases command state" 
     var cancel_context = CancelTransportContext{ .io = io, .group = &runtime_group };
     cancel_thread = try std.Thread.spawn(.{}, cancelTransportTask, .{&cancel_context});
     try awaitFlag(&observer.observed, error.CancellationWasNotObserved);
+    try awaitFlag(&gate.cancellation_observed, error.TransportCancellationWasNotObserved);
     gate.proceed.store(true, .release);
     try awaitFlag(&cancel_context.completed, error.CancellationDidNotComplete);
     cancel_thread.?.join();
@@ -627,9 +629,68 @@ test "Runtime send cancellation closes drains joins and releases command state" 
     runtime_group_started = false;
 
     try std.testing.expectEqual(error.Canceled, ping_context.result_error.?);
+    try std.testing.expect(ping_context.req_id == null);
+    try std.testing.expect(runtime.popRequestResult() == null);
     try std.testing.expectEqual(error.Canceled, run_error.?);
     try std.testing.expect(runtime.isClosed());
     try std.testing.expect(!runtime.isRunning());
+    const counts = runtime_mod.Testing.activeAndPermitCount(runtime);
+    try std.testing.expectEqual(@as(usize, 0), counts.active);
+    try std.testing.expectEqual(@as(usize, 0), counts.permits);
+}
+
+test "Runtime stop interrupts a blocked transport send without caller cancellation" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x7a} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const runtime = try runtime_mod.Runtime.init(io, alloc, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
+    }, .{});
+    var running = RunningRuntime.init(io);
+    defer running.deinit();
+    try running.start(runtime);
+    try running.awaitStarted();
+
+    var gate = transport_mod.Testing.SendGate{ .cancelable = true };
+    runtime_mod.Testing.setSendGate(runtime, &gate);
+    var ping_context = RuntimePingContext{
+        .runtime = runtime,
+        .remote_id = remote_id,
+        .remote_pubkey = remote_pubkey,
+        .remote_address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9398 } },
+    };
+    var api_group: std.Io.Group = .init;
+    var api_started = false;
+    defer {
+        gate.proceed.store(true, .release);
+        if (api_started) {
+            api_group.cancel(io);
+            api_group.await(io) catch {};
+        }
+    }
+    try api_group.concurrent(io, sendRuntimePing, .{&ping_context});
+    api_started = true;
+    try awaitFlag(&gate.entered, error.RuntimeDidNotEnter);
+
+    running.stop();
+    try awaitFlag(&gate.cancellation_observed, error.RuntimeStopDidNotCancelTransport);
+    try api_group.await(io);
+    api_started = false;
+    try running.await();
+
+    try std.testing.expect(running.run_result == null);
+    try std.testing.expectEqual(error.Canceled, ping_context.result_error.?);
+    try std.testing.expect(ping_context.req_id == null);
+    try std.testing.expect(runtime.popRequestResult() == null);
+    try std.testing.expect(runtime.isClosed());
     const counts = runtime_mod.Testing.activeAndPermitCount(runtime);
     try std.testing.expectEqual(@as(usize, 0), counts.active);
     try std.testing.expectEqual(@as(usize, 0), counts.permits);
