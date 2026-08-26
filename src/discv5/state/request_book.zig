@@ -185,6 +185,30 @@ const StoredRequest = union(enum) {
     active: ActiveRequest,
 };
 
+pub const TerminalRequest = union(enum) {
+    sending: SendingRequest,
+    active: ActiveRequest,
+
+    pub fn origin(self: *const TerminalRequest) types.RequestOrigin {
+        return switch (self.*) {
+            inline else => |request| request.origin,
+        };
+    }
+
+    pub fn kind(self: *const TerminalRequest) types.RequestKind {
+        return switch (self.*) {
+            .sending => |request| request.response.kind(),
+            .active => |request| request.response.kind(),
+        };
+    }
+
+    pub fn release(self: *TerminalRequest, admission: *admission_mod.IngressAdmission) void {
+        switch (self.*) {
+            inline else => |*request| request.admission.release(admission),
+        }
+    }
+};
+
 pub const QueuedRequest = request_queue.QueuedRequest;
 const EndpointLane = request_queue.EndpointLane;
 
@@ -695,13 +719,28 @@ pub const RequestBook = struct {
         return null;
     }
 
+    pub fn takeTerminal(self: *RequestBook, key: types.RequestKey) ?TerminalRequest {
+        const current = self.active.getPtr(key) orelse return null;
+        const handle = RequestHandle{ .key = key, .generation = switch (current.*) {
+            inline else => |*request| request.generation,
+        } };
+        const removed = self.active.fetchRemove(key).?.value;
+        switch (removed) {
+            inline else => |request| {
+                self.clearIndexes(handle, request.phase);
+                if (request.queued_intent) self.discardQueuedIntent(key);
+            },
+        }
+        return switch (removed) {
+            .sending => |request| .{ .sending = request },
+            .active => |request| .{ .active = request },
+        };
+    }
+
     pub fn take(self: *RequestBook, key: types.RequestKey) ?ActiveRequest {
-        const current = self.active.get(key) orelse return null;
-        if (current != .active) return null;
-        const removed = self.active.fetchRemove(key).?.value.active;
-        self.clearIndexes(.{ .key = key, .generation = removed.generation }, removed.phase);
-        if (removed.queued_intent) self.discardQueuedIntent(key);
-        return removed;
+        const current = self.active.getPtr(key) orelse return null;
+        if (current.* != .active) return null;
+        return (self.takeTerminal(key) orelse unreachable).active;
     }
 
     pub fn detachLookup(self: *RequestBook, lookup_id: u32) void {

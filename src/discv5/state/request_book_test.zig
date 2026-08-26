@@ -202,6 +202,34 @@ test "RequestBook keeps every request queued xor active in FIFO order" {
     try std.testing.expectEqualSlices(u8, second.slice(), book.firstQueued(peer).?.req_id.slice());
 }
 
+test "terminal take consumes sending queued intent and rejects stale completions" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const peer = endpoint(39);
+    const pubkey = [_]u8{39} ** 33;
+    const req_id = try message.ReqId.fromSlice(&.{1});
+    const key = types.RequestKey.init(peer, req_id);
+    try book.queue(try .init(.api, peer, &pubkey, req_id, .ping, &.{}, &.{1}, 10));
+    const handle = try book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(39),
+    }, 10, true, true);
+
+    var terminal = book.takeTerminal(key) orelse return error.MissingTerminalRequest;
+    try std.testing.expect(terminal == .sending);
+    terminal.release(&ingress);
+    try std.testing.expectEqual(@as(usize, 0), book.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), book.sendingCount());
+    try std.testing.expectEqual(@as(usize, 0), book.queuedCount());
+    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), book.challenge_by_nonce.count());
+    try std.testing.expectEqual(@as(usize, 0), book.lanes.count());
+    try std.testing.expect(book.completeSending(handle) == null);
+    try std.testing.expect(book.abortSending(handle, &ingress) == null);
+    book.assertInvariants();
+}
+
 test "RequestBook takes an exact queued request without disturbing lane FIFO" {
     var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
     defer ingress.deinit();

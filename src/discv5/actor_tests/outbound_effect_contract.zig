@@ -5,6 +5,7 @@ const enr = @import("../enr.zig");
 const outbound = @import("../flow/outbound.zig");
 const message = @import("../protocol/message.zig");
 const packet = @import("../protocol/packet.zig");
+const request_results = @import("../request_results.zig");
 const secp = @import("../secp256k1.zig");
 const request_book = @import("../state/request_book.zig");
 const types = @import("../types.zig");
@@ -61,6 +62,18 @@ const TestContext = struct {
         };
     }
 };
+
+fn expectRequestOwnershipCleared(context: *TestContext, key: types.RequestKey) !void {
+    try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.sendingCount());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.challenge_by_nonce.count());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.lanes.count());
+    try std.testing.expect(!context.harness.actor.requests.containsRequest(key));
+    try std.testing.expect(!context.harness.actor.requests.shouldQueue(key.endpoint));
+    context.harness.actor.requests.assertInvariants();
+}
 
 test "request effect is compact handle plus packet bytes" {
     const fields = @typeInfo(actor_mod.SendDatagramEffect).@"struct".fields;
@@ -127,6 +140,62 @@ test "copied request effect completion is accepted exactly once" {
 
     try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
+}
+
+test "cancel terminalizes canonical sending request before copied completions" {
+    var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xd5, 0xd6, 94, 9294);
+    defer context.deinit();
+    var results = try request_results.RequestResultOutbox.init(context.harness.io, std.testing.allocator, 1);
+    defer results.deinit();
+    try std.testing.expect(results.reserve());
+    try std.testing.expect(results.claim());
+    var env = context.harness.env();
+    env.request_results = &results;
+    const effect = try context.preparePing();
+    const sent_copy = effect;
+    const failed_copy = effect;
+    const key = effect.handle.key;
+
+    try std.testing.expect(context.harness.actor.cancelRequest(env, key));
+    const canceled = results.pop() orelse return error.MissingCanceledRequestResult;
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, key, canceled.key));
+    try std.testing.expectEqual(types.RequestKind.ping, canceled.kind);
+    try std.testing.expect(canceled.terminal == .canceled);
+    try std.testing.expect(results.pop() == null);
+    try expectRequestOwnershipCleared(&context, key);
+
+    context.harness.actor.applySendCompletion(env, sent_copy, .sent);
+    context.harness.actor.applySendCompletion(env, failed_copy, .failed);
+    try std.testing.expect(results.pop() == null);
+    try expectRequestOwnershipCleared(&context, key);
+}
+
+test "shutdown terminalizes canonical sending request before copied completions" {
+    var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xd7, 0xd8, 95, 9295);
+    defer context.deinit();
+    var results = try request_results.RequestResultOutbox.init(context.harness.io, std.testing.allocator, 1);
+    defer results.deinit();
+    try std.testing.expect(results.reserve());
+    try std.testing.expect(results.claim());
+    var env = context.harness.env();
+    env.request_results = &results;
+    const effect = try context.preparePing();
+    const sent_copy = effect;
+    const failed_copy = effect;
+    const key = effect.handle.key;
+
+    context.harness.actor.finishAllRequests(env);
+    const stopped = results.pop() orelse return error.MissingStoppedRequestResult;
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, key, stopped.key));
+    try std.testing.expectEqual(types.RequestKind.ping, stopped.kind);
+    try std.testing.expect(stopped.terminal == .runtime_stopped);
+    try std.testing.expect(results.pop() == null);
+    try expectRequestOwnershipCleared(&context, key);
+
+    context.harness.actor.applySendCompletion(env, sent_copy, .sent);
+    context.harness.actor.applySendCompletion(env, failed_copy, .failed);
+    try std.testing.expect(results.pop() == null);
+    try expectRequestOwnershipCleared(&context, key);
 }
 
 test "sent FINDNODE effect activates the nodes response state" {

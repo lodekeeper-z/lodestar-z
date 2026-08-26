@@ -834,15 +834,12 @@ pub const Actor = struct {
     }
 
     pub fn finishAllRequests(self: *Actor, env: Env) void {
-        var active_finished: usize = 0;
-        while (active_finished < self.limits.max_active_requests) : (active_finished += 1) {
+        var request_finished: usize = 0;
+        while (request_finished < self.limits.max_active_requests) : (request_finished += 1) {
             const snapshot = self.requests.firstRequest() orelse break;
-            var active = self.requests.take(snapshot.key) orelse unreachable;
-            std.debug.assert(std.meta.activeTag(active.origin) != .lookup);
-            self.publishRequestTerminal(env, snapshot.key, snapshot.kind, active.origin, .runtime_stopped);
-            active.admission.release(env.ingress);
+            _ = completion.finish(self, env, snapshot.key, .shutdown, .runtime_stopped);
         }
-        std.debug.assert(self.requests.firstActive() == null);
+        std.debug.assert(self.requests.firstRequest() == null);
 
         var queued_finished: usize = 0;
         while (queued_finished < self.limits.max_queued_requests) : (queued_finished += 1) {

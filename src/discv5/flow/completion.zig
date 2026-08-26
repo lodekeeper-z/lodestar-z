@@ -11,19 +11,23 @@ pub const Outcome = union(enum) {
     success: []const lookup.Candidate,
     failure,
     canceled,
+    shutdown,
 };
 
-/// The sole active-request terminal transition. It takes indexed state first,
-/// publishes the reliable terminal result, releases admission exactly once,
-/// applies peer/lookup/health state, and only then drains the endpoint lane.
+/// The sole canonical-request terminal transition. It takes indexed state first,
+/// publishes the reliable terminal result, and releases admission exactly once.
+/// Ordinary completion then applies owner state and drains the endpoint lane;
+/// shutdown consumes ownership without starting more work.
 pub fn finish(actor: *Actor, env: Env, key: types.RequestKey, outcome: Outcome, terminal: request_results.RequestTerminal) bool {
-    var active = actor.requests.take(key) orelse return false;
-    actor.publishRequestTerminal(env, key, active.response.kind(), active.origin, terminal);
-    active.admission.release(env.ingress);
+    var request = actor.requests.takeTerminal(key) orelse return false;
+    const origin = request.origin();
+    actor.publishRequestTerminal(env, key, request.kind(), origin, terminal);
+    request.release(env.ingress);
     switch (outcome) {
-        .success => |closer| actor.onRequestCompletion(env, key, active.origin, true, closer),
-        .failure => actor.onRequestCompletion(env, key, active.origin, false, &.{}),
-        .canceled => actor.onRequestCancellation(env, key, active.origin),
+        .success => |closer| actor.onRequestCompletion(env, key, origin, true, closer),
+        .failure => actor.onRequestCompletion(env, key, origin, false, &.{}),
+        .canceled => actor.onRequestCancellation(env, key, origin),
+        .shutdown => return true,
     }
     outbound.drainEndpoint(actor, env, key.endpoint);
     return true;
