@@ -183,10 +183,6 @@ pub const PreparedRequest = struct {
     deadline_ns: i64,
     index_challenge: ?types.ChallengeKey,
     establish: bool,
-
-    pub fn abort(self: *PreparedRequest, admission: *admission_mod.IngressAdmission) void {
-        self.admission.release(admission);
-    }
 };
 
 pub const ChallengePreparation = struct {
@@ -205,6 +201,7 @@ pub const RequestBook = struct {
     active: ActiveMap,
     lanes: LaneMap,
     challenge_by_nonce: std.AutoHashMap(types.ChallengeKey, types.RequestKey),
+    prepared_active: usize = 0,
     queued_total: usize = 0,
     drain_cursor: usize = 0,
 
@@ -226,6 +223,7 @@ pub const RequestBook = struct {
     }
 
     pub fn deinit(self: *RequestBook, admission: *admission_mod.IngressAdmission) void {
+        std.debug.assert(self.prepared_active == 0);
         var active = self.active.iterator();
         while (active.next()) |entry| {
             entry.value_ptr.admission.release(admission);
@@ -239,6 +237,7 @@ pub const RequestBook = struct {
 
     pub fn deinitEmpty(self: *RequestBook) void {
         std.debug.assert(self.active.count() == 0);
+        std.debug.assert(self.prepared_active == 0);
         std.debug.assert(self.queued_total == 0);
         self.active.deinit();
         self.lanes.deinit();
@@ -268,13 +267,14 @@ pub const RequestBook = struct {
         establish: bool,
     ) !PreparedRequest {
         if (self.active.contains(key)) return error.DuplicateRequest;
-        if (self.active.count() >= self.limits.max_active_requests) return error.TooManyActiveRequests;
+        if (self.active.count() + self.prepared_active >= self.limits.max_active_requests) return error.TooManyActiveRequests;
         if (establish) {
             if (self.lanes.get(key.endpoint)) |lane| if (lane.establishing != null) return error.EndpointEstablishing;
         }
         const challenge_index = challengeForPhase(key.endpoint.addr, phase);
         if (challenge_index) |index| if (self.challenge_by_nonce.contains(index)) return error.DuplicateChallenge;
         const permit = try admission.acquire(key.endpoint.addr, admission_mod.requestPacketBudget(response.kind()));
+        self.prepared_active += 1;
         return .{
             .key = key,
             .origin = origin,
@@ -289,6 +289,7 @@ pub const RequestBook = struct {
 
     pub fn commitPrepared(self: *RequestBook, prepared: PreparedRequest) void {
         std.debug.assert(!self.active.contains(prepared.key));
+        self.releaseActiveReservation();
         self.active.putAssumeCapacityNoClobber(prepared.key, .{
             .origin = prepared.origin,
             .response = prepared.response.activate(),
@@ -298,6 +299,11 @@ pub const RequestBook = struct {
         });
         if (prepared.index_challenge) |index| self.challenge_by_nonce.putAssumeCapacityNoClobber(index, prepared.key);
         if (prepared.establish) self.setEstablishing(prepared.key);
+    }
+
+    pub fn abortPrepared(self: *RequestBook, prepared: *PreparedRequest, admission: *admission_mod.IngressAdmission) void {
+        self.releaseActiveReservation();
+        prepared.admission.release(admission);
     }
 
     pub fn queue(self: *RequestBook, request: QueuedRequest) !void {
@@ -659,7 +665,7 @@ pub const RequestBook = struct {
     }
 
     pub fn assertInvariants(self: *const RequestBook) void {
-        std.debug.assert(self.active.count() <= self.limits.max_active_requests);
+        std.debug.assert(self.active.count() + self.prepared_active <= self.limits.max_active_requests);
         std.debug.assert(self.queued_total <= self.limits.max_queued_requests);
         var counted: usize = 0;
         var lanes = self.lanes.iterator();
@@ -683,6 +689,11 @@ pub const RequestBook = struct {
             const expected = challengeForPhase(entry.value_ptr.endpoint.addr, active.phase) orelse unreachable;
             std.debug.assert(std.meta.eql(entry.key_ptr.*, expected));
         }
+    }
+
+    fn releaseActiveReservation(self: *RequestBook) void {
+        std.debug.assert(self.prepared_active > 0);
+        self.prepared_active -= 1;
     }
 
     fn setEstablishing(self: *RequestBook, key: types.RequestKey) void {

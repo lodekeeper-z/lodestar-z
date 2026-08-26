@@ -16,6 +16,10 @@ const TestContext = struct {
     remote_pubkey: [33]u8,
 
     fn init(alloc: std.mem.Allocator, io: std.Io, local_byte: u8, remote_byte: u8, remote_ip: u8, remote_port: u16) !TestContext {
+        return initWithMaxActive(alloc, io, local_byte, remote_byte, remote_ip, remote_port, 1);
+    }
+
+    fn initWithMaxActive(alloc: std.mem.Allocator, io: std.Io, local_byte: u8, remote_byte: u8, remote_ip: u8, remote_port: u16, max_active_requests: usize) !TestContext {
         const local_key = try secp.keyPairFromSecret(&([_]u8{local_byte} ** 32));
         const remote_key = try secp.keyPairFromSecret(&([_]u8{remote_byte} ** 32));
         const remote_pubkey = secp.compressedPubkey(&remote_key);
@@ -25,7 +29,7 @@ const TestContext = struct {
                 .local_key_pair = local_key,
                 .rate_limiter = null,
                 .limits = .{
-                    .max_active_requests = 1,
+                    .max_active_requests = max_active_requests,
                     .max_queued_requests = 1,
                     .event_capacity = 1,
                     .command_capacity = 1,
@@ -138,7 +142,7 @@ test "bounded request effect output owns preparation without executing transport
 
     var env = context.harness.env();
     env.effects = &effects;
-    try outbound.emitPrepared(env, action);
+    try outbound.emitPrepared(&context.harness.actor, env, action);
 
     try std.testing.expectEqual(@as(usize, 1), effects.count());
     try std.testing.expectEqual(@as(usize, 0), context.harness.recording.datagrams.items.len);
@@ -148,7 +152,7 @@ test "bounded request effect output owns preparation without executing transport
 }
 
 test "full request effect output aborts the unaccepted preparation" {
-    var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xbb, 0xbc, 86, 9286);
+    var context = try TestContext.initWithMaxActive(std.testing.allocator, std.Options.debug_io, 0xbb, 0xbc, 86, 9286, 2);
     defer context.deinit();
     var storage: [1]actor_mod.ActorEffect = undefined;
     var effects = actor_mod.EffectQueue.init(&storage);
@@ -162,7 +166,7 @@ test "full request effect output aborts the unaccepted preparation" {
     );
     var env = context.harness.env();
     env.effects = &effects;
-    try outbound.emitPrepared(env, first);
+    try outbound.emitPrepared(&context.harness.actor, env, first);
     const second = try context.harness.actor.preparePing(
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
         context.endpoint,
@@ -173,7 +177,7 @@ test "full request effect output aborts the unaccepted preparation" {
 
     try std.testing.expectError(
         error.TooManyActiveRequests,
-        outbound.emitPrepared(env, second),
+        outbound.emitPrepared(&context.harness.actor, env, second),
     );
 
     try std.testing.expectEqual(@as(usize, 1), effects.count());

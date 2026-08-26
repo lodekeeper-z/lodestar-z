@@ -474,3 +474,42 @@ test "lookup finish detaches active and queued requests without cancellation" {
     try std.testing.expectEqual(@as(usize, 1), book.activeCount());
     try std.testing.expectEqual(@as(usize, 1), book.queuedCount());
 }
+
+test "prepared requests reserve active capacity before send completion" {
+    const prepared_limits = config_mod.Limits{
+        .max_active_requests = 1,
+        .max_queued_requests = 1,
+        .max_queued_requests_per_endpoint = 1,
+    };
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, prepared_limits);
+    defer book.deinit(&ingress);
+
+    var first = try book.prepareActive(
+        &ingress,
+        .init(endpoint(21), try message.ReqId.fromSlice(&.{1})),
+        .api,
+        .pong,
+        .{ .awaiting_whoareyou = try probe(21) },
+        1,
+        true,
+    );
+    defer book.abortPrepared(&first, &ingress);
+
+    const second = book.prepareActive(
+        &ingress,
+        .init(endpoint(22), try message.ReqId.fromSlice(&.{2})),
+        .api,
+        .pong,
+        .{ .awaiting_whoareyou = try probe(22) },
+        1,
+        true,
+    );
+    if (second) |prepared| {
+        var unexpected = prepared;
+        book.abortPrepared(&unexpected, &ingress);
+        return error.PreparedRequestExceededActiveCapacity;
+    } else |err| try std.testing.expectEqual(error.TooManyActiveRequests, err);
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+}

@@ -33,6 +33,7 @@ pub fn prepareTracked(
 }
 
 pub fn emitPrepared(
+    actor: *Actor,
     env: Env,
     action: actor_mod.OutboundRequestAction,
 ) !void {
@@ -40,7 +41,7 @@ pub fn emitPrepared(
     switch (action) {
         .queued => {},
         .send => |effect| effects.push(.{ .request = effect }) catch {
-            effect.abortPreparation(env.ingress);
+            effect.abortPreparation(&actor.requests, env.ingress);
             return error.TooManyActiveRequests;
         },
     }
@@ -59,7 +60,7 @@ pub fn drainEndpoint(actor: *Actor, env: Env, endpoint: types.Endpoint) void {
         queued.plaintext.slice(),
         queued.origin,
     ) catch return;
-    emitPrepared(env, .{ .send = effect }) catch return;
+    emitPrepared(actor, env, .{ .send = effect }) catch return;
 }
 
 fn prepareDispatch(
@@ -138,7 +139,7 @@ pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext
     } };
     const effects = env.effects orelse unreachable;
     effects.push(effect) catch {
-        effect.abortPreparation(env.ingress);
+        effect.abortPreparation(&actor.requests, env.ingress);
         return error.TooManyActiveRequests;
     };
 }

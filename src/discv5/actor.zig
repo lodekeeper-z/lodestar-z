@@ -86,9 +86,9 @@ pub const SendDatagramEffect = struct {
         };
     }
 
-    pub fn abortPreparation(self: SendDatagramEffect, ingress: *admission.IngressAdmission) void {
+    pub fn abortPreparation(self: SendDatagramEffect, requests: *request_book.RequestBook, ingress: *admission.IngressAdmission) void {
         var pending = self.takePrepared();
-        pending.abort(ingress);
+        requests.abortPrepared(&pending, ingress);
     }
 
     pub fn requestId(self: *const SendDatagramEffect) message.ReqId {
@@ -156,9 +156,9 @@ pub const ActorEffect = union(enum) {
         };
     }
 
-    pub fn abortPreparation(self: ActorEffect, ingress: *admission.IngressAdmission) void {
+    pub fn abortPreparation(self: ActorEffect, requests: *request_book.RequestBook, ingress: *admission.IngressAdmission) void {
         switch (self) {
-            .request => |effect| effect.abortPreparation(ingress),
+            .request => |effect| effect.abortPreparation(requests, ingress),
             .response => |effect| {
                 var permit = effect.admission;
                 permit.release(ingress);
@@ -531,7 +531,7 @@ pub const Actor = struct {
             .failed, .runtime_stopped => {
                 const key = pending.key;
                 const origin = pending.origin;
-                pending.abort(env.ingress);
+                self.requests.abortPrepared(&pending, env.ingress);
                 if (completion_event == .runtime_stopped) {
                     self.onRequestSendStopped(env, key, origin);
                 } else {
@@ -590,7 +590,7 @@ pub const Actor = struct {
     ) !message.ReqId {
         var action = try self.preparePing(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, enr_seq, origin);
         const req_id = action.requestId();
-        try outbound.emitPrepared(env, action);
+        try outbound.emitPrepared(self, env, action);
         return req_id;
     }
 
@@ -622,7 +622,7 @@ pub const Actor = struct {
     ) !message.ReqId {
         var action = try self.prepareFindNode(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, distances, origin);
         const req_id = action.requestId();
-        try outbound.emitPrepared(env, action);
+        try outbound.emitPrepared(self, env, action);
         return req_id;
     }
 
@@ -665,7 +665,7 @@ pub const Actor = struct {
     ) !message.ReqId {
         var action = try self.prepareTalkRequest(.{ .io = env.io, .ingress = env.ingress }, endpoint, pubkey, protocol_name, request, origin);
         const req_id = action.requestId();
-        try outbound.emitPrepared(env, action);
+        try outbound.emitPrepared(self, env, action);
         return req_id;
     }
 
@@ -1024,7 +1024,7 @@ pub const Actor = struct {
             _ = self.peers.cancelEvictionRequest(probe.ticket, key);
             return err;
         };
-        outbound.emitPrepared(env, action) catch |err| {
+        outbound.emitPrepared(self, env, action) catch |err| {
             _ = self.peers.cancelEvictionRequest(probe.ticket, key);
             return err;
         };
@@ -1066,7 +1066,7 @@ pub const Actor = struct {
             _ = self.peers.cancelHealthRequest(key);
             return err;
         };
-        outbound.emitPrepared(env, action) catch |err| {
+        outbound.emitPrepared(self, env, action) catch |err| {
             _ = self.peers.cancelHealthRequest(key);
             return err;
         };
