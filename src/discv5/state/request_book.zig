@@ -275,6 +275,7 @@ pub const RequestBook = struct {
         if (challenge_index) |index| if (self.challenge_by_nonce.contains(index)) return error.DuplicateChallenge;
         const permit = try admission.acquire(key.endpoint.addr, admission_mod.requestPacketBudget(response.kind()));
         self.prepared_active += 1;
+        if (establish) self.reservePreparedEstablishing(key);
         return .{
             .key = key,
             .origin = origin,
@@ -298,11 +299,12 @@ pub const RequestBook = struct {
             .deadline_ns = prepared.deadline_ns,
         });
         if (prepared.index_challenge) |index| self.challenge_by_nonce.putAssumeCapacityNoClobber(index, prepared.key);
-        if (prepared.establish) self.setEstablishing(prepared.key);
+        if (prepared.establish) self.commitPreparedEstablishing(prepared.key);
     }
 
     pub fn abortPrepared(self: *RequestBook, prepared: *PreparedRequest, admission: *admission_mod.IngressAdmission) void {
         self.releaseActiveReservation();
+        if (prepared.establish) self.abortPreparedEstablishing(prepared.key);
         prepared.admission.release(admission);
     }
 
@@ -481,7 +483,10 @@ pub const RequestBook = struct {
         }
         if (self.lanes.getPtr(view.key.endpoint)) |lane| {
             if (lane.establishing) |key| {
-                if (types.RequestKeyContext.eql(.{}, key, view.key)) lane.establishing = null;
+                if (types.RequestKeyContext.eql(.{}, key, view.key)) {
+                    std.debug.assert(!lane.establishing_prepared);
+                    lane.establishing = null;
+                }
             }
         }
         self.removeEmptyLane(view.key.endpoint);
@@ -674,7 +679,13 @@ pub const RequestBook = struct {
             std.debug.assert(entry.value_ptr.queued.len() <= self.limits.max_queued_requests_per_endpoint);
             if (entry.value_ptr.establishing) |key| {
                 std.debug.assert(types.EndpointContext.eql(.{}, key.endpoint, entry.key_ptr.*));
-                std.debug.assert(self.active.contains(key));
+                if (entry.value_ptr.establishing_prepared) {
+                    std.debug.assert(!self.active.contains(key));
+                } else {
+                    std.debug.assert(self.active.contains(key));
+                }
+            } else {
+                std.debug.assert(!entry.value_ptr.establishing_prepared);
             }
             for (entry.value_ptr.queued.items.items[entry.value_ptr.queued.head..]) |queued| {
                 const queued_key = types.RequestKey.init(queued.endpoint, queued.req_id);
@@ -696,11 +707,37 @@ pub const RequestBook = struct {
         self.prepared_active -= 1;
     }
 
+    fn reservePreparedEstablishing(self: *RequestBook, key: types.RequestKey) void {
+        const lane = self.lanes.getOrPutAssumeCapacity(key.endpoint);
+        if (!lane.found_existing) lane.value_ptr.* = .{};
+        std.debug.assert(lane.value_ptr.establishing == null);
+        std.debug.assert(!lane.value_ptr.establishing_prepared);
+        lane.value_ptr.establishing = key;
+        lane.value_ptr.establishing_prepared = true;
+    }
+
+    fn commitPreparedEstablishing(self: *RequestBook, key: types.RequestKey) void {
+        const lane = self.lanes.getPtr(key.endpoint) orelse unreachable;
+        std.debug.assert(lane.establishing != null and types.RequestKeyContext.eql(.{}, lane.establishing.?, key));
+        std.debug.assert(lane.establishing_prepared);
+        lane.establishing_prepared = false;
+    }
+
+    fn abortPreparedEstablishing(self: *RequestBook, key: types.RequestKey) void {
+        const lane = self.lanes.getPtr(key.endpoint) orelse unreachable;
+        std.debug.assert(lane.establishing != null and types.RequestKeyContext.eql(.{}, lane.establishing.?, key));
+        std.debug.assert(lane.establishing_prepared);
+        lane.establishing = null;
+        lane.establishing_prepared = false;
+        self.removeEmptyLane(key.endpoint);
+    }
+
     fn setEstablishing(self: *RequestBook, key: types.RequestKey) void {
         const lane = self.lanes.getOrPutAssumeCapacity(key.endpoint);
         if (!lane.found_existing) lane.value_ptr.* = .{};
         std.debug.assert(lane.value_ptr.establishing == null or types.RequestKeyContext.eql(.{}, lane.value_ptr.establishing.?, key));
         lane.value_ptr.establishing = key;
+        lane.value_ptr.establishing_prepared = false;
     }
 
     fn containsQueued(self: *const RequestBook, key: types.RequestKey) bool {
@@ -714,7 +751,10 @@ pub const RequestBook = struct {
     fn clearIndexes(self: *RequestBook, key: types.RequestKey, active: *const ActiveRequest) void {
         if (challengeForPhase(key.endpoint.addr, active.phase)) |index| _ = self.challenge_by_nonce.remove(index);
         if (self.lanes.getPtr(key.endpoint)) |lane| if (lane.establishing) |establishing| {
-            if (types.RequestKeyContext.eql(.{}, establishing, key)) lane.establishing = null;
+            if (types.RequestKeyContext.eql(.{}, establishing, key)) {
+                std.debug.assert(!lane.establishing_prepared);
+                lane.establishing = null;
+            }
         };
         self.removeEmptyLane(key.endpoint);
     }

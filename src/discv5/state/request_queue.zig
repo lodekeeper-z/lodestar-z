@@ -91,6 +91,7 @@ pub const RequestFifo = struct {
 
 pub const EndpointLane = struct {
     establishing: ?types.RequestKey = null,
+    establishing_prepared: bool = false,
     queued: RequestFifo = .{},
 
     pub fn deinit(self: *EndpointLane, alloc: Allocator) void {

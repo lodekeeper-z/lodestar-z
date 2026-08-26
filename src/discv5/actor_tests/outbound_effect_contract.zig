@@ -75,7 +75,7 @@ test "prepared outbound ping owns request until successful send completion" {
 
     try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.activeCount());
     try std.testing.expect(context.harness.actor.requests.get(key) == null);
-    try std.testing.expect(!context.harness.actor.requests.shouldQueue(context.endpoint));
+    try std.testing.expect(context.harness.actor.requests.shouldQueue(context.endpoint));
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
     try std.testing.expect(effect.packetBytes().len > 0);
     try std.testing.expect(effect.destination().eql(&context.endpoint.addr));
@@ -167,9 +167,11 @@ test "full request effect output aborts the unaccepted preparation" {
     var env = context.harness.env();
     env.effects = &effects;
     try outbound.emitPrepared(&context.harness.actor, env, first);
+    var second_endpoint = context.endpoint;
+    second_endpoint.addr.ip4.port += 1;
     const second = try context.harness.actor.preparePing(
         .{ .io = context.harness.io, .ingress = &context.harness.ingress },
-        context.endpoint,
+        second_endpoint,
         &context.remote_pubkey,
         0,
         .reliable_api,
@@ -185,6 +187,40 @@ test "full request effect output aborts the unaccepted preparation" {
     const effect = effects.pop() orelse return error.MissingEffect;
     context.harness.actor.applyEffectCompletion(context.harness.env(), effect, .failed);
     try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
+}
+
+test "prepared endpoint establishment queues a second request before send completion" {
+    var context = try TestContext.initWithMaxActive(std.testing.allocator, std.Options.debug_io, 0xcb, 0xcc, 91, 9291, 2);
+    defer context.deinit();
+
+    const env = context.harness.env();
+    const first = try context.harness.actor.preparePing(
+        .{ .io = context.harness.io, .ingress = &context.harness.ingress },
+        context.endpoint,
+        &context.remote_pubkey,
+        0,
+        .api,
+    );
+    try outbound.emitPrepared(&context.harness.actor, env, first);
+
+    const second = try context.harness.actor.preparePing(
+        .{ .io = context.harness.io, .ingress = &context.harness.ingress },
+        context.endpoint,
+        &context.remote_pubkey,
+        0,
+        .api,
+    );
+    switch (second) {
+        .queued => {},
+        .send => |effect| {
+            effect.abortPreparation(&context.harness.actor.requests, &context.harness.ingress);
+            return error.PreparedDuplicateEndpointEstablishment;
+        },
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.harness.effects.count());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
 }
 
 test "queued drain emits one FIFO effect per sent completion" {
