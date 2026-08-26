@@ -82,6 +82,70 @@ test "kbucket: routing table findClosestNodeIds uses bounded stack storage" {
     try std.testing.expectEqual(@as(u8, 3), out[2][31]);
 }
 
+test "kbucket: candidate membership is derived from replacement location" {
+    const alloc = std.testing.allocator;
+    const local: NodeId = [_]u8{0} ** 32;
+    var rt = try RoutingTable.init(alloc, local);
+    defer rt.deinit(alloc);
+
+    for (0..K) |i| {
+        var node_id: NodeId = [_]u8{0} ** 32;
+        node_id[0] = 0x80;
+        node_id[31] = @intCast(i);
+        try std.testing.expect(rt.insert(.{
+            .node_id = node_id,
+            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = @intCast(i) } },
+            .last_seen = @intCast(i),
+            .status = .disconnected,
+        }));
+    }
+
+    var candidate_id: NodeId = [_]u8{0} ** 32;
+    candidate_id[0] = 0x80;
+    candidate_id[31] = 0xff;
+    const inserted_at_ns: i64 = 1_000;
+    const outcome = rt.insertDetailed(.{
+        .node_id = candidate_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 9_000 } },
+        .last_seen = inserted_at_ns,
+        .status = .connected,
+    });
+
+    try std.testing.expect(!outcome.inserted);
+    try std.testing.expect(rt.getEntry(&candidate_id) == null);
+    const candidate = rt.getEntryWithPending(&candidate_id) orelse return error.MissingCandidate;
+    try std.testing.expectEqual(EntryStatus.connected, candidate.status);
+
+    var closest_before: [K + 1]NodeId = undefined;
+    try std.testing.expectEqual(K, rt.findClosestNodeIds(&candidate_id, K + 1, &closest_before));
+    for (closest_before[0..K]) |node_id| {
+        try std.testing.expect(!std.mem.eql(u8, &node_id, &candidate_id));
+    }
+
+    const distance = logDistance(&local, &candidate_id) orelse return error.InvalidCandidateDistance;
+    try std.testing.expect(rt.buckets[distance].applyPendingIfExpired(inserted_at_ns + std.time.ns_per_ms, 1));
+    try std.testing.expect(rt.getEntry(&candidate_id) != null);
+    try std.testing.expect(rt.getEntryWithPending(&candidate_id) != null);
+
+    var closest_after: [K + 1]NodeId = undefined;
+    try std.testing.expectEqual(K, rt.findClosestNodeIds(&candidate_id, K + 1, &closest_after));
+    var found_candidate = false;
+    for (closest_after[0..K]) |node_id| {
+        if (std.mem.eql(u8, &node_id, &candidate_id)) found_candidate = true;
+    }
+    try std.testing.expect(found_candidate);
+}
+
+test "kbucket: Entry and routing storage remain bounded" {
+    const routing_storage_size = @sizeOf([kbucket.NUM_BUCKETS]KBucket);
+    try std.testing.expect(@sizeOf(Entry) <= 640);
+    try std.testing.expect(routing_storage_size <= 3 * 1024 * 1024);
+}
+
+test "kbucket: EntryStatus has only independent health states" {
+    try std.testing.expect(std.meta.stringToEnum(EntryStatus, "pending") == null);
+}
+
 test "kbucket: full bucket stores pending connected entry until timeout" {
     var bucket = KBucket.init();
 
@@ -131,7 +195,7 @@ test "kbucket: full bucket does not evict connected peers" {
         .node_id = [_]u8{0xee} ** 32,
         .addr = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 2 }, .port = 0 } },
         .last_seen = -1,
-        .status = .pending,
+        .status = .disconnected,
     });
     try std.testing.expect(!inserted);
     try std.testing.expect(bucket.pending == null);
@@ -145,7 +209,7 @@ test "kbucket: updating existing node does not grow bucket" {
         .node_id = node_id,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0x2328 } },
         .last_seen = 1,
-        .status = .pending,
+        .status = .disconnected,
     }));
     try std.testing.expect(bucket.insert(.{
         .node_id = node_id,

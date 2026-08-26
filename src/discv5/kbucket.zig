@@ -14,7 +14,6 @@ pub const BUCKET_PENDING_TIMEOUT_MS: u64 = 60_000;
 pub const EntryStatus = enum {
     connected,
     disconnected,
-    pending,
 };
 
 pub const Entry = struct {
@@ -125,7 +124,7 @@ pub const KBucket = struct {
             return .{ .inserted = true };
         }
 
-        if (entry.status == .connected or entry.status == .pending) {
+        if (entry.status == .connected) {
             if (self.first_connected_index != 0 and self.pending == null) {
                 const pending_eviction = self.entries[0];
                 const ticket = EvictionTicket{
@@ -292,7 +291,7 @@ pub const KBucket = struct {
                     if (first >= self.count) self.first_connected_index = null;
                 }
             },
-            .disconnected, .pending => {
+            .disconnected => {
                 if (self.first_connected_index) |*first| {
                     first.* -= 1;
                 }
@@ -310,7 +309,7 @@ pub const KBucket = struct {
                     self.first_connected_index = self.count;
                 }
             },
-            .disconnected, .pending => {
+            .disconnected => {
                 const insert_at = self.first_connected_index orelse self.count;
                 if (insert_at < self.count) {
                     @memmove(self.entries[insert_at + 1 .. self.count + 1], self.entries[insert_at..self.count]);
