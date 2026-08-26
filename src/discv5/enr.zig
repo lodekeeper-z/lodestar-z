@@ -229,8 +229,7 @@ pub fn decode(data: []const u8) Error!Enr {
             const val = list.readBytes() catch return Error.InvalidEnr;
             if (readFixed(1, val)) |v| enr.syncnets = v;
         } else {
-            // Skip unknown key value
-            list.skipItem() catch return Error.InvalidEnr;
+            return Error.InvalidEnr;
         }
     }
 
@@ -493,6 +492,49 @@ pub fn countSubnets(attnets: [8]u8) u32 {
         count += @popCount(byte);
     }
     return count;
+}
+
+fn encodeUnknownEnrForTest(alloc: Allocator, key_pair: secp.KeyPair) ![]u8 {
+    const pubkey = secp.compressedPubkey(&key_pair);
+
+    var content_buf: [MAX_ENR_SIZE]u8 = undefined;
+    var content_writer = rlp.Writer.initBuffer(&content_buf);
+    const content_start = try content_writer.beginListBounded();
+    try content_writer.writeUint64Bounded(1);
+    try content_writer.writeBytesBounded("id");
+    try content_writer.writeBytesBounded("v4");
+    try content_writer.writeBytesBounded("secp256k1");
+    try content_writer.writeBytesBounded(&pubkey);
+    try content_writer.writeBytesBounded("x-test");
+    try content_writer.writeBytesBounded("opaque");
+    try content_writer.finishList(content_start);
+
+    var hash: [32]u8 = undefined;
+    Keccak256.hash(content_writer.bytes(), &hash, .{});
+    const signature = try secp.sign(&hash, &key_pair);
+
+    var full_buf: [MAX_ENR_SIZE]u8 = undefined;
+    var full_writer = rlp.Writer.initBuffer(&full_buf);
+    const full_start = try full_writer.beginListBounded();
+    try full_writer.writeBytesBounded(&signature);
+    try full_writer.writeUint64Bounded(1);
+    try full_writer.writeBytesBounded("id");
+    try full_writer.writeBytesBounded("v4");
+    try full_writer.writeBytesBounded("secp256k1");
+    try full_writer.writeBytesBounded(&pubkey);
+    try full_writer.writeBytesBounded("x-test");
+    try full_writer.writeBytesBounded("opaque");
+    try full_writer.finishList(full_start);
+    return alloc.dupe(u8, full_writer.bytes());
+}
+
+test "ENR rejects unknown signed key value" {
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x42} ** 32));
+    const encoded = try encodeUnknownEnrForTest(std.testing.allocator, key_pair);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expectError(error.InvalidEnr, decode(encoded));
+    try std.testing.expectError(error.InvalidEnr, ValidatedEnr.init(encoded));
 }
 
 test "ENR nodeIdFromCompressedPubkey" {
