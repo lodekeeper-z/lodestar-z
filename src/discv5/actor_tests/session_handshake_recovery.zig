@@ -1686,6 +1686,138 @@ test "matched WHOAREYOU enqueue failure removes exact response recovery once" {
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 }
 
+test "duplicate successful response handshake completion is a stale no-op" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const endpoint = responseCompletionEndpoint(0x71);
+    var harness = try ActorHarness.init(alloc, io, responseCompletionConfig(try secp.keyPairFromSecret(&([_]u8{0x70} ** 32))));
+    defer harness.deinit();
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xa1} ** 16,
+        .recipient_key = [_]u8{0xa2} ** 16,
+    };
+    harness.actor.sessions.put(endpoint, stable, 0);
+    const effect = try retainResponseHandshake(&harness, endpoint, 0x73, 0xb1);
+
+    harness.actor.applyEffectCompletion(harness.env(), effect, .sent);
+    try expectResponseCompletionState(&harness, endpoint, 0xb1, stable, 0, 1);
+
+    harness.actor.applyEffectCompletion(harness.env(), effect, .sent);
+    try expectResponseCompletionState(&harness, endpoint, 0xb1, stable, 0, 1);
+}
+
+test "failed response handshake cleanup makes stale success a no-op" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const endpoint = responseCompletionEndpoint(0x75);
+    var harness = try ActorHarness.init(alloc, io, responseCompletionConfig(try secp.keyPairFromSecret(&([_]u8{0x74} ** 32))));
+    defer harness.deinit();
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xa3} ** 16,
+        .recipient_key = [_]u8{0xa4} ** 16,
+    };
+    harness.actor.sessions.put(endpoint, stable, 0);
+    const effect = try retainResponseHandshake(&harness, endpoint, 0x76, 0xb2);
+
+    harness.actor.applyEffectCompletion(harness.env(), effect, .failed);
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.responses.candidate(endpoint, 0) == null);
+
+    harness.actor.applyEffectCompletion(harness.env(), effect, .sent);
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.responses.candidate(endpoint, 0) == null);
+    try std.testing.expectEqual(@as(u64, 0), harness.actor.metrics.sent_message_count[metrics.MessageType.talkresp.index()]);
+    const unchanged = harness.actor.sessions.get(endpoint, 0) orelse return error.MissingStableSession;
+    try std.testing.expectEqual(stable.initiator_key, unchanged.initiator_key);
+    try std.testing.expectEqual(stable.recipient_key, unchanged.recipient_key);
+}
+
+test "stale response handshake success preserves reused nonce generation" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const endpoint = responseCompletionEndpoint(0x78);
+    var harness = try ActorHarness.init(alloc, io, responseCompletionConfig(try secp.keyPairFromSecret(&([_]u8{0x77} ** 32))));
+    defer harness.deinit();
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xa5} ** 16,
+        .recipient_key = [_]u8{0xa6} ** 16,
+    };
+    harness.actor.sessions.put(endpoint, stable, 0);
+    const stale = try retainResponseHandshake(&harness, endpoint, 0x79, 0xb3);
+    harness.actor.applyEffectCompletion(harness.env(), stale, .failed);
+    const current = try retainResponseHandshake(&harness, endpoint, 0x79, 0xb4);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+
+    harness.actor.applyEffectCompletion(harness.env(), stale, .sent);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.responses.candidate(endpoint, 0) == null);
+    try std.testing.expect(harness.actor.responses.hasLive(endpoint.addr, &([_]u8{0x79} ** packet.NONCE_SIZE), 0));
+    try std.testing.expectEqual(@as(u64, 0), harness.actor.metrics.sent_message_count[metrics.MessageType.talkresp.index()]);
+    const unchanged = harness.actor.sessions.get(endpoint, 0) orelse return error.MissingStableSession;
+    try std.testing.expectEqual(stable.initiator_key, unchanged.initiator_key);
+    try std.testing.expectEqual(stable.recipient_key, unchanged.recipient_key);
+
+    harness.actor.applyEffectCompletion(harness.env(), current, .sent);
+    try expectResponseCompletionState(&harness, endpoint, 0xb4, stable, 0, 1);
+}
+
+fn responseCompletionConfig(local_key: secp.KeyPair) config.Config {
+    return .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .response_recovery_capacity = 2, .event_capacity = 1, .command_capacity = 1 },
+    };
+}
+
+fn responseCompletionEndpoint(byte: u8) types.Endpoint {
+    return .{
+        .node_id = [_]u8{byte} ** 32,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, byte }, .port = 9_300 + @as(u16, byte) } },
+    };
+}
+
+fn retainResponseHandshake(harness: *ActorHarness, endpoint: types.Endpoint, nonce_byte: u8, key_byte: u8) !actor_mod.ActorEffect {
+    var permit = try harness.ingress.acquire(endpoint.addr, admission.RESPONSE_RECOVERY_PACKET_BUDGET);
+    const nonce = [_]u8{nonce_byte} ** packet.NONCE_SIZE;
+    harness.actor.responses.put(.{
+        .endpoint = endpoint,
+        .nonce = nonce,
+        .dest_pubkey = [_]u8{nonce_byte} ** 33,
+        .plaintext = try .init(&.{message.MSG_TALKRESP}),
+        .admission = permit.move(),
+    }, 0, &harness.ingress);
+    const view = harness.actor.responses.challenge(endpoint.addr, &nonce, 0, &harness.ingress) orelse return error.MissingRecovery;
+    return .{ .handshake = .{
+        .destination = endpoint.addr,
+        .packet = try .init(&.{}),
+        .source = .{ .response = view },
+        .initiator_key = [_]u8{key_byte} ** 16,
+        .recipient_key = [_]u8{key_byte + 1} ** 16,
+        .deadline_ns = 0,
+        .prepared_at_ns = 0,
+        .plaintext = try .init(&.{message.MSG_TALKRESP}),
+    } };
+}
+
+fn expectResponseCompletionState(
+    harness: *ActorHarness,
+    endpoint: types.Endpoint,
+    key_byte: u8,
+    stable: session_book.StableSession,
+    expected_permits: usize,
+    expected_sent: u64,
+) !void {
+    try std.testing.expectEqual(expected_permits, harness.ingress.permitCount());
+    const candidate = harness.actor.responses.candidate(endpoint, 0) orelse return error.MissingCandidate;
+    try std.testing.expectEqual([_]u8{key_byte} ** 16, candidate.initiator_key);
+    try std.testing.expectEqual([_]u8{key_byte + 1} ** 16, candidate.recipient_key);
+    try std.testing.expectEqual(expected_sent, harness.actor.metrics.sent_message_count[metrics.MessageType.talkresp.index()]);
+    const unchanged = harness.actor.sessions.get(endpoint, 0) orelse return error.MissingStableSession;
+    try std.testing.expectEqual(stable.initiator_key, unchanged.initiator_key);
+    try std.testing.expectEqual(stable.recipient_key, unchanged.recipient_key);
+}
+
 test "transactional capacity-one challenge replacement send failure preserves original" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;

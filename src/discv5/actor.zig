@@ -465,10 +465,10 @@ pub const Actor = struct {
                         .initiator_key = handshake_effect.initiator_key,
                         .recipient_key = handshake_effect.recipient_key,
                     }, handshake_effect.deadline_ns),
-                    .response => |view| self.responses.commitCandidate(view, .{
+                    .response => |view| if (!self.responses.commitCandidate(view, .{
                         .initiator_key = handshake_effect.initiator_key,
                         .recipient_key = handshake_effect.recipient_key,
-                    }, handshake_effect.prepared_at_ns, env.ingress),
+                    }, handshake_effect.prepared_at_ns, env.ingress)) return,
                 }
                 outbound.noteSent(self, handshake_effect.plaintext.slice());
             },

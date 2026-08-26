@@ -144,12 +144,15 @@ pub const ResponseBook = struct {
         keys: CandidateKeys,
         now_ns: i64,
         admission: *admission_mod.IngressAdmission,
-    ) void {
-        const recovery = self.recoveries.takeMove(.init(view.endpoint.addr, &view.nonce)) orelse unreachable;
-        std.debug.assert(recovery.generation == view.generation);
-        std.debug.assert(types.EndpointContext.eql(.{}, recovery.recovery.endpoint, view.endpoint));
+    ) bool {
+        const key = types.ChallengeKey.init(view.endpoint.addr, &view.nonce);
+        const current = self.recoveries.peekPtrRaw(key) orelse return false;
+        if (current.generation != view.generation or
+            !types.EndpointContext.eql(.{}, current.recovery.endpoint, view.endpoint)) return false;
+        const recovery = self.recoveries.takeMove(key) orelse unreachable;
         cleanup(recovery.recovery, admission);
         _ = self.candidates.putMove(view.endpoint, keys, self.timeout_ms, now_ns);
+        return true;
     }
 
     pub fn candidate(self: *const ResponseBook, endpoint: types.Endpoint, now_ns: i64) ?CandidateKeys {
@@ -279,7 +282,7 @@ fn putTestCandidate(book: *ResponseBook, admission: *admission_mod.IngressAdmiss
     try putTestRecovery(book, admission, byte, now_ns);
     const nonce = [_]u8{byte} ** packet.NONCE_SIZE;
     const view = book.challenge(testAddress(byte), &nonce, now_ns, admission) orelse return error.MissingRecovery;
-    book.commitCandidate(view, .{
+    _ = book.commitCandidate(view, .{
         .initiator_key = [_]u8{byte} ** 16,
         .recipient_key = [_]u8{byte + 1} ** 16,
     }, now_ns, admission);
