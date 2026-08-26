@@ -331,7 +331,7 @@ test "real eviction probe WHOAREYOU recovery preserves reservation and completes
     try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     const pending = harness.actor.requests.pendingKeys(harness.candidate_endpoint) orelse return error.MissingPendingKeys;
-    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.key, key));
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.handle.key, key));
     try std.testing.expect(types.RequestKeyContext.eql(.{}, try harness.armedKey(), key));
 
     const pong = message.Pong{ .req_id = key.req_id, .enr_seq = 0, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 };

@@ -1364,7 +1364,7 @@ test "old key remains accepted without promotion until candidate response" {
     actor.handlePacket(harness.env(), old_response.bytes[0..old_response.len], endpoint.addr);
     harness.drainEffectsIgnoringFailures();
     const still_pending = actor.requests.pendingKeys(endpoint) orelse return error.PendingRekeyWasPromotedByOldKey;
-    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.key, still_pending.key));
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.handle.key, still_pending.handle.key));
     try std.testing.expect(actor.requests.shouldQueue(endpoint));
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     const still_old = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingOldSession;

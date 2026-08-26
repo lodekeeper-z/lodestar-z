@@ -241,7 +241,7 @@ const RuntimeImpl = struct {
         };
     }
 
-    /// Request-side effects inject into distinct active or prepared request slots.
+    /// Request-side effects inject into distinct canonical request slots.
     /// Other producers are atomic per inbound packet; FINDNODE is the maximum:
     /// one eviction probe followed by the bounded multipart NODES response.
     /// Runtime drains the FIFO after every command and pops before completion,

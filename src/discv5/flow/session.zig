@@ -146,7 +146,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
     env.commitExpected();
     const recovery: RecoveryMaterial = switch (source) {
         .request => |preparation| .{
-            .endpoint = preparation.key.endpoint,
+            .endpoint = preparation.handle.key.endpoint,
             .dest_pubkey = preparation.recovery.dest_pubkey,
             .plaintext = preparation.recovery.plaintext,
         },
@@ -219,7 +219,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *packet.ParsedPacket, from: 
 
 fn failRequestRecovery(actor: *Actor, env: Env, source: WhoareyouSource, failure: request_results.RequestSendFailure) void {
     switch (source) {
-        .request => |preparation| _ = completion.finish(actor, env, preparation.key, .failure, .{ .send_failure = failure }),
+        .request => |preparation| _ = completion.finish(actor, env, preparation.handle.key, .failure, .{ .send_failure = failure }),
         .response => {},
     }
 }

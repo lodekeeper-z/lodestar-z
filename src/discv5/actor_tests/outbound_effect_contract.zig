@@ -62,11 +62,19 @@ const TestContext = struct {
     }
 };
 
-test "outbound request effect fits within four packet budgets" {
-    try std.testing.expect(@sizeOf(actor_mod.ActorEffect) <= 4 * packet.MAX_PACKET_SIZE);
+test "request effect is compact handle plus packet bytes" {
+    const fields = @typeInfo(actor_mod.SendDatagramEffect).@"struct".fields;
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("handle", fields[0].name);
+    try std.testing.expectEqual(request_book.RequestHandle, fields[0].type);
+    try std.testing.expectEqualStrings("packet", fields[1].name);
+    try std.testing.expectEqual(types.PacketBytes, fields[1].type);
+    comptime {
+        std.debug.assert(@sizeOf(actor_mod.ActorEffect) <= (13 * packet.MAX_PACKET_SIZE) / 4);
+    }
 }
 
-test "prepared outbound ping owns request until successful send completion" {
+test "sending outbound ping owns request until successful send completion" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb1, 0xb2, 81, 9281);
     defer context.deinit();
 
@@ -74,6 +82,7 @@ test "prepared outbound ping owns request until successful send completion" {
     const key = types.RequestKey.init(context.endpoint, effect.requestId());
 
     try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.sendingCount());
     try std.testing.expect(context.harness.actor.requests.get(key) == null);
     try std.testing.expect(context.harness.actor.requests.shouldQueue(context.endpoint));
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
@@ -83,6 +92,7 @@ test "prepared outbound ping owns request until successful send completion" {
     context.harness.actor.applySendCompletion(context.harness.env(), effect, .sent);
 
     try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.sendingCount());
     try std.testing.expect(context.harness.actor.requests.get(key) != null);
     try std.testing.expect(context.harness.actor.requests.shouldQueue(context.endpoint));
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
@@ -99,12 +109,26 @@ test "failed outbound ping completion releases the effect-owned request" {
     context.harness.actor.applyEffectCompletion(context.harness.env(), effect, .failed);
 
     try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.sendingCount());
     try std.testing.expect(context.harness.actor.requests.get(key) == null);
     try std.testing.expect(!context.harness.actor.requests.shouldQueue(context.endpoint));
     try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
 }
 
-test "prepared FINDNODE effect commits the nodes response state" {
+test "copied request effect completion is accepted exactly once" {
+    var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xd1, 0xd2, 92, 9292);
+    defer context.deinit();
+    const effect = try context.preparePing();
+    const duplicate = effect;
+
+    context.harness.actor.applySendCompletion(context.harness.env(), effect, .sent);
+    context.harness.actor.applySendCompletion(context.harness.env(), duplicate, .sent);
+
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
+}
+
+test "sent FINDNODE effect activates the nodes response state" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb5, 0xb6, 83, 9283);
     defer context.deinit();
 
@@ -127,7 +151,7 @@ test "prepared FINDNODE effect commits the nodes response state" {
     try std.testing.expect(request.response == .nodes);
 }
 
-test "bounded request effect output owns preparation without executing transport" {
+test "bounded request effect output owns sending state without executing transport" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb9, 0xba, 85, 9285);
     defer context.deinit();
     var storage: [1]actor_mod.ActorEffect = undefined;
@@ -151,7 +175,7 @@ test "bounded request effect output owns preparation without executing transport
     context.harness.actor.applyEffectCompletion(context.harness.env(), effect, .failed);
 }
 
-test "full request effect output aborts the unaccepted preparation" {
+test "full request effect output aborts the unaccepted sending state" {
     var context = try TestContext.initWithMaxActive(std.testing.allocator, std.Options.debug_io, 0xbb, 0xbc, 86, 9286, 2);
     defer context.deinit();
     var storage: [1]actor_mod.ActorEffect = undefined;
@@ -176,6 +200,7 @@ test "full request effect output aborts the unaccepted preparation" {
         0,
         .reliable_api,
     );
+    const second_key = types.RequestKey.init(second_endpoint, second.requestId());
 
     try std.testing.expectError(
         error.TooManyActiveRequests,
@@ -183,13 +208,66 @@ test "full request effect output aborts the unaccepted preparation" {
     );
 
     try std.testing.expectEqual(@as(usize, 1), effects.count());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.sendingCount());
+    try std.testing.expect(!context.harness.actor.requests.containsRequest(second_key));
     try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
     const effect = effects.pop() orelse return error.MissingEffect;
     context.harness.actor.applyEffectCompletion(context.harness.env(), effect, .failed);
     try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
 }
 
-test "prepared endpoint establishment queues a second request before send completion" {
+test "queued effect enqueue abort preserves intent and releases canonical sending state" {
+    var context = try TestContext.initWithMaxActive(std.testing.allocator, std.Options.debug_io, 0xd3, 0xd4, 93, 9293, 2);
+    defer context.deinit();
+    var storage: [1]actor_mod.ActorEffect = undefined;
+    var effects = actor_mod.EffectQueue.init(&storage);
+    var env = context.harness.env();
+    env.effects = &effects;
+    const blocker = try context.harness.actor.preparePing(
+        .{ .io = context.harness.io, .ingress = &context.harness.ingress },
+        context.endpoint,
+        &context.remote_pubkey,
+        0,
+        .api,
+    );
+    try outbound.emitPrepared(&context.harness.actor, env, blocker);
+    var queued_endpoint = context.endpoint;
+    queued_endpoint.addr.ip4.port += 1;
+    const queued_id = try message.ReqId.fromSlice(&.{0x44});
+    var plaintext: [128]u8 = undefined;
+    try context.harness.actor.requests.queue(try .init(
+        .api,
+        queued_endpoint,
+        &context.remote_pubkey,
+        queued_id,
+        .ping,
+        &.{},
+        try (message.Ping{ .req_id = queued_id, .enr_seq = 0 }).encodeInto(&plaintext),
+        std.math.maxInt(i64),
+    ));
+
+    outbound.drainEndpoint(&context.harness.actor, env, queued_endpoint);
+
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.sendingCount());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.ingress.permitCount());
+    try std.testing.expectEqual(queued_id, context.harness.actor.requests.firstQueued(queued_endpoint).?.req_id);
+    const blocker_effect = effects.pop() orelse return error.MissingEffect;
+    context.harness.actor.applyEffectCompletion(context.harness.env(), blocker_effect, .failed);
+
+    outbound.drainEndpoint(&context.harness.actor, env, queued_endpoint);
+    try std.testing.expectEqual(@as(usize, 1), effects.count());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.sendingCount());
+    const queued_effect = effects.pop() orelse return error.MissingQueuedEffect;
+    context.harness.actor.applyEffectCompletion(context.harness.env(), queued_effect, .failed);
+    try std.testing.expectEqual(@as(usize, 1), context.harness.actor.requests.queuedCount());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.actor.requests.sendingCount());
+    try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
+    _ = context.harness.actor.requests.takeQueued(.init(queued_endpoint, queued_id)) orelse return error.MissingQueuedIntent;
+}
+
+test "sending endpoint establishment queues a second request before send completion" {
     var context = try TestContext.initWithMaxActive(std.testing.allocator, std.Options.debug_io, 0xcb, 0xcc, 91, 9291, 2);
     defer context.deinit();
 
@@ -213,8 +291,8 @@ test "prepared endpoint establishment queues a second request before send comple
     switch (second) {
         .queued => {},
         .send => |effect| {
-            effect.abortPreparation(&context.harness.actor.requests, &context.harness.ingress);
-            return error.PreparedDuplicateEndpointEstablishment;
+            _ = context.harness.actor.requests.abortSending(effect.handle, &context.harness.ingress);
+            return error.UnexpectedDuplicateEndpointEstablishment;
         },
     }
 
@@ -338,7 +416,7 @@ test "Actor tracked send helpers emit without executing transport" {
     try std.testing.expectEqual(@as(usize, 0), context.harness.ingress.permitCount());
 }
 
-test "prepared TALKREQ effect commits the talk response state" {
+test "sent TALKREQ effect activates the talk response state" {
     var context = try TestContext.init(std.testing.allocator, std.Options.debug_io, 0xb7, 0xb8, 84, 9284);
     defer context.deinit();
 

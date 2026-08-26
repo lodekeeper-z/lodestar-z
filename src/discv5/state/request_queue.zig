@@ -90,8 +90,7 @@ pub const RequestFifo = struct {
 };
 
 pub const EndpointLane = struct {
-    establishing: ?types.RequestKey = null,
-    establishing_prepared: bool = false,
+    establishing: ?types.RequestHandle = null,
     queued: RequestFifo = .{},
 
     pub fn deinit(self: *EndpointLane, alloc: Allocator) void {

@@ -45,6 +45,11 @@ pub const RequestKey = struct {
     }
 };
 
+pub const RequestHandle = struct {
+    key: RequestKey,
+    generation: u64,
+};
+
 pub const EndpointContext = struct {
     pub fn hash(_: EndpointContext, endpoint: Endpoint) u64 {
         var hasher = std.hash.Wyhash.init(0);

@@ -7,6 +7,7 @@ const types = @import("../types.zig");
 
 const Allocator = std.mem.Allocator;
 const AdmissionPermit = admission_mod.AdmissionPermit;
+pub const RequestHandle = types.RequestHandle;
 
 pub const MAX_NODES_RESPONSE: usize = config_mod.MAX_NODES_RESPONSE;
 pub const RequestDistances = request_queue.RequestDistances;
@@ -135,8 +136,7 @@ pub const Response = union(enum) {
     }
 };
 
-/// Compact response fact owned while an outbound request is prepared but not
-/// yet sent. The large NODES accumulator only becomes real at send commit.
+/// Compact response fact used to initialize canonical request state.
 pub const ResponseExpectation = union(enum) {
     pong,
     nodes: RequestDistances,
@@ -160,12 +160,15 @@ pub const ResponseExpectation = union(enum) {
 };
 
 pub const ActiveRequest = struct {
+    generation: u64,
+    lifecycle: enum { sending, active },
     origin: types.RequestOrigin,
     response: Response,
     phase: Phase,
     admission: AdmissionPermit,
     deadline_ns: i64,
     attempts: u32 = 0,
+    queued_intent: bool,
 };
 
 pub const QueuedRequest = request_queue.QueuedRequest;
@@ -174,24 +177,19 @@ const EndpointLane = request_queue.EndpointLane;
 const ActiveMap = std.HashMap(types.RequestKey, ActiveRequest, types.RequestKeyContext, std.hash_map.default_max_load_percentage);
 const LaneMap = std.HashMap(types.Endpoint, EndpointLane, types.EndpointContext, std.hash_map.default_max_load_percentage);
 
-pub const PreparedRequest = struct {
+pub const SendCompletionView = struct {
     key: types.RequestKey,
     origin: types.RequestOrigin,
-    response: ResponseExpectation,
-    phase: Phase,
-    admission: AdmissionPermit,
-    deadline_ns: i64,
-    index_challenge: ?types.ChallengeKey,
-    establish: bool,
+    kind: types.RequestKind,
 };
 
 pub const ChallengePreparation = struct {
-    key: types.RequestKey,
+    handle: RequestHandle,
     recovery: RecoveryState,
 };
 
 pub const PendingKeysView = struct {
-    key: types.RequestKey,
+    handle: RequestHandle,
     keys: PendingSessionKeys,
 };
 
@@ -200,8 +198,8 @@ pub const RequestBook = struct {
     limits: config_mod.Limits,
     active: ActiveMap,
     lanes: LaneMap,
-    challenge_by_nonce: std.AutoHashMap(types.ChallengeKey, types.RequestKey),
-    prepared_active: usize = 0,
+    challenge_by_nonce: std.AutoHashMap(types.ChallengeKey, RequestHandle),
+    next_generation: u64 = 1,
     queued_total: usize = 0,
     drain_cursor: usize = 0,
 
@@ -216,14 +214,13 @@ pub const RequestBook = struct {
         var lanes = LaneMap.init(alloc);
         errdefer lanes.deinit();
         try lanes.ensureTotalCapacity(@intCast(lane_capacity));
-        var challenges = std.AutoHashMap(types.ChallengeKey, types.RequestKey).init(alloc);
+        var challenges = std.AutoHashMap(types.ChallengeKey, RequestHandle).init(alloc);
         errdefer challenges.deinit();
         try challenges.ensureTotalCapacity(@intCast(limits.max_active_requests));
         return .{ .alloc = alloc, .limits = limits, .active = active, .lanes = lanes, .challenge_by_nonce = challenges };
     }
 
     pub fn deinit(self: *RequestBook, admission: *admission_mod.IngressAdmission) void {
-        std.debug.assert(self.prepared_active == 0);
         var active = self.active.iterator();
         while (active.next()) |entry| {
             entry.value_ptr.admission.release(admission);
@@ -237,7 +234,6 @@ pub const RequestBook = struct {
 
     pub fn deinitEmpty(self: *RequestBook) void {
         std.debug.assert(self.active.count() == 0);
-        std.debug.assert(self.prepared_active == 0);
         std.debug.assert(self.queued_total == 0);
         self.active.deinit();
         self.lanes.deinit();
@@ -256,7 +252,7 @@ pub const RequestBook = struct {
         };
     }
 
-    pub fn prepareActive(
+    pub fn beginSending(
         self: *RequestBook,
         admission: *admission_mod.IngressAdmission,
         key: types.RequestKey,
@@ -265,47 +261,56 @@ pub const RequestBook = struct {
         phase: Phase,
         deadline_ns: i64,
         establish: bool,
-    ) !PreparedRequest {
+        queued_intent: bool,
+    ) !RequestHandle {
         if (self.active.contains(key)) return error.DuplicateRequest;
-        if (self.active.count() + self.prepared_active >= self.limits.max_active_requests) return error.TooManyActiveRequests;
+        if (self.active.count() >= self.limits.max_active_requests) return error.TooManyActiveRequests;
         if (establish) {
             if (self.lanes.get(key.endpoint)) |lane| if (lane.establishing != null) return error.EndpointEstablishing;
         }
         const challenge_index = challengeForPhase(key.endpoint.addr, phase);
         if (challenge_index) |index| if (self.challenge_by_nonce.contains(index)) return error.DuplicateChallenge;
-        const permit = try admission.acquire(key.endpoint.addr, admission_mod.requestPacketBudget(response.kind()));
-        self.prepared_active += 1;
-        if (establish) self.reservePreparedEstablishing(key);
-        return .{
-            .key = key,
+        var permit = try admission.acquire(key.endpoint.addr, admission_mod.requestPacketBudget(response.kind()));
+        errdefer permit.release(admission);
+        const handle = RequestHandle{ .key = key, .generation = self.next_generation };
+        self.next_generation +%= 1;
+        if (self.next_generation == 0) self.next_generation = 1;
+        self.active.putAssumeCapacityNoClobber(key, .{
+            .generation = handle.generation,
+            .lifecycle = .sending,
             .origin = origin,
-            .response = response,
+            .response = response.activate(),
             .phase = phase,
-            .admission = permit,
+            .admission = permit.move(),
             .deadline_ns = deadline_ns,
-            .index_challenge = challenge_index,
-            .establish = establish,
-        };
-    }
-
-    pub fn commitPrepared(self: *RequestBook, prepared: PreparedRequest) void {
-        std.debug.assert(!self.active.contains(prepared.key));
-        self.releaseActiveReservation();
-        self.active.putAssumeCapacityNoClobber(prepared.key, .{
-            .origin = prepared.origin,
-            .response = prepared.response.activate(),
-            .phase = prepared.phase,
-            .admission = prepared.admission,
-            .deadline_ns = prepared.deadline_ns,
+            .queued_intent = queued_intent,
         });
-        if (prepared.index_challenge) |index| self.challenge_by_nonce.putAssumeCapacityNoClobber(index, prepared.key);
-        if (prepared.establish) self.commitPreparedEstablishing(prepared.key);
+        if (challenge_index) |index| self.challenge_by_nonce.putAssumeCapacityNoClobber(index, handle);
+        if (establish) self.setEstablishing(handle);
+        return handle;
     }
 
-    pub fn abortPrepared(self: *RequestBook, prepared: *PreparedRequest, admission: *admission_mod.IngressAdmission) void {
-        self.releaseActiveReservation();
-        if (prepared.establish) self.abortPreparedEstablishing(prepared.key);
-        prepared.admission.release(admission);
+    pub fn completeSending(self: *RequestBook, handle: RequestHandle) ?SendCompletionView {
+        const request = self.active.getPtr(handle.key) orelse return null;
+        if (request.generation != handle.generation or request.lifecycle != .sending) return null;
+        if (request.queued_intent) self.discardQueuedIntent(handle.key);
+        request.lifecycle = .active;
+        request.queued_intent = false;
+        return .{ .key = handle.key, .origin = request.origin, .kind = request.response.kind() };
+    }
+
+    pub fn abortSending(
+        self: *RequestBook,
+        handle: RequestHandle,
+        admission: *admission_mod.IngressAdmission,
+    ) ?SendCompletionView {
+        const current = self.active.get(handle.key) orelse return null;
+        if (current.generation != handle.generation or current.lifecycle != .sending) return null;
+        var removed = self.active.fetchRemove(handle.key).?.value;
+        self.clearIndexes(handle, &removed);
+        const view = SendCompletionView{ .key = handle.key, .origin = removed.origin, .kind = removed.response.kind() };
+        removed.admission.release(admission);
+        return view;
     }
 
     pub fn queue(self: *RequestBook, request: QueuedRequest) !void {
@@ -340,7 +345,21 @@ pub const RequestBook = struct {
     }
 
     pub fn activeCount(self: *const RequestBook) usize {
-        return self.active.count();
+        var count: usize = 0;
+        var requests = self.active.iterator();
+        while (requests.next()) |entry| if (entry.value_ptr.lifecycle == .active) {
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn sendingCount(self: *const RequestBook) usize {
+        var count: usize = 0;
+        var requests = self.active.iterator();
+        while (requests.next()) |entry| if (entry.value_ptr.lifecycle == .sending) {
+            count += 1;
+        };
+        return count;
     }
 
     pub fn queuedCount(self: *const RequestBook) usize {
@@ -354,7 +373,16 @@ pub const RequestBook = struct {
 
     pub fn firstActive(self: *const RequestBook) ?RequestSnapshot {
         var active = self.active.iterator();
-        const entry = active.next() orelse return null;
+        while (active.next()) |entry| {
+            if (entry.value_ptr.lifecycle != .active) continue;
+            return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.response.kind() };
+        }
+        return null;
+    }
+
+    pub fn firstRequest(self: *const RequestBook) ?RequestSnapshot {
+        var requests = self.active.iterator();
+        const entry = requests.next() orelse return null;
         return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.response.kind() };
     }
 
@@ -398,7 +426,7 @@ pub const RequestBook = struct {
         var iterator = self.active.iterator();
         while (iterator.next()) |entry| {
             if (!std.mem.eql(u8, &entry.key_ptr.endpoint.node_id, node_id)) continue;
-            if (entry.value_ptr.response == .nodes) return true;
+            if (entry.value_ptr.lifecycle == .active and entry.value_ptr.response == .nodes) return true;
         }
         return false;
     }
@@ -409,39 +437,21 @@ pub const RequestBook = struct {
         return lane.queued.first();
     }
 
-    pub fn commitSent(self: *RequestBook, prepared: PreparedRequest) void {
-        if (self.containsQueued(prepared.key)) {
-            self.commitQueued(prepared);
-        } else {
-            self.commitPrepared(prepared);
-        }
-    }
-
-    pub fn commitQueued(self: *RequestBook, prepared: PreparedRequest) void {
-        const lane = self.lanes.getPtr(prepared.key.endpoint) orelse unreachable;
-        const queued = lane.queued.first() orelse unreachable;
-        std.debug.assert(std.meta.eql(types.RequestKey.init(queued.endpoint, queued.req_id), prepared.key));
-        lane.queued.discardFirst();
-        std.debug.assert(self.queued_total > 0);
-        self.queued_total -= 1;
-        self.commitPrepared(prepared);
-        self.removeEmptyLane(prepared.key.endpoint);
-    }
-
     pub fn challenge(self: *const RequestBook, nonce: *const [12]u8, from: types.Address) !ChallengePreparation {
         const challenge_key = types.ChallengeKey.init(from, nonce);
-        const key = self.challenge_by_nonce.get(challenge_key) orelse return error.InvalidChallenge;
-        const active = self.active.get(key) orelse return error.InvalidChallenge;
+        const handle = self.challenge_by_nonce.get(challenge_key) orelse return error.InvalidChallenge;
+        const active = self.active.get(handle.key) orelse return error.InvalidChallenge;
+        if (active.generation != handle.generation or active.lifecycle != .active) return error.InvalidChallenge;
         const recovery = switch (active.phase) {
             .awaiting_whoareyou => |value| value.recovery,
             .awaiting_response => |value| if (value.wait.canChallenge()) value.recovery else return error.InvalidChallenge,
         };
         if (!std.mem.eql(u8, &recovery.nonce, nonce)) return error.InvalidChallenge;
-        if (self.lanes.get(key.endpoint)) |lane| {
-            if (lane.establishing) |existing| if (!types.RequestKeyContext.eql(.{}, existing, key))
+        if (self.lanes.get(handle.key.endpoint)) |lane| {
+            if (lane.establishing) |existing| if (!handleEql(existing, handle))
                 return error.EndpointEstablishing;
         }
-        return .{ .key = key, .recovery = recovery };
+        return .{ .handle = handle, .recovery = recovery };
     }
 
     pub fn hasChallenge(self: *const RequestBook, nonce: *const [12]u8, from: types.Address) bool {
@@ -454,46 +464,51 @@ pub const RequestBook = struct {
         keys: PendingSessionKeys,
         deadline_ns: i64,
     ) void {
-        const active = self.active.getPtr(preparation.key) orelse unreachable;
+        const active = self.active.getPtr(preparation.handle.key) orelse return;
+        if (active.generation != preparation.handle.generation or active.lifecycle != .active) return;
         active.phase = .{ .awaiting_response = .{
             .recovery = preparation.recovery,
             .wait = .{ .handshake_sent = keys },
         } };
         active.deadline_ns = deadline_ns;
-        std.debug.assert(self.challenge_by_nonce.remove(.init(preparation.key.endpoint.addr, &preparation.recovery.nonce)));
-        self.setEstablishing(preparation.key);
+        _ = self.challenge_by_nonce.remove(.init(preparation.handle.key.endpoint.addr, &preparation.recovery.nonce));
+        self.setEstablishing(preparation.handle);
     }
 
     pub fn pendingKeys(self: *const RequestBook, endpoint: types.Endpoint) ?PendingKeysView {
         const lane = self.lanes.get(endpoint) orelse return null;
-        const key = lane.establishing orelse return null;
-        const active = self.active.get(key) orelse return null;
+        const handle = lane.establishing orelse return null;
+        const active = self.active.get(handle.key) orelse return null;
+        if (active.generation != handle.generation or active.lifecycle != .active) return null;
         const response = switch (active.phase) {
             .awaiting_whoareyou => return null,
             .awaiting_response => |value| value,
         };
-        return .{ .key = key, .keys = response.wait.pendingKeys() orelse return null };
+        return .{ .handle = handle, .keys = response.wait.pendingKeys() orelse return null };
     }
 
     pub fn promotePending(self: *RequestBook, view: PendingKeysView) void {
-        const active = self.active.getPtr(view.key) orelse return;
+        const active = self.active.getPtr(view.handle.key) orelse return;
+        if (active.generation != view.handle.generation or active.lifecycle != .active) return;
         switch (active.phase) {
             .awaiting_whoareyou => return,
             .awaiting_response => |*response| response.wait = response.wait.afterPromotion(),
         }
-        if (self.lanes.getPtr(view.key.endpoint)) |lane| {
-            if (lane.establishing) |key| {
-                if (types.RequestKeyContext.eql(.{}, key, view.key)) {
-                    std.debug.assert(!lane.establishing_prepared);
-                    lane.establishing = null;
-                }
+        if (self.lanes.getPtr(view.handle.key.endpoint)) |lane| {
+            if (lane.establishing) |handle| {
+                if (handleEql(handle, view.handle)) lane.establishing = null;
             }
         }
-        self.removeEmptyLane(view.key.endpoint);
+        self.removeEmptyLane(view.handle.key.endpoint);
     }
 
     pub fn get(self: *RequestBook, key: types.RequestKey) ?*ActiveRequest {
-        return self.active.getPtr(key);
+        const request = self.active.getPtr(key) orelse return null;
+        return if (request.lifecycle == .active) request else null;
+    }
+
+    pub fn containsRequest(self: *const RequestBook, key: types.RequestKey) bool {
+        return self.active.contains(key);
     }
 
     pub const ActiveScan = struct {
@@ -556,7 +571,7 @@ pub const RequestBook = struct {
             };
             scan.index = iterator.index;
             scan.slots_scanned += scan.index - previous;
-            if (now_ns >= entry.value_ptr.deadline_ns) {
+            if (entry.value_ptr.lifecycle == .active and now_ns >= entry.value_ptr.deadline_ns) {
                 out[count] = entry.key_ptr.*;
                 count += 1;
             }
@@ -569,13 +584,13 @@ pub const RequestBook = struct {
     }
     pub fn canReplaceChallenge(self: *const RequestBook, key: types.RequestKey, nonce: *const [12]u8) bool {
         const indexed = self.challenge_by_nonce.get(.init(key.endpoint.addr, nonce)) orelse return true;
-        return types.RequestKeyContext.eql(.{}, indexed, key);
+        return types.RequestKeyContext.eql(.{}, indexed.key, key);
     }
 
     pub fn canEstablish(self: *const RequestBook, key: types.RequestKey) bool {
         const lane = self.lanes.get(key.endpoint) orelse return true;
         const establishing = lane.establishing orelse return true;
-        return types.RequestKeyContext.eql(.{}, establishing, key);
+        return types.RequestKeyContext.eql(.{}, establishing.key, key);
     }
 
     pub fn commitRetry(self: *RequestBook, key: types.RequestKey, deadline_ns: i64) void {
@@ -614,8 +629,11 @@ pub const RequestBook = struct {
                 .wait = response_wait.afterFreshRetry(),
             } },
         };
-        self.challenge_by_nonce.putAssumeCapacityNoClobber(.init(key.endpoint.addr, &nonce), key);
-        if (transition == .probe) self.setEstablishing(key);
+        self.challenge_by_nonce.putAssumeCapacityNoClobber(.init(key.endpoint.addr, &nonce), .{
+            .key = key,
+            .generation = active.generation,
+        });
+        if (transition == .probe) self.setEstablishing(.{ .key = key, .generation = active.generation });
         switch (active.response) {
             .nodes => |*nodes| nodes.resetGeneration(),
             .pong, .talkresp => {},
@@ -646,7 +664,8 @@ pub const RequestBook = struct {
 
     pub fn take(self: *RequestBook, key: types.RequestKey) ?ActiveRequest {
         const removed = self.active.fetchRemove(key) orelse return null;
-        self.clearIndexes(key, &removed.value);
+        self.clearIndexes(.{ .key = key, .generation = removed.value.generation }, &removed.value);
+        if (removed.value.queued_intent) self.discardQueuedIntent(key);
         return removed.value;
     }
 
@@ -670,74 +689,42 @@ pub const RequestBook = struct {
     }
 
     pub fn assertInvariants(self: *const RequestBook) void {
-        std.debug.assert(self.active.count() + self.prepared_active <= self.limits.max_active_requests);
+        std.debug.assert(self.active.count() <= self.limits.max_active_requests);
         std.debug.assert(self.queued_total <= self.limits.max_queued_requests);
         var counted: usize = 0;
         var lanes = self.lanes.iterator();
         while (lanes.next()) |entry| {
             counted += entry.value_ptr.queued.len();
             std.debug.assert(entry.value_ptr.queued.len() <= self.limits.max_queued_requests_per_endpoint);
-            if (entry.value_ptr.establishing) |key| {
-                std.debug.assert(types.EndpointContext.eql(.{}, key.endpoint, entry.key_ptr.*));
-                if (entry.value_ptr.establishing_prepared) {
-                    std.debug.assert(!self.active.contains(key));
-                } else {
-                    std.debug.assert(self.active.contains(key));
-                }
-            } else {
-                std.debug.assert(!entry.value_ptr.establishing_prepared);
+            if (entry.value_ptr.establishing) |handle| {
+                std.debug.assert(types.EndpointContext.eql(.{}, handle.key.endpoint, entry.key_ptr.*));
+                const request = self.active.get(handle.key) orelse unreachable;
+                std.debug.assert(request.generation == handle.generation);
             }
             for (entry.value_ptr.queued.items.items[entry.value_ptr.queued.head..]) |queued| {
                 const queued_key = types.RequestKey.init(queued.endpoint, queued.req_id);
                 std.debug.assert(types.EndpointContext.eql(.{}, queued.endpoint, entry.key_ptr.*));
-                std.debug.assert(!self.active.contains(queued_key));
+                if (self.active.get(queued_key)) |request| {
+                    std.debug.assert(request.lifecycle == .sending and request.queued_intent);
+                }
             }
         }
         std.debug.assert(counted == self.queued_total);
         var challenges = self.challenge_by_nonce.iterator();
         while (challenges.next()) |entry| {
-            const active = self.active.get(entry.value_ptr.*) orelse unreachable;
-            const expected = challengeForPhase(entry.value_ptr.endpoint.addr, active.phase) orelse unreachable;
+            const handle = entry.value_ptr.*;
+            const request = self.active.get(handle.key) orelse unreachable;
+            std.debug.assert(request.generation == handle.generation);
+            const expected = challengeForPhase(handle.key.endpoint.addr, request.phase) orelse unreachable;
             std.debug.assert(std.meta.eql(entry.key_ptr.*, expected));
         }
     }
 
-    fn releaseActiveReservation(self: *RequestBook) void {
-        std.debug.assert(self.prepared_active > 0);
-        self.prepared_active -= 1;
-    }
-
-    fn reservePreparedEstablishing(self: *RequestBook, key: types.RequestKey) void {
-        const lane = self.lanes.getOrPutAssumeCapacity(key.endpoint);
+    fn setEstablishing(self: *RequestBook, handle: RequestHandle) void {
+        const lane = self.lanes.getOrPutAssumeCapacity(handle.key.endpoint);
         if (!lane.found_existing) lane.value_ptr.* = .{};
-        std.debug.assert(lane.value_ptr.establishing == null);
-        std.debug.assert(!lane.value_ptr.establishing_prepared);
-        lane.value_ptr.establishing = key;
-        lane.value_ptr.establishing_prepared = true;
-    }
-
-    fn commitPreparedEstablishing(self: *RequestBook, key: types.RequestKey) void {
-        const lane = self.lanes.getPtr(key.endpoint) orelse unreachable;
-        std.debug.assert(lane.establishing != null and types.RequestKeyContext.eql(.{}, lane.establishing.?, key));
-        std.debug.assert(lane.establishing_prepared);
-        lane.establishing_prepared = false;
-    }
-
-    fn abortPreparedEstablishing(self: *RequestBook, key: types.RequestKey) void {
-        const lane = self.lanes.getPtr(key.endpoint) orelse unreachable;
-        std.debug.assert(lane.establishing != null and types.RequestKeyContext.eql(.{}, lane.establishing.?, key));
-        std.debug.assert(lane.establishing_prepared);
-        lane.establishing = null;
-        lane.establishing_prepared = false;
-        self.removeEmptyLane(key.endpoint);
-    }
-
-    fn setEstablishing(self: *RequestBook, key: types.RequestKey) void {
-        const lane = self.lanes.getOrPutAssumeCapacity(key.endpoint);
-        if (!lane.found_existing) lane.value_ptr.* = .{};
-        std.debug.assert(lane.value_ptr.establishing == null or types.RequestKeyContext.eql(.{}, lane.value_ptr.establishing.?, key));
-        lane.value_ptr.establishing = key;
-        lane.value_ptr.establishing_prepared = false;
+        std.debug.assert(lane.value_ptr.establishing == null or handleEql(lane.value_ptr.establishing.?, handle));
+        lane.value_ptr.establishing = handle;
     }
 
     fn containsQueued(self: *const RequestBook, key: types.RequestKey) bool {
@@ -748,15 +735,26 @@ pub const RequestBook = struct {
         return false;
     }
 
-    fn clearIndexes(self: *RequestBook, key: types.RequestKey, active: *const ActiveRequest) void {
-        if (challengeForPhase(key.endpoint.addr, active.phase)) |index| _ = self.challenge_by_nonce.remove(index);
-        if (self.lanes.getPtr(key.endpoint)) |lane| if (lane.establishing) |establishing| {
-            if (types.RequestKeyContext.eql(.{}, establishing, key)) {
-                std.debug.assert(!lane.establishing_prepared);
-                lane.establishing = null;
-            }
-        };
+    fn discardQueuedIntent(self: *RequestBook, key: types.RequestKey) void {
+        const lane = self.lanes.getPtr(key.endpoint) orelse unreachable;
+        const queued = lane.queued.first() orelse unreachable;
+        std.debug.assert(types.RequestKeyContext.eql(.{}, .init(queued.endpoint, queued.req_id), key));
+        lane.queued.discardFirst();
+        std.debug.assert(self.queued_total > 0);
+        self.queued_total -= 1;
         self.removeEmptyLane(key.endpoint);
+    }
+
+    fn clearIndexes(self: *RequestBook, handle: RequestHandle, active: *const ActiveRequest) void {
+        if (challengeForPhase(handle.key.endpoint.addr, active.phase)) |index| {
+            if (self.challenge_by_nonce.get(index)) |indexed| if (handleEql(indexed, handle)) {
+                _ = self.challenge_by_nonce.remove(index);
+            };
+        }
+        if (self.lanes.getPtr(handle.key.endpoint)) |lane| if (lane.establishing) |establishing| {
+            if (handleEql(establishing, handle)) lane.establishing = null;
+        };
+        self.removeEmptyLane(handle.key.endpoint);
     }
 
     fn removeEmptyLane(self: *RequestBook, endpoint: types.Endpoint) void {
@@ -766,6 +764,10 @@ pub const RequestBook = struct {
         removed.deinit(self.alloc);
     }
 };
+
+fn handleEql(a: RequestHandle, b: RequestHandle) bool {
+    return a.generation == b.generation and types.RequestKeyContext.eql(.{}, a.key, b.key);
+}
 
 fn challengeForPhase(address: types.Address, phase: Phase) ?types.ChallengeKey {
     return switch (phase) {

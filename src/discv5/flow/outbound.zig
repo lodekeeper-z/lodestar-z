@@ -29,7 +29,7 @@ pub fn prepareTracked(
         return .{ .queued = req_id };
     }
     const requested_distances = request_book.RequestDistances.fromSlice(distances);
-    return .{ .send = try prepareDispatch(actor, context, endpoint, dest_pubkey, req_id, kind, &requested_distances, plaintext, origin) };
+    return .{ .send = try prepareDispatch(actor, context, endpoint, dest_pubkey, req_id, kind, &requested_distances, plaintext, origin, false) };
 }
 
 pub fn emitPrepared(
@@ -41,7 +41,7 @@ pub fn emitPrepared(
     switch (action) {
         .queued => {},
         .send => |effect| effects.push(.{ .request = effect }) catch {
-            effect.abortPreparation(&actor.requests, env.ingress);
+            _ = actor.requests.abortSending(effect.handle, env.ingress);
             return error.TooManyActiveRequests;
         },
     }
@@ -59,6 +59,7 @@ pub fn drainEndpoint(actor: *Actor, env: Env, endpoint: types.Endpoint) void {
         &queued.requested_distances,
         queued.plaintext.slice(),
         queued.origin,
+        true,
     ) catch return;
     emitPrepared(actor, env, .{ .send = effect }) catch return;
 }
@@ -73,6 +74,7 @@ fn prepareDispatch(
     requested_distances: *const request_book.RequestDistances,
     plaintext: []const u8,
     origin: types.RequestOrigin,
+    queued_intent: bool,
 ) !actor_mod.SendDatagramEffect {
     const now_ns = nowNs(context.io);
     var packet_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
@@ -94,8 +96,8 @@ fn prepareDispatch(
     else
         .{ .awaiting_response = .{ .recovery = recovery, .wait = .session_request } };
     const response = actor.requests.makeExpectation(kind, requested_distances);
-    const transient_packet = if (stable == null) null else try types.PacketBytes.init(encoded.bytes);
-    const prepared = try actor.requests.prepareActive(
+    const send_packet = try types.PacketBytes.init(encoded.bytes);
+    const handle = try actor.requests.beginSending(
         context.ingress,
         .init(endpoint, req_id),
         origin,
@@ -103,13 +105,9 @@ fn prepareDispatch(
         phase,
         deadlineNs(now_ns, actor.request_timeout_ms),
         stable == null,
+        queued_intent,
     );
-    return .{
-        .storage = if (transient_packet) |send_packet|
-            .{ .transient = .{ .prepared = prepared, .packet = send_packet } }
-        else
-            .{ .retained = prepared },
-    };
+    return .{ .handle = handle, .packet = send_packet };
 }
 
 pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) !void {

@@ -33,6 +33,20 @@ fn probe(nonce_byte: u8) !book_mod.AwaitingWhoareyou {
     };
 }
 
+fn beginActive(
+    book: *book_mod.RequestBook,
+    ingress: *admission.IngressAdmission,
+    key: types.RequestKey,
+    origin: types.RequestOrigin,
+    response: book_mod.ResponseExpectation,
+    phase: book_mod.Phase,
+    deadline_ns: i64,
+    establish: bool,
+) !void {
+    const handle = try book.beginSending(ingress, key, origin, response, phase, deadline_ns, establish, false);
+    if (book.completeSending(handle) == null) return error.SendingCompletionRejected;
+}
+
 test "FINDNODE correlation stores bounded distance membership" {
     const distances = book_mod.RequestDistances.fromSlice(&.{ 256, 0, 256, 257, 1 });
     try std.testing.expect(distances.contains(0));
@@ -53,7 +67,8 @@ test "response waits preserve challenge and pending-key behavior across retries 
     };
 
     const promoted_retry = types.RequestKey.init(endpoint(1), try message.ReqId.fromSlice(&.{1}));
-    const promoted_prepared = try book.prepareActive(
+    try beginActive(
+        &book,
         &ingress,
         promoted_retry,
         .api,
@@ -62,7 +77,6 @@ test "response waits preserve challenge and pending-key behavior across retries 
         1,
         true,
     );
-    book.commitPrepared(promoted_prepared);
     book.commitChallenge(try book.challenge(&([_]u8{20} ** 12), promoted_retry.endpoint.addr), keys, 2);
     try std.testing.expect(book.pendingKeys(promoted_retry.endpoint) != null);
     try std.testing.expectError(error.InvalidChallenge, book.challenge(&([_]u8{20} ** 12), promoted_retry.endpoint.addr));
@@ -77,7 +91,8 @@ test "response waits preserve challenge and pending-key behavior across retries 
     _ = try book.challenge(&([_]u8{21} ** 12), promoted_retry.endpoint.addr);
 
     const confirmed_retry = types.RequestKey.init(endpoint(2), try message.ReqId.fromSlice(&.{2}));
-    const confirmed_prepared = try book.prepareActive(
+    try beginActive(
+        &book,
         &ingress,
         confirmed_retry,
         .api,
@@ -86,7 +101,6 @@ test "response waits preserve challenge and pending-key behavior across retries 
         1,
         true,
     );
-    book.commitPrepared(confirmed_prepared);
     book.commitChallenge(try book.challenge(&([_]u8{30} ** 12), confirmed_retry.endpoint.addr), keys, 2);
     const confirmed_pending = book.pendingKeys(confirmed_retry.endpoint) orelse return error.MissingPendingKeys;
     book.promotePending(confirmed_pending);
@@ -105,7 +119,8 @@ test "RequestBook conserves challenge lane active and admission indexes" {
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(1), try message.ReqId.fromSlice(&.{}));
-    const prepared = try book.prepareActive(
+    try beginActive(
+        &book,
         &ingress,
         key,
         .api,
@@ -114,7 +129,6 @@ test "RequestBook conserves challenge lane active and admission indexes" {
         1,
         true,
     );
-    book.commitPrepared(prepared);
     book.assertInvariants();
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
     const challenge = try book.challenge(&([_]u8{7} ** 12), key.endpoint.addr);
@@ -123,7 +137,7 @@ test "RequestBook conserves challenge lane active and admission indexes" {
         .recipient_key = [_]u8{11} ** 16,
     }, 2);
     const pending = book.pendingKeys(key.endpoint) orelse return error.MissingPendingKeys;
-    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.key, key));
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.handle.key, key));
     book.promotePending(pending);
     try std.testing.expect(book.pendingKeys(key.endpoint) == null);
     var removed = book.take(key) orelse return error.MissingActiveRequest;
@@ -138,7 +152,8 @@ test "WHOAREYOU phase changes preserve the cumulative retry bound" {
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(12), try message.ReqId.fromSlice(&.{1}));
-    const prepared = try book.prepareActive(
+    try beginActive(
+        &book,
         &ingress,
         key,
         .api,
@@ -147,7 +162,6 @@ test "WHOAREYOU phase changes preserve the cumulative retry bound" {
         1,
         true,
     );
-    book.commitPrepared(prepared);
     book.commitRetry(key, 2);
     try std.testing.expectEqual(@as(u32, 1), book.get(key).?.attempts);
 
@@ -177,10 +191,10 @@ test "RequestBook keeps every request queued xor active in FIFO order" {
     try std.testing.expect(book.firstQueued(peer).?.requested_distances.contains(0));
     try std.testing.expect(book.firstQueued(peer).?.requested_distances.contains(256));
     try std.testing.expect(!book.firstQueued(peer).?.requested_distances.contains(1));
-    const prepared = try book.prepareActive(&ingress, .init(peer, first), .api, .pong, .{
+    const handle = try book.beginSending(&ingress, .init(peer, first), .api, .pong, .{
         .awaiting_whoareyou = try probe(8),
-    }, 0, true);
-    book.commitQueued(prepared);
+    }, 0, true, true);
+    try std.testing.expect(book.completeSending(handle) != null);
     book.assertInvariants();
     try std.testing.expect(book.firstQueued(peer) == null);
     var removed = book.take(.init(peer, first)).?;
@@ -324,10 +338,9 @@ fn allocationLifecycle(alloc: std.mem.Allocator) !void {
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(3), try message.ReqId.fromSlice(&.{1}));
     const requested = requestedDistances(&.{1});
-    const prepared = try book.prepareActive(&ingress, key, .api, book.makeExpectation(.findnode, &requested), .{
+    try beginActive(&book, &ingress, key, .api, book.makeExpectation(.findnode, &requested), .{
         .awaiting_whoareyou = try probe(9),
     }, 0, true);
-    book.commitPrepared(prepared);
     const challenge = try book.challenge(&([_]u8{9} ** 12), key.endpoint.addr);
     book.commitChallenge(challenge, .{
         .initiator_key = [_]u8{6} ** 16,
@@ -376,10 +389,9 @@ test "challenge preparation and commit remain allocation-free" {
     defer book.deinit(&ingress);
     failing.fail_index = failing.alloc_index;
     const key = types.RequestKey.init(endpoint(6), try message.ReqId.fromSlice(&.{1}));
-    const prepared = try book.prepareActive(&ingress, key, .api, .pong, .{
+    try beginActive(&book, &ingress, key, .api, .pong, .{
         .awaiting_whoareyou = try probe(11),
     }, 10, true);
-    book.commitPrepared(prepared);
     const challenge = try book.challenge(&([_]u8{11} ** 12), key.endpoint.addr);
     book.commitChallenge(challenge, .{
         .initiator_key = [_]u8{1} ** 16,
@@ -417,8 +429,7 @@ test "timed-out active scan visits maximum-capacity table once across bounded ba
             },
             .wait = .session_request,
         } };
-        const prepared = try book.prepareActive(&ingress, .init(peer, req_id), .api, .pong, phase, now_ns - 1, false);
-        book.commitPrepared(prepared);
+        try beginActive(&book, &ingress, .init(peer, req_id), .api, .pong, phase, now_ns - 1, false);
     }
 
     var scan = book_mod.RequestBook.ActiveScan{};
@@ -442,10 +453,9 @@ test "RequestBook shutdown releases active permits and only deinitializes queued
     defer ingress.deinit();
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
     const active_key = types.RequestKey.init(endpoint(7), try message.ReqId.fromSlice(&.{1}));
-    const prepared = try book.prepareActive(&ingress, active_key, .api, .pong, .{
+    try beginActive(&book, &ingress, active_key, .api, .pong, .{
         .awaiting_whoareyou = try probe(12),
     }, 10, true);
-    book.commitPrepared(prepared);
     const queued_endpoint = endpoint(8);
     const pubkey = [_]u8{8} ** 33;
     try book.queue(try .init(.api, queued_endpoint, &pubkey, try message.ReqId.fromSlice(&.{2}), .ping, &.{}, &.{1}, 10));
@@ -460,10 +470,9 @@ test "lookup finish detaches active and queued requests without cancellation" {
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
     defer book.deinit(&ingress);
     const active_key = types.RequestKey.init(endpoint(9), try message.ReqId.fromSlice(&.{1}));
-    const prepared = try book.prepareActive(&ingress, active_key, .{ .lookup = 42 }, .pong, .{
+    try beginActive(&book, &ingress, active_key, .{ .lookup = 42 }, .pong, .{
         .awaiting_whoareyou = try probe(13),
     }, 10, true);
-    book.commitPrepared(prepared);
     const queued_endpoint = endpoint(10);
     const pubkey = [_]u8{9} ** 33;
     try book.queue(try .init(.{ .lookup = 42 }, queued_endpoint, &pubkey, try message.ReqId.fromSlice(&.{2}), .ping, &.{}, &.{1}, 10));
@@ -475,41 +484,74 @@ test "lookup finish detaches active and queued requests without cancellation" {
     try std.testing.expectEqual(@as(usize, 1), book.queuedCount());
 }
 
-test "prepared requests reserve active capacity before send completion" {
-    const prepared_limits = config_mod.Limits{
+test "canonical sending rejects duplicate request keys before completion" {
+    const sending_limits = config_mod.Limits{
         .max_active_requests = 1,
         .max_queued_requests = 1,
         .max_queued_requests_per_endpoint = 1,
     };
     var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 2);
     defer ingress.deinit();
-    var book = try book_mod.RequestBook.init(std.testing.allocator, prepared_limits);
+    var book = try book_mod.RequestBook.init(std.testing.allocator, sending_limits);
     defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(21), try message.ReqId.fromSlice(&.{1}));
+    const first = try book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(21),
+    }, 1, true, false);
+    defer _ = book.abortSending(first, &ingress);
 
-    var first = try book.prepareActive(
-        &ingress,
-        .init(endpoint(21), try message.ReqId.fromSlice(&.{1})),
-        .api,
-        .pong,
-        .{ .awaiting_whoareyou = try probe(21) },
-        1,
-        true,
-    );
-    defer book.abortPrepared(&first, &ingress);
-
-    const second = book.prepareActive(
-        &ingress,
-        .init(endpoint(22), try message.ReqId.fromSlice(&.{2})),
-        .api,
-        .pong,
-        .{ .awaiting_whoareyou = try probe(22) },
-        1,
-        true,
-    );
-    if (second) |prepared| {
-        var unexpected = prepared;
-        book.abortPrepared(&unexpected, &ingress);
-        return error.PreparedRequestExceededActiveCapacity;
-    } else |err| try std.testing.expectEqual(error.TooManyActiveRequests, err);
+    try std.testing.expectError(error.DuplicateRequest, book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(23),
+    }, 1, true, false));
+    try std.testing.expectEqual(@as(usize, 1), book.sendingCount());
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+}
+
+test "canonical sending rejects duplicate challenge nonces before completion" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    var second_endpoint = endpoint(31);
+    second_endpoint.node_id = [_]u8{32} ** 32;
+    const first = try book.beginSending(&ingress, .init(endpoint(31), try message.ReqId.fromSlice(&.{1})), .api, .pong, .{
+        .awaiting_whoareyou = try probe(31),
+    }, 1, true, false);
+    defer _ = book.abortSending(first, &ingress);
+
+    try std.testing.expectError(error.DuplicateChallenge, book.beginSending(
+        &ingress,
+        .init(second_endpoint, try message.ReqId.fromSlice(&.{2})),
+        .api,
+        .pong,
+        .{ .awaiting_whoareyou = try probe(31) },
+        1,
+        true,
+        false,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), book.sendingCount());
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+}
+
+test "stale sending handle cannot mutate a reused request key generation" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(33), try message.ReqId.fromSlice(&.{1}));
+    const old = try book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(33),
+    }, 1, true, false);
+    try std.testing.expect(book.abortSending(old, &ingress) != null);
+    const current = try book.beginSending(&ingress, key, .api, .pong, .{
+        .awaiting_whoareyou = try probe(34),
+    }, 1, true, false);
+    try std.testing.expect(old.generation != current.generation);
+
+    try std.testing.expect(book.completeSending(old) == null);
+    try std.testing.expectEqual(@as(usize, 1), book.sendingCount());
+    try std.testing.expect(book.completeSending(current) != null);
+    try std.testing.expectEqual(@as(usize, 1), book.activeCount());
+    var active = book.take(key) orelse return error.MissingActiveRequest;
+    active.admission.release(&ingress);
 }

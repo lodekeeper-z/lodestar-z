@@ -61,52 +61,20 @@ pub const SendCompletion = enum {
     runtime_stopped,
 };
 
-/// Move-owned outbound transition. Until Runtime reports completion, this is
-/// the sole owner of the bounded datagram and prepared request admission.
 pub const SendDatagramEffect = struct {
-    storage: union(enum) {
-        retained: request_book.PreparedRequest,
-        transient: struct {
-            prepared: request_book.PreparedRequest,
-            packet: types.PacketBytes,
-        },
-    },
-
-    fn prepared(self: *const SendDatagramEffect) *const request_book.PreparedRequest {
-        return switch (self.storage) {
-            .retained => |*value| value,
-            .transient => |*value| &value.prepared,
-        };
-    }
-
-    fn takePrepared(self: SendDatagramEffect) request_book.PreparedRequest {
-        return switch (self.storage) {
-            .retained => |value| value,
-            .transient => |value| value.prepared,
-        };
-    }
-
-    pub fn abortPreparation(self: SendDatagramEffect, requests: *request_book.RequestBook, ingress: *admission.IngressAdmission) void {
-        var pending = self.takePrepared();
-        requests.abortPrepared(&pending, ingress);
-    }
+    handle: request_book.RequestHandle,
+    packet: types.PacketBytes,
 
     pub fn requestId(self: *const SendDatagramEffect) message.ReqId {
-        return self.prepared().key.req_id;
+        return self.handle.key.req_id;
     }
 
     pub fn destination(self: *const SendDatagramEffect) types.Address {
-        return self.prepared().key.endpoint.addr;
+        return self.handle.key.endpoint.addr;
     }
 
     pub fn packetBytes(self: *const SendDatagramEffect) []const u8 {
-        return switch (self.storage) {
-            .retained => |*value| switch (value.phase) {
-                .awaiting_whoareyou => |*phase| phase.retry_packet.slice(),
-                .awaiting_response => unreachable,
-            },
-            .transient => |*value| value.packet.slice(),
-        };
+        return self.packet.slice();
     }
 };
 
@@ -158,7 +126,7 @@ pub const ActorEffect = union(enum) {
 
     pub fn abortPreparation(self: ActorEffect, requests: *request_book.RequestBook, ingress: *admission.IngressAdmission) void {
         switch (self) {
-            .request => |effect| effect.abortPreparation(requests, ingress),
+            .request => |effect| _ = requests.abortSending(effect.handle, ingress),
             .response => |effect| {
                 var permit = effect.admission;
                 permit.release(ingress);
@@ -515,27 +483,21 @@ pub const Actor = struct {
             }
         else
             effect_value;
-        var pending = effect.takePrepared();
         switch (completion_event) {
             .sent => {
-                const key = pending.key;
-                const origin = pending.origin;
-                const kind = pending.response.kind();
-                self.requests.commitSent(pending);
-                outbound.noteSentRequest(self, kind);
-                self.onRequestSendSuccess(env, key, origin);
-                if (self.sessions.get(key.endpoint, outbound.nowNs(env.io)) != null) {
-                    outbound.drainEndpoint(self, env, key.endpoint);
+                const completed = self.requests.completeSending(effect.handle) orelse return;
+                outbound.noteSentRequest(self, completed.kind);
+                self.onRequestSendSuccess(env, completed.key, completed.origin);
+                if (self.sessions.get(completed.key.endpoint, outbound.nowNs(env.io)) != null) {
+                    outbound.drainEndpoint(self, env, completed.key.endpoint);
                 }
             },
             .failed, .runtime_stopped => {
-                const key = pending.key;
-                const origin = pending.origin;
-                self.requests.abortPrepared(&pending, env.ingress);
+                const aborted = self.requests.abortSending(effect.handle, env.ingress) orelse return;
                 if (completion_event == .runtime_stopped) {
-                    self.onRequestSendStopped(env, key, origin);
+                    self.onRequestSendStopped(env, aborted.key, aborted.origin);
                 } else {
-                    self.onRequestSendFailure(env, key, origin);
+                    self.onRequestSendFailure(env, aborted.key, aborted.origin);
                 }
             },
         }
@@ -780,7 +742,7 @@ pub const Actor = struct {
     }
 
     pub fn cancelRequest(self: *Actor, env: Env, key: types.RequestKey) bool {
-        if (self.requests.get(key) != null) {
+        if (self.requests.containsRequest(key)) {
             return completion.finish(self, env, key, .canceled, .canceled);
         }
         const queued = self.requests.takeQueued(key) orelse return false;
@@ -874,7 +836,7 @@ pub const Actor = struct {
     pub fn finishAllRequests(self: *Actor, env: Env) void {
         var active_finished: usize = 0;
         while (active_finished < self.limits.max_active_requests) : (active_finished += 1) {
-            const snapshot = self.requests.firstActive() orelse break;
+            const snapshot = self.requests.firstRequest() orelse break;
             var active = self.requests.take(snapshot.key) orelse unreachable;
             std.debug.assert(std.meta.activeTag(active.origin) != .lookup);
             self.publishRequestTerminal(env, snapshot.key, snapshot.kind, active.origin, .runtime_stopped);
