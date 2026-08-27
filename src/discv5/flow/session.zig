@@ -121,6 +121,9 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket, a
         if (decryptParsedMessage(parsed, &candidate.keys.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
             var authenticated_message: AuthenticatedMessage = undefined;
             if (!decodeAuthenticated(&authenticated_message, endpoint, plaintext, null)) return;
+            if (@import("builtin").is_test) if (env.response_candidate_hook) |hook| {
+                hook.run(hook.context, actor, candidate);
+            };
             if (!actor.responses.matchesCandidate(candidate)) return;
             if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
             var accepted = session_book.StableSession{

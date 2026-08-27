@@ -366,6 +366,32 @@ pub const ResponseBook = struct {
             _ = self.candidates.putMove(endpoint, .{ .handle = handle, .keys = keys }, self.timeout_ms, now_ns);
         }
 
+        /// Replace an exact copied candidate through the canonical generation
+        /// counter while preserving the bounded one-entry endpoint owner.
+        pub fn replaceCandidate(
+            self: *ResponseBook,
+            stale: CandidateView,
+            keys: CandidateKeys,
+            now_ns: i64,
+        ) !CandidateView {
+            if (!self.matchesCandidate(stale)) return error.StaleResponse;
+            const successor = std.math.add(u64, self.next_generation, 1) catch return error.GenerationExhausted;
+            const handle = ResponseHandle{
+                .endpoint = stale.handle.endpoint,
+                .nonce = stale.handle.nonce,
+                .generation = self.next_generation,
+            };
+            self.next_generation = successor;
+            const removed = self.candidates.putMove(
+                handle.endpoint,
+                .{ .handle = handle, .keys = keys },
+                self.timeout_ms,
+                now_ns,
+            ) orelse unreachable;
+            std.debug.assert(sameHandle(removed.value.handle, stale.handle));
+            return .{ .handle = handle, .keys = keys };
+        }
+
         pub fn hasPhase(self: *const ResponseBook, handle: ResponseHandle) bool {
             const current = self.phases.peekPtrRaw(handleKey(handle)) orelse return false;
             return sameHandle(current.handle, handle);

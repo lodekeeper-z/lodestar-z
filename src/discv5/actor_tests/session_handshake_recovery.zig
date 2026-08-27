@@ -13,6 +13,7 @@ const metrics = @import("../metrics.zig");
 const secp = @import("../secp256k1.zig");
 const peer_store = @import("../state/peer_store.zig");
 const request_book = @import("../state/request_book.zig");
+const response_book = @import("../state/response_book.zig");
 const session_book = @import("../state/session_book.zig");
 const types = @import("../types.zig");
 const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
@@ -1667,15 +1668,28 @@ test "authenticated stale request candidate cannot replace stable session or pro
     var harness = try ActorHarness.init(alloc, io, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .rate_limiter = null,
-        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 4, .command_capacity = 1 },
+        .rate_limiter = .{
+            .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+            .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+        },
+        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 4, .command_capacity = 1, .request_result_capacity = 1 },
     });
     defer harness.deinit();
     const actor = &harness.actor;
+    var results = try request_results.RequestResultOutbox.init(io, alloc, 1);
+    defer results.deinit();
+    try std.testing.expect(results.reserve());
+    try std.testing.expect(results.claim());
+    var request_env = harness.env();
+    request_env.request_results = &results;
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
     const stable = session_book.StableSession{ .initiator_key = [_]u8{0x93} ** 16, .recipient_key = [_]u8{0x94} ** 16 };
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
-    const request = try actor_mod.Testing.sendPingResolvedForTest(actor, harness.env(), endpoint, &remote_pubkey, .api);
+    const request = try actor_mod.Testing.sendPingResolvedForTest(actor, request_env, endpoint, &remote_pubkey, .reliable_api);
+    defer {
+        _ = actor.cancelRequest(request_env, request);
+        while (results.pop()) |_| {}
+    }
     try harness.drainEffects();
     var sent = harness.recording.datagrams.items[0].bytes;
     const request_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id)).static_header.nonce;
@@ -1687,39 +1701,241 @@ test "authenticated stale request candidate cannot replace stable session or pro
         .id_nonce = &([_]u8{0x96} ** 16),
         .enr_seq = 0,
     }, null);
-    actor.handlePacket(harness.env(), challenge, endpoint.addr);
+    actor.handlePacket(request_env, challenge, endpoint.addr);
     harness.drainEffectsIgnoringFailures();
     const stale = actor.requests.pendingKeys(endpoint) orelse return error.MissingPendingRekey;
     var replacement = PendingPromotionReplacement{ .replacement_keys = .{
         .initiator_key = [_]u8{0x97} ** 16,
         .recipient_key = [_]u8{0x98} ** 16,
     } };
-    const proof_ping = message.Ping{ .req_id = try message.ReqId.fromSlice(&.{0x99}), .enr_seq = 0 };
+    const proof_pong = message.Pong{
+        .req_id = request.key.req_id,
+        .enr_seq = 0,
+        .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } },
+        .recipient_port = 9253,
+    };
     var proof_buffer: [128]u8 = undefined;
-    var stale_packet = try encodeEncryptedPacket(actor, remote_id, &stale.keys.recipient_key, try proof_ping.encodeInto(&proof_buffer), 0x9a);
-    var stale_env = harness.env();
+    var stale_packet = try encodeEncryptedPacket(actor, remote_id, &stale.keys.recipient_key, try proof_pong.encodeInto(&proof_buffer), 0x9a);
+    try std.testing.expect(harness.ingress.admit(endpoint.addr, 0) == .ordinary);
+    var stale_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |credit| credit,
+        else => return error.MissingExpectedCredit,
+    };
+    defer stale_credit.rollback(&harness.ingress);
+    const admission_before = admission.IngressAdmission.Testing.fingerprint(&harness.ingress);
+    const metrics_before = actor.metrics;
+    var stale_env = request_env;
+    stale_env.expected_credit = &stale_credit;
     stale_env.pending_promotion_hook = .{ .context = &replacement, .run = PendingPromotionReplacement.run };
     actor.handlePacket(stale_env, stale_packet.bytes[0..stale_packet.len], endpoint.addr);
 
     const newer = actor.requests.pendingKeys(endpoint) orelse return error.NewCandidateRemoved;
+    try std.testing.expect(stale_credit.armed);
+    try std.testing.expectEqual(admission_before, admission.IngressAdmission.Testing.fingerprint(&harness.ingress));
     try std.testing.expectEqual(replacement.replacement.?.handle, newer.handle);
     try std.testing.expect(newer.handle.send_generation != stale.handle.send_generation);
+    try std.testing.expect(actor.requests.shouldQueue(endpoint));
+    try std.testing.expect(actor.requests.get(request.key) != null);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
-    try std.testing.expectEqual(@as(u64, 0), actor.metrics.rcvd_message_count[metrics.MessageType.ping.index()]);
+    try std.testing.expect(std.meta.eql(metrics_before, actor.metrics));
+    try std.testing.expect(results.pop() == null);
     const retained = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.StableSessionRemoved;
     try std.testing.expectEqual(stable.initiator_key, retained.initiator_key);
     try std.testing.expectEqual(stable.recipient_key, retained.recipient_key);
 
-    var exact_packet = try encodeEncryptedPacket(actor, remote_id, &newer.keys.recipient_key, try proof_ping.encodeInto(&proof_buffer), 0x9b);
-    actor.handlePacket(harness.env(), exact_packet.bytes[0..exact_packet.len], endpoint.addr);
+    stale_credit.rollback(&harness.ingress);
+    var restored_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |credit| credit,
+        else => return error.ExpectedCreditNotRestored,
+    };
+    restored_credit.rollback(&harness.ingress);
+    var exact_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |credit| credit,
+        else => return error.ExpectedCreditNotReacquired,
+    };
+    defer exact_credit.rollback(&harness.ingress);
+    var copied_credit = exact_credit;
+    var exact_env = request_env;
+    exact_env.expected_credit = &exact_credit;
+    var exact_packet = try encodeEncryptedPacket(actor, remote_id, &newer.keys.recipient_key, try proof_pong.encodeInto(&proof_buffer), 0x9b);
+    actor.handlePacket(exact_env, exact_packet.bytes[0..exact_packet.len], endpoint.addr);
+    try std.testing.expect(!exact_credit.armed);
+    const after_commit = admission.IngressAdmission.Testing.fingerprint(&harness.ingress);
+    copied_credit.rollback(&harness.ingress);
+    try std.testing.expectEqual(after_commit, admission.IngressAdmission.Testing.fingerprint(&harness.ingress));
     try std.testing.expect(actor.requests.pendingKeys(endpoint) == null);
-    try std.testing.expectEqual(@as(u64, 1), actor.metrics.rcvd_message_count[metrics.MessageType.ping.index()]);
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(u64, 1), actor.metrics.rcvd_message_count[metrics.MessageType.pong.index()]);
     const promoted = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingPromotedSession;
     try std.testing.expectEqual(newer.keys.initiator_key, promoted.initiator_key);
     try std.testing.expectEqual(newer.keys.recipient_key, promoted.recipient_key);
-    try std.testing.expect(actor.cancelRequest(harness.env(), request));
-    actor.responses.prune(std.math.maxInt(i64), &harness.ingress);
+    const result = results.pop() orelse return error.MissingPongResult;
+    try std.testing.expectEqual(types.RequestKind.ping, result.kind);
+    try std.testing.expectEqualSlices(u8, request.key.req_id.slice(), result.handle.request_id.slice());
+    try std.testing.expect(result.terminal == .pong);
+    try std.testing.expect(results.pop() == null);
+}
+
+const ResponseCandidateReplacement = struct {
+    replacement_keys: response_book.CandidateKeys,
+    now_ns: i64,
+    replacement: ?response_book.CandidateView = null,
+
+    fn run(context: *anyopaque, actor: *actor_mod.Actor, stale: response_book.CandidateView) void {
+        const self: *ResponseCandidateReplacement = @ptrCast(@alignCast(context));
+        self.replacement = response_book.ResponseBook.Testing.replaceCandidate(
+            &actor.responses,
+            stale,
+            self.replacement_keys,
+            self.now_ns,
+        ) catch unreachable;
+    }
+};
+
+test "authenticated stale response candidate preserves expected credit until exact replacement promotion" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xa3} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xa4} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 54 }, .port = 9254 } },
+    };
+    var harness = try ActorHarness.init(alloc, io, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = .{
+            .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+            .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+        },
+        .limits = .{
+            .max_active_requests = 1,
+            .max_queued_requests = 1,
+            .response_recovery_capacity = 1,
+            .event_capacity = 4,
+            .command_capacity = 1,
+            .request_result_capacity = 1,
+        },
+    });
+    defer harness.deinit();
+    const actor = &harness.actor;
+    var results = try request_results.RequestResultOutbox.init(io, alloc, 1);
+    defer results.deinit();
+    try std.testing.expect(results.reserve());
+    try std.testing.expect(results.claim());
+    var request_env = harness.env();
+    request_env.request_results = &results;
+    const now_ns = outbound.nowNs(io);
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, now_ns));
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xa5} ** 16,
+        .recipient_key = [_]u8{0xa6} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, now_ns);
+    const request = try actor_mod.Testing.sendPingResolvedForTest(actor, request_env, endpoint, &remote_pubkey, .reliable_api);
+    defer {
+        _ = actor.cancelRequest(request_env, request);
+        while (results.pop()) |_| {}
+    }
+    try harness.drainEffects();
+
+    var response_permit = try harness.ingress.acquire(endpoint.addr, admission.RESPONSE_RECOVERY_PACKET_BUDGET);
+    errdefer response_permit.release(&harness.ingress);
+    const response_nonce = [_]u8{0xa7} ** packet.NONCE_SIZE;
+    const response = try actor.responses.beginResponse(.{
+        .endpoint = endpoint,
+        .nonce = response_nonce,
+        .dest_pubkey = remote_pubkey,
+        .plaintext = try .init(&.{message.MSG_PONG}),
+    }, &response_permit, now_ns);
+    try std.testing.expect(actor.responses.completeResponseSend(response, .sent, &harness.ingress));
+    const challenge_view = actor.responses.challenge(endpoint.addr, &response_nonce, now_ns, &harness.ingress) orelse return error.MissingRecovery;
+    const handshake_handle = try actor.responses.beginHandshake(challenge_view, .{
+        .initiator_key = [_]u8{0xa8} ** 16,
+        .recipient_key = [_]u8{0xa9} ** 16,
+    }, now_ns);
+    try std.testing.expect(actor.responses.completeHandshake(handshake_handle, .sent, &harness.ingress));
+    const stale = actor.responses.candidate(endpoint, now_ns) orelse return error.MissingCandidate;
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+
+    const pong = message.Pong{
+        .req_id = request.key.req_id,
+        .enr_seq = 0,
+        .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } },
+        .recipient_port = 9254,
+    };
+    var plaintext_buffer: [128]u8 = undefined;
+    const plaintext = try pong.encodeInto(&plaintext_buffer);
+    var stale_packet = try encodeEncryptedPacket(actor, remote_id, &stale.keys.recipient_key, plaintext, 0xaa);
+    try std.testing.expect(harness.ingress.admit(endpoint.addr, 0) == .ordinary);
+    var stale_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |credit| credit,
+        else => return error.MissingExpectedCredit,
+    };
+    defer stale_credit.rollback(&harness.ingress);
+    const admission_before = admission.IngressAdmission.Testing.fingerprint(&harness.ingress);
+    const metrics_before = actor.metrics;
+    var replacement = ResponseCandidateReplacement{
+        .replacement_keys = .{
+            .initiator_key = [_]u8{0xab} ** 16,
+            .recipient_key = [_]u8{0xac} ** 16,
+        },
+        .now_ns = now_ns,
+    };
+    var stale_env = request_env;
+    stale_env.expected_credit = &stale_credit;
+    stale_env.response_candidate_hook = .{ .context = &replacement, .run = ResponseCandidateReplacement.run };
+    actor.handlePacket(stale_env, stale_packet.bytes[0..stale_packet.len], endpoint.addr);
+
+    const newer = actor.responses.candidate(endpoint, now_ns) orelse return error.NewCandidateRemoved;
+    try std.testing.expect(stale_credit.armed);
+    try std.testing.expectEqual(admission_before, admission.IngressAdmission.Testing.fingerprint(&harness.ingress));
+    try std.testing.expectEqual(replacement.replacement.?.handle, newer.handle);
+    try std.testing.expect(newer.handle.generation != stale.handle.generation);
+    try std.testing.expectEqual(@as(usize, 1), actor.responses.candidateCount());
+    try std.testing.expect(actor.requests.get(request.key) != null);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expect(std.meta.eql(metrics_before, actor.metrics));
+    try std.testing.expect(results.pop() == null);
+    const retained = actor.sessions.get(endpoint, now_ns) orelse return error.StableSessionRemoved;
+    try std.testing.expectEqual(stable.initiator_key, retained.initiator_key);
+    try std.testing.expectEqual(stable.recipient_key, retained.recipient_key);
+
+    stale_credit.rollback(&harness.ingress);
+    var restored_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |credit| credit,
+        else => return error.ExpectedCreditNotRestored,
+    };
+    restored_credit.rollback(&harness.ingress);
+    var exact_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |credit| credit,
+        else => return error.ExpectedCreditNotReacquired,
+    };
+    defer exact_credit.rollback(&harness.ingress);
+    var copied_credit = exact_credit;
+    var exact_env = request_env;
+    exact_env.expected_credit = &exact_credit;
+    var exact_packet = try encodeEncryptedPacket(actor, remote_id, &newer.keys.recipient_key, plaintext, 0xad);
+    actor.handlePacket(exact_env, exact_packet.bytes[0..exact_packet.len], endpoint.addr);
+    try std.testing.expect(!exact_credit.armed);
+    const after_commit = admission.IngressAdmission.Testing.fingerprint(&harness.ingress);
+    copied_credit.rollback(&harness.ingress);
+    try std.testing.expectEqual(after_commit, admission.IngressAdmission.Testing.fingerprint(&harness.ingress));
+    try std.testing.expect(actor.responses.candidate(endpoint, now_ns) == null);
+    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(u64, 1), actor.metrics.rcvd_message_count[metrics.MessageType.pong.index()]);
+    const promoted = actor.sessions.get(endpoint, now_ns) orelse return error.MissingPromotedSession;
+    try std.testing.expectEqual(newer.keys.initiator_key, promoted.initiator_key);
+    try std.testing.expectEqual(newer.keys.recipient_key, promoted.recipient_key);
+    const result = results.pop() orelse return error.MissingPongResult;
+    try std.testing.expectEqual(types.RequestKind.ping, result.kind);
+    try std.testing.expectEqualSlices(u8, request.key.req_id.slice(), result.handle.request_id.slice());
+    try std.testing.expect(result.terminal == .pong);
+    try std.testing.expect(results.pop() == null);
 }
 
 test "stable session wins a same-read-key candidate collision" {

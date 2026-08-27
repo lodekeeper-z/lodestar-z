@@ -118,7 +118,7 @@ Runtime delivers command | packet | maintenance | completion
 | Ordered Actor effect queues | request-only | 1 queue for every datagram effect |
 | Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
 | Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
-| DiscV5 tests after migration | 307 | 428 after request/response/retry/challenge ledger canonicalization, exact admission correlation, compact in-place handshake rollback, and runtime/auth race tracers |
+| DiscV5 tests after migration | 307 | 429 after request/response/retry/challenge ledger canonicalization, exact admission correlation, compact in-place handshake rollback, and runtime/auth race tracers |
 | Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 1,400 bytes; every variant is packet plus semantic handle, including unified handshake at 1,392 bytes, WHOAREYOU at 1,360 bytes, and retry at 1,384 bytes. The project-wide final `<= 1,536` ceiling is intentionally not yet promoted from the staged exact lock. |
 
 ### Canonical completion ownership

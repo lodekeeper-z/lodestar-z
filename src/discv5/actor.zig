@@ -53,6 +53,10 @@ pub const Env = if (builtin.is_test) struct {
         context: *anyopaque,
         run: *const fn (*anyopaque, *Actor, request_book.PendingKeysView) void,
     } = null,
+    response_candidate_hook: ?struct {
+        context: *anyopaque,
+        run: *const fn (*anyopaque, *Actor, response_book.CandidateView) void,
+    } = null,
 
     pub fn commitExpected(self: Env, target: admission.PermitHandle) bool {
         const credit = self.expected_credit orelse return true;
