@@ -455,6 +455,13 @@ test "stale P1 eviction success preserves P2 reservation when RequestKey is reus
     try std.testing.expect(!harness.hasPending());
 
     const candidate_pubkey = secp.compressedPubkey(&harness.candidate_key);
+    const incumbent_addr = harness.actor.peers.activeRoute(&harness.candidate_id).?.addr;
+    const disconnect_key = types.RequestKey.init(
+        .{ .node_id = harness.candidate_id, .addr = incumbent_addr },
+        try message.ReqId.fromSlice(&.{0xee}),
+    );
+    try std.testing.expect(harness.actor.peers.armHealthRequest(disconnect_key, .connected_only));
+    try std.testing.expect(harness.actor.peers.markDisconnected(disconnect_key, 2) == .disconnected);
     var sibling = harness.candidate_id;
     for (0..peer_store.K) |index| {
         sibling[31] = harness.candidate_id[31] ^ @as(u8, @intCast(index));

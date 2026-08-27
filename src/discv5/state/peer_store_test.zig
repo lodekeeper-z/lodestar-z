@@ -587,6 +587,71 @@ test "PeerStore newer ENR resets relay proof and equal-sequence trust promotes t
     try std.testing.expect(store.activeRoute(&node_id).?.advertised_endpoint_trusted);
 }
 
+test "stale and equal-sequence equivocation cannot relay a different canonical ENR" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x58} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const addr_a = address(11_410);
+    const addr_b = address(11_411);
+    const canonical_raw = try encodeEnr(alloc, key_pair, 2, addr_b);
+    defer alloc.free(canonical_raw);
+    const stale_raw = try encodeEnr(alloc, key_pair, 1, addr_a);
+    defer alloc.free(stale_raw);
+    const equivocation_raw = try encodeEnr(alloc, key_pair, 2, addr_a);
+    defer alloc.free(equivocation_raw);
+
+    for ([_][]const u8{ stale_raw, equivocation_raw }) |rejected_raw| {
+        var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+        defer store.deinit();
+        try std.testing.expect(store.learnEnr(canonical_raw, 1) != null);
+        const before = store.advertisedEvidence(store.lookup(&node_id).?).?;
+
+        try std.testing.expect(store.addTrusted(node_id, &pubkey, addr_a, rejected_raw, 2));
+        const retained = store.activeRoute(&node_id).?;
+        const after = store.advertisedEvidence(store.lookup(&node_id).?).?;
+        try std.testing.expectEqualSlices(u8, canonical_raw, store.findEnr(&node_id).?);
+        try std.testing.expect(retained.addr.eql(&addr_b));
+        try std.testing.expect(!retained.runtime_contact_trusted);
+        try std.testing.expect(!retained.relayable);
+        try std.testing.expect(!retained.advertised_endpoint_trusted);
+        try std.testing.expectEqual(before.ip4, after.ip4);
+        try std.testing.expectEqual(before.ip6, after.ip6);
+    }
+}
+
+test "trusted retained endpoint promotes canonical relay proof without replacing canonical evidence" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x59} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const addr_a = address(11_420);
+    const addr_b = address(11_421);
+    const canonical_raw = try encodeEnr(alloc, key_pair, 2, addr_b);
+    defer alloc.free(canonical_raw);
+    const stale_matching_raw = try encodeEnr(alloc, key_pair, 1, addr_b);
+    defer alloc.free(stale_matching_raw);
+    const stale_irrelevant_raw = try encodeEnr(alloc, key_pair, 1, addr_a);
+    defer alloc.free(stale_irrelevant_raw);
+    var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+
+    try std.testing.expect(store.learnEnr(canonical_raw, 1) != null);
+    try std.testing.expect(store.addTrusted(node_id, &pubkey, addr_b, stale_matching_raw, 2));
+    var retained = store.activeRoute(&node_id).?;
+    try std.testing.expect(retained.relayable);
+    try std.testing.expect(retained.advertised_endpoint_trusted);
+    try std.testing.expectEqualSlices(u8, canonical_raw, store.findEnr(&node_id).?);
+    try std.testing.expect(store.advertisedEvidence(store.lookup(&node_id).?).?.ip4.address().eql(&addr_b));
+
+    try std.testing.expect(store.addTrusted(node_id, &pubkey, addr_a, stale_irrelevant_raw, 3));
+    retained = store.activeRoute(&node_id).?;
+    try std.testing.expect(retained.relayable);
+    try std.testing.expect(retained.advertised_endpoint_trusted);
+    try std.testing.expectEqualSlices(u8, canonical_raw, store.findEnr(&node_id).?);
+    try std.testing.expect(store.advertisedEvidence(store.lookup(&node_id).?).?.ip4.address().eql(&addr_b));
+}
+
 test "PeerStore fallback-only learned ENR retains contact facts without raw ENR ownership" {
     const alloc = std.testing.allocator;
     const key_pair = try secp.keyPairFromSecret(&([_]u8{0x52} ** 32));
@@ -649,6 +714,33 @@ test "newer discovered ENR preserves authenticated runtime and initializes unkno
     const unknown = store.activeRoute(&unknown_id).?;
     try std.testing.expect(!unknown.connected);
     try std.testing.expect(unknown.addr.eql(&unknown_addr));
+}
+
+test "discovered ENR preserves authenticated no-ENR fallback liveness" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x57} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const authenticated_addr = address(11_610);
+    const advertised_addr = address(11_611);
+    const discovered_raw = try encodeEnr(alloc, key_pair, 2, advertised_addr);
+    defer alloc.free(discovered_raw);
+    var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+
+    const responsive = store.acceptValidatedHandshake(node_id, &pubkey, authenticated_addr, null, 20);
+    try std.testing.expect(responsive.transition == .none);
+    try std.testing.expect(peer_store.Testing.connected(&store, &node_id).?);
+    try std.testing.expect(store.activeRoute(&node_id) == null);
+
+    try std.testing.expect(store.learnEnr(discovered_raw, 30) != null);
+    const retained = store.activeRoute(&node_id).?;
+    try std.testing.expect(retained.connected);
+    try std.testing.expect(retained.addr.eql(&authenticated_addr));
+    try std.testing.expectEqual(@as(i64, 20), store.resolve(store.lookup(&node_id).?).?.last_seen);
+    try std.testing.expectEqual(@as(i64, 0), retained.next_ping_at_ns);
+    try std.testing.expectEqualSlices(u8, discovered_raw, store.findEnr(&node_id).?);
+    try std.testing.expect(store.advertisedEvidence(store.lookup(&node_id).?).?.ip4.address().eql(&advertised_addr));
 }
 
 test "newer ENR exactly replaces advertised families and preserves proof only for unchanged endpoint" {

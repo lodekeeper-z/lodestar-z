@@ -819,10 +819,10 @@ pub const PeerStore = struct {
         const distance = logDistance(&self.backing.routing.local_id, &record.node_id) orelse return .{ .inserted = false };
         const bucket = &self.backing.routing.buckets[distance];
 
+        // Admission is monotonic: false means no new liveness proof. Only an
+        // exact protocol disconnect completion may clear authenticated state.
         if (findRoute(bucket, ref)) |index| {
             _ = removeRouteAt(bucket, index);
-            // Admission refresh is monotonic. Only an explicit protocol
-            // disconnect completion may downgrade authenticated liveness.
             if (connected) setConnected(record, true);
             insertRouteOrdered(self, bucket, .{ .peer = ref, .routing_recency = now_ns });
             return .{ .inserted = true };
@@ -831,7 +831,7 @@ pub const PeerStore = struct {
             if (connected) setConnected(record, true);
             return .{ .inserted = true };
         }
-        setConnected(record, connected);
+        if (connected) setConnected(record, true);
         if (bucket.count < K) {
             if (!self.pinActive(ref)) return error.PinCapacityExceeded;
             insertRouteOrdered(self, bucket, .{ .peer = ref, .routing_recency = now_ns });
@@ -1142,9 +1142,10 @@ pub const PeerStore = struct {
         const ref = existing orelse self.remember(validated.node_id, &key, runtime_address, trusted) catch return null;
         var record = self.resolveMut(ref) orelse return null;
         if (record.enr_index != NONE and record.enr_seq >= validated.parsed.seq) {
-            if (trusted) {
-                if (validated.parsed.udpAddress4()) |value| _ = self.setAdvertisedEvidence(ref, value, true);
-                if (validated.parsed.udpAddress6()) |value| _ = self.setAdvertisedEvidence(ref, value, true);
+            // The rejected record cannot replace canonical evidence. Promote
+            // only the retained ENR endpoint that the caller trusted exactly.
+            if (trusted and self.advertisesAddress(ref, runtime_address)) {
+                _ = self.setAdvertisedEvidence(ref, runtime_address, true);
                 record = self.resolveMut(ref) orelse return null;
                 if (record.address().eql(&runtime_address)) record.flags |= FLAG_TRUSTED;
                 record.flags |= FLAG_RELAYABLE;
@@ -1465,6 +1466,11 @@ pub const PeerStore = struct {
 };
 
 pub const Testing = if (builtin.is_test) struct {
+    pub fn connected(store: *const PeerStore, node_id: *const types.NodeId) ?bool {
+        const ref = store.lookup(node_id) orelse return null;
+        return isConnected(store, ref);
+    }
+
     pub fn replaceEvictionRequestPeer(store: *PeerStore, ticket: EvictionTicket, replacement: PeerRef) bool {
         if (ticket.probe.index >= PROBE_CAPACITY) return false;
         if (store.backing.probe_generations[ticket.probe.index] != ticket.probe.generation) return false;
