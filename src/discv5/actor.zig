@@ -193,11 +193,16 @@ const handshake_handle_size = 104;
 const handshake_send_effect_size = 1_392;
 const challenge_handle_size = 72;
 const whoareyou_send_effect_size = 1_360;
-const staged_actor_effect_size = 1_400;
+const exact_actor_effect_size = 1_400;
+/// Production compile-time ceiling for the move-owned Runtime effect FIFO.
+pub const MAX_ACTOR_EFFECT_SIZE: usize = 1_536;
 
 comptime {
-    if (@sizeOf(ActorEffect) != staged_actor_effect_size) {
-        @compileError("ActorEffect must remain at the staged 1400-byte compact-handshake layout");
+    if (@sizeOf(ActorEffect) > MAX_ACTOR_EFFECT_SIZE) {
+        @compileError("ActorEffect exceeds the production 1536-byte ceiling");
+    }
+    if (@sizeOf(ActorEffect) != exact_actor_effect_size) {
+        @compileError("ActorEffect must remain at the exact 1400-byte compact layout");
     }
     if (@sizeOf(request_book.HandshakeHandle) != request_handshake_handle_size or
         @sizeOf(HandshakeHandle) != handshake_handle_size or
@@ -1278,7 +1283,7 @@ fn isLookupBackpressure(err: anyerror) bool {
     };
 }
 
-test "discv5 actor: staged effect layouts remain exact" {
+test "discv5 actor: integrated effect layouts remain exact" {
     try std.testing.expectEqual(challenge_handle_size, @sizeOf(session_book.ChallengeHandle));
     try std.testing.expectEqual(whoareyou_send_effect_size, @sizeOf(WhoareyouSendEffect));
     try std.testing.expectEqual(@as(usize, 2), @typeInfo(WhoareyouSendEffect).@"struct".fields.len);
@@ -1291,7 +1296,7 @@ test "discv5 actor: staged effect layouts remain exact" {
     try std.testing.expectEqual(handshake_handle_size, @sizeOf(HandshakeHandle));
     try std.testing.expectEqual(handshake_send_effect_size, @sizeOf(HandshakeSendEffect));
     try std.testing.expectEqual(@as(usize, 2), @typeInfo(HandshakeSendEffect).@"struct".fields.len);
-    try std.testing.expectEqual(staged_actor_effect_size, @sizeOf(ActorEffect));
+    try std.testing.expectEqual(exact_actor_effect_size, @sizeOf(ActorEffect));
     const request_layout = request_book.RequestBook.layout();
     try std.testing.expectEqual(@as(usize, 96), request_layout.retry_handle);
     try std.testing.expectEqual(@as(usize, 96), request_layout.handshake_handle);

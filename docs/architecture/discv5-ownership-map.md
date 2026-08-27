@@ -119,7 +119,7 @@ Runtime delivers command | packet | maintenance | completion
 | Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
 | Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
 | DiscV5 tests after migration | 307 | 429 after request/response/retry/challenge ledger canonicalization, exact admission correlation, compact in-place handshake rollback, and runtime/auth race tracers |
-| Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 1,400 bytes; every variant is packet plus semantic handle, including unified handshake at 1,392 bytes, WHOAREYOU at 1,360 bytes, and retry at 1,384 bytes. The project-wide final `<= 1,536` ceiling is intentionally not yet promoted from the staged exact lock. |
+| Bounded effect size | request effect within four packet budgets | `ActorEffect` is exactly 1,400 bytes under the production compile-time `<= 1,536` ceiling; every variant is immutable packet bytes plus its semantic handle, including unified handshake at 1,392 bytes, WHOAREYOU at 1,360 bytes, and retry at 1,384 bytes. |
 
 ### Canonical completion ownership
 
@@ -184,11 +184,13 @@ The registered layout report runs in Debug, ReleaseSafe, and ReleaseFast and dis
 | `ActiveRequest` | 10,496 |
 | `StoredRequest` | 11,776 |
 | `RequestBook` | 272 Debug/ReleaseSafe, 248 ReleaseFast |
-| `ActorEffect` staged union | 1,400 |
+| `ActorEffect` union (production ceiling: `<= 1,536`) | 1,400 |
 | Runtime effect FIFO capacity at supported defaults | 1,024 entries |
 
-Compact effects are forbidden from regaining admission/permit, challenge/preparation source, keys, deadline, plaintext, destination, ENR, or transition ownership. The canonical challenge backing is checked as `C + 1`; configuration rejects `C = 0`, and checked addition rejects overflow before allocation. Request storage remains bounded by `max_active_requests`; this migration adds no map, cache, or allocation.
+Compact effects are forbidden from regaining admission/permit, challenge/preparation source, keys, deadline, plaintext, destination, ENR, or transition ownership. Admission correlation remains canonical in the permit/credit ledger and did not enlarge `ActorEffect`. The canonical challenge backing is checked as `C + 1`; configuration rejects `C = 0`, and checked addition rejects overflow before allocation. Request storage remains bounded by `max_active_requests`; this migration adds no map, cache, or allocation.
 
-## Remaining ownership work
+## Integrated status
 
-Only final integration remains: promote the project-wide `ActorEffect <= 1,536` ceiling while retaining the observed 1,400-byte lock, then perform the final cross-slice integration review. Runtime transport, effect ledgers, and exact expected-credit/admission authority are complete.
+The request, response, retry, WHOAREYOU, handshake, and admission ownership stages are integrated. Runtime transport, the single 1,024-entry effect FIFO, generation-correlated canonical books, and exact expected-credit/admission authority are complete; no admission or final ownership migration stage remains.
+
+The registered layout gates retain `ActorEffect` at exactly 1,400 bytes under its production `<= 1,536` ceiling in Debug, ReleaseSafe, and ReleaseFast. The complete DiscV5 suite contains 429 tests and passes in all three modes. The repository default build completes all 54 steps, and lint completes with zero errors and ten warnings.
