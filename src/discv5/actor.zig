@@ -106,7 +106,7 @@ pub const ActorEffect = union(enum) {
         return switch (self.*) {
             .request => |*effect| effect.destination(),
             .response => |*effect| effect.handle.endpoint.addr,
-            .retry => |*effect| effect.destination(),
+            .retry => |*effect| effect.handle.request.key.endpoint.addr,
             .handshake => |*effect| effect.destination(),
             .whoareyou => |*effect| effect.destination(),
         };
@@ -116,7 +116,7 @@ pub const ActorEffect = union(enum) {
         return switch (self.*) {
             .request => |*effect| effect.packetBytes(),
             .response => |*effect| effect.packet.slice(),
-            .retry => |*effect| effect.packetBytes(),
+            .retry => |*effect| effect.packet.slice(),
             .handshake => |*effect| effect.packetBytes(),
             .whoareyou => |*effect| effect.packetBytes(),
         };
@@ -139,46 +139,7 @@ pub fn CompactSendEffect(comptime Handle: type) type {
 
 pub const ResponseSendEffect = CompactSendEffect(response_book.ResponseHandle);
 
-pub const RetrySendEffect = union(enum) {
-    retained: struct {
-        key: types.RequestKey,
-        packet: types.PacketBytes,
-        deadline_ns: i64,
-        kind: types.RequestKind,
-    },
-    fresh: struct {
-        key: types.RequestKey,
-        packet: types.PacketBytes,
-        deadline_ns: i64,
-        kind: types.RequestKind,
-        transition: request_book.FreshRetryTransition,
-        admission: admission.AdmissionPermit,
-    },
-
-    pub fn destination(self: *const RetrySendEffect) types.Address {
-        return switch (self.*) {
-            .retained => |*value| value.key.endpoint.addr,
-            .fresh => |*value| value.key.endpoint.addr,
-        };
-    }
-
-    pub fn packetBytes(self: *const RetrySendEffect) []const u8 {
-        return switch (self.*) {
-            .retained => |*value| value.packet.slice(),
-            .fresh => |*value| value.packet.slice(),
-        };
-    }
-
-    pub fn abortPreparation(self: RetrySendEffect, ingress: *admission.IngressAdmission) void {
-        switch (self) {
-            .retained => {},
-            .fresh => |value| {
-                var permit = value.admission;
-                permit.release(ingress);
-            },
-        }
-    }
-};
+pub const RetrySendEffect = CompactSendEffect(request_book.RetryHandle);
 
 pub const WhoareyouSource = union(enum) {
     request: request_book.ChallengePreparation,
@@ -199,6 +160,7 @@ pub const RequestHandshakeSendEffect = struct {
 pub const ResponseHandshakeSendEffect = CompactSendEffect(response_book.HandshakeHandle);
 
 const staged_response_send_effect_size = 1_376;
+const staged_retry_send_effect_size = 1_384;
 const staged_response_handshake_send_effect_size = 1_384;
 // ActorEffect 4_080 is a temporary staged baseline dominated by legacy request handshake.
 // It MUST be updated/replaced by the final <= 1_536 assertion when request handshake is compacted.
@@ -215,6 +177,13 @@ comptime {
     {
         @compileError("response effect must remain handle plus packet bytes at the staged 1376-byte layout");
     }
+    if (@typeInfo(RetrySendEffect).@"struct".fields.len != 2 or
+        !@hasField(RetrySendEffect, "handle") or
+        !@hasField(RetrySendEffect, "packet") or
+        @sizeOf(RetrySendEffect) != staged_retry_send_effect_size)
+    {
+        @compileError("retry effect must remain handle plus packet bytes at the staged 1384-byte layout");
+    }
     if (@typeInfo(ResponseHandshakeSendEffect).@"struct".fields.len != 2 or
         !@hasField(ResponseHandshakeSendEffect, "handle") or
         !@hasField(ResponseHandshakeSendEffect, "packet") or
@@ -222,7 +191,10 @@ comptime {
     {
         @compileError("response-source handshake effect must remain handle plus packet bytes at the staged 1384-byte layout");
     }
-    for (.{ "admission", "plaintext", "key", "keys", "deadline_ns", "source", "dest_pubkey", "remote_enr" }) |field| {
+    for (.{ "admission", "permit", "transition", "deadline", "deadline_ns", "kind", "nonce", "probe", "plaintext", "enr", "remote_enr", "key", "keys", "source", "dest_pubkey" }) |field| {
+        if (@hasField(RetrySendEffect, field)) {
+            @compileError("compact retry effect may not regain canonical retry ownership");
+        }
         if (@hasField(ResponseSendEffect, field) or @hasField(ResponseHandshakeSendEffect, field)) {
             @compileError("compact response effects may not regain canonical response ownership");
         }
@@ -464,27 +436,13 @@ pub const Actor = struct {
                     outbound.noteSent(self, view.plaintext.slice());
                 }
             },
-            .retry => |retry| switch (retry) {
-                .retained => |value| {
-                    self.requests.commitRetry(value.key, value.deadline_ns);
-                    if (completion_event == .sent) outbound.noteSentRequest(self, value.kind);
-                },
-                .fresh => |value| {
-                    var permit = value.admission;
-                    if (completion_event == .sent) {
-                        self.requests.commitFreshRetry(
-                            value.key,
-                            value.transition,
-                            value.deadline_ns,
-                            permit.move(),
-                            env.ingress,
-                        );
-                        outbound.noteSentRequest(self, value.kind);
-                    } else {
-                        permit.release(env.ingress);
-                        self.requests.commitRetry(value.key, value.deadline_ns);
-                    }
-                },
+            .retry => |retry| {
+                const completed = self.requests.completeRetry(retry.handle, switch (completion_event) {
+                    .sent => .sent,
+                    .failed => .failed,
+                    .runtime_stopped => .runtime_stopped,
+                }, env.ingress) orelse return;
+                if (completion_event == .sent) outbound.noteSentRequest(self, completed.kind);
             },
             .handshake => |handshake_effect| switch (handshake_effect) {
                 .request => |value| {
@@ -1342,11 +1300,20 @@ fn isLookupBackpressure(err: anyerror) bool {
 
 test "discv5 actor: staged effect layouts remain exact" {
     try std.testing.expectEqual(staged_response_send_effect_size, @sizeOf(ResponseSendEffect));
+    try std.testing.expectEqual(staged_retry_send_effect_size, @sizeOf(RetrySendEffect));
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(RetrySendEffect).@"struct".fields.len);
+    try std.testing.expect(@hasField(RetrySendEffect, "handle"));
+    try std.testing.expect(@hasField(RetrySendEffect, "packet"));
     try std.testing.expectEqual(staged_response_handshake_send_effect_size, @sizeOf(ResponseHandshakeSendEffect));
     // This is temporary and MUST become <= 1_536 when request handshake is compacted.
     try std.testing.expectEqual(staged_actor_effect_size, @sizeOf(ActorEffect));
     try std.testing.expect(@hasField(RequestHandshakeSendEffect, "source"));
     try std.testing.expect(@hasField(RequestHandshakeSendEffect, "plaintext"));
+    const request_layout = request_book.RequestBook.layout();
+    std.debug.print(
+        "RETRY_LAYOUT handle={} effect={} actor_effect={} request_book={} phase={} stored_request={} fifo={}\n",
+        .{ request_layout.retry_handle, @sizeOf(RetrySendEffect), @sizeOf(ActorEffect), request_layout.request_book, request_layout.phase, request_layout.stored_request, config_mod.MAX_ACTIVE_REQUESTS },
+    );
 }
 
 test "discv5 actor: local node ID is derived from the configured key pair" {

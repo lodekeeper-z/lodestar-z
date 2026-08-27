@@ -9,6 +9,17 @@ const Allocator = std.mem.Allocator;
 const AdmissionPermit = admission_mod.AdmissionPermit;
 pub const RequestHandle = types.RequestHandle;
 
+pub const RetryHandle = struct {
+    request: RequestHandle,
+    send_generation: u64,
+};
+
+pub const RetrySendCompletion = enum {
+    sent,
+    failed,
+    runtime_stopped,
+};
+
 pub const MAX_NODES_RESPONSE: usize = config_mod.MAX_NODES_RESPONSE;
 pub const RequestDistances = request_queue.RequestDistances;
 
@@ -180,14 +191,36 @@ const SendingRequest = struct {
     queued_intent: bool,
 };
 
+const SendingRetry = struct {
+    generation: u64,
+    origin: types.RequestOrigin,
+    response: Response,
+    phase: Phase,
+    admission: AdmissionPermit,
+    deadline_ns: i64,
+    attempts: u32,
+    queued_intent: bool,
+    send_generation: u64,
+    next_deadline_ns: i64,
+    preparation: union(enum) {
+        retained,
+        fresh: struct {
+            transition: FreshRetryTransition,
+            admission: AdmissionPermit,
+        },
+    },
+};
+
 const StoredRequest = union(enum) {
     sending: SendingRequest,
     active: ActiveRequest,
+    sending_retry: SendingRetry,
 };
 
 pub const TerminalRequest = union(enum) {
     sending: SendingRequest,
     active: ActiveRequest,
+    sending_retry: SendingRetry,
 
     pub fn origin(self: *const TerminalRequest) types.RequestOrigin {
         return switch (self.*) {
@@ -199,6 +232,7 @@ pub const TerminalRequest = union(enum) {
         return switch (self.*) {
             .sending => |request| request.response.kind(),
             .active => |request| request.response.kind(),
+            .sending_retry => |request| request.response.kind(),
         };
     }
 
@@ -210,9 +244,26 @@ pub const TerminalRequest = union(enum) {
 
     pub fn release(self: *TerminalRequest, admission: *admission_mod.IngressAdmission) void {
         switch (self.*) {
-            inline else => |*request| request.admission.release(admission),
+            .sending => |*request| request.admission.release(admission),
+            .active => |*request| request.admission.release(admission),
+            .sending_retry => |*request| {
+                request.admission.release(admission);
+                switch (request.preparation) {
+                    .retained => {},
+                    .fresh => |*fresh| fresh.admission.release(admission),
+                }
+            },
         }
     }
+};
+
+pub const RetryPreparationView = struct {
+    handle: RetryHandle,
+    packet: types.PacketBytes,
+};
+
+pub const RetryCompletionView = struct {
+    kind: types.RequestKind,
 };
 
 pub const QueuedRequest = request_queue.QueuedRequest;
@@ -244,8 +295,25 @@ pub const RequestBook = struct {
     lanes: LaneMap,
     challenge_by_nonce: std.AutoHashMap(types.ChallengeKey, RequestHandle),
     next_generation: u64 = 1,
+    next_retry_generation: u64 = 1,
     queued_total: usize = 0,
     drain_cursor: usize = 0,
+
+    pub const Layout = struct {
+        retry_handle: usize,
+        phase: usize,
+        stored_request: usize,
+        request_book: usize,
+    };
+
+    pub fn layout() Layout {
+        return .{
+            .retry_handle = @sizeOf(RetryHandle),
+            .phase = @sizeOf(Phase),
+            .stored_request = @sizeOf(StoredRequest),
+            .request_book = @sizeOf(RequestBook),
+        };
+    }
 
     pub fn init(alloc: Allocator, limits: config_mod.Limits) !RequestBook {
         if (limits.max_active_requests == 0 or limits.max_active_requests > config_mod.MAX_ACTIVE_REQUESTS or
@@ -268,7 +336,15 @@ pub const RequestBook = struct {
         var active = self.active.iterator();
         while (active.next()) |entry| {
             switch (entry.value_ptr.*) {
-                inline else => |*request| request.admission.release(admission),
+                .sending => |*request| request.admission.release(admission),
+                .active => |*request| request.admission.release(admission),
+                .sending_retry => |*request| {
+                    request.admission.release(admission);
+                    switch (request.preparation) {
+                        .retained => {},
+                        .fresh => |*fresh| fresh.admission.release(admission),
+                    }
+                },
             }
         }
         self.active.deinit();
@@ -477,6 +553,7 @@ pub const RequestBook = struct {
         return .{ .key = entry.key_ptr.*, .kind = switch (entry.value_ptr.*) {
             .sending => |request| request.response.kind(),
             .active => |request| request.response.kind(),
+            .sending_retry => |request| request.response.kind(),
         } };
     }
 
@@ -597,7 +674,136 @@ pub const RequestBook = struct {
         return switch (request.*) {
             .sending => null,
             .active => |*active| active,
+            .sending_retry => null,
         };
+    }
+
+    pub fn prepareRetainedRetry(self: *RequestBook, handle: RequestHandle, deadline_ns: i64) !RetryPreparationView {
+        const request = self.active.getPtr(handle.key) orelse return error.StaleRequest;
+        if (request.* != .active or request.active.generation != handle.generation) return error.StaleRequest;
+        const next_generation = std.math.add(u64, self.next_retry_generation, 1) catch return error.GenerationExhausted;
+        const packet = switch (request.active.phase) {
+            .awaiting_whoareyou => |phase| phase.retry_packet,
+            .awaiting_response => return error.InvalidRetryPhase,
+        };
+        const send_generation = self.next_retry_generation;
+        const active = request.active;
+        self.next_retry_generation = next_generation;
+        request.* = .{ .sending_retry = .{
+            .generation = active.generation,
+            .origin = active.origin,
+            .response = active.response,
+            .phase = active.phase,
+            .admission = active.admission,
+            .deadline_ns = active.deadline_ns,
+            .attempts = active.attempts,
+            .queued_intent = active.queued_intent,
+            .send_generation = send_generation,
+            .next_deadline_ns = deadline_ns,
+            .preparation = .retained,
+        } };
+        return .{ .handle = .{ .request = handle, .send_generation = send_generation }, .packet = packet };
+    }
+
+    pub fn failRetryPreparation(self: *RequestBook, handle: RequestHandle, deadline_ns: i64) bool {
+        const request = self.getActivePtr(handle) orelse return false;
+        request.attempts += 1;
+        request.deadline_ns = deadline_ns;
+        return true;
+    }
+
+    pub fn prepareFreshRetry(
+        self: *RequestBook,
+        handle: RequestHandle,
+        packet: types.PacketBytes,
+        transition: FreshRetryTransition,
+        deadline_ns: i64,
+        next_admission: *AdmissionPermit,
+    ) !RetryPreparationView {
+        const request = self.active.getPtr(handle.key) orelse return error.StaleRequest;
+        if (request.* != .active or request.active.generation != handle.generation) return error.StaleRequest;
+        if (request.active.phase != .awaiting_response) return error.InvalidRetryPhase;
+        const next_generation = std.math.add(u64, self.next_retry_generation, 1) catch return error.GenerationExhausted;
+        const send_generation = self.next_retry_generation;
+        const active = request.active;
+        self.next_retry_generation = next_generation;
+        request.* = .{ .sending_retry = .{
+            .generation = active.generation,
+            .origin = active.origin,
+            .response = active.response,
+            .phase = active.phase,
+            .admission = active.admission,
+            .deadline_ns = active.deadline_ns,
+            .attempts = active.attempts,
+            .queued_intent = active.queued_intent,
+            .send_generation = send_generation,
+            .next_deadline_ns = deadline_ns,
+            .preparation = .{ .fresh = .{
+                .transition = transition,
+                .admission = next_admission.move(),
+            } },
+        } };
+        return .{ .handle = .{ .request = handle, .send_generation = send_generation }, .packet = packet };
+    }
+
+    pub fn completeRetry(
+        self: *RequestBook,
+        handle: RetryHandle,
+        completion: RetrySendCompletion,
+        admission: *admission_mod.IngressAdmission,
+    ) ?RetryCompletionView {
+        const request = self.active.getPtr(handle.request.key) orelse return null;
+        if (request.* != .sending_retry or
+            request.sending_retry.generation != handle.request.generation or
+            request.sending_retry.send_generation != handle.send_generation) return null;
+        var sending = request.sending_retry;
+        var phase = sending.phase;
+        var current_admission = sending.admission;
+        switch (sending.preparation) {
+            .retained => {},
+            .fresh => |*fresh| if (completion == .sent) {
+                var recovery = phase.awaiting_response.recovery;
+                const response_wait = phase.awaiting_response.wait;
+                if (challengeForPhase(handle.request.key.endpoint.addr, phase)) |old| std.debug.assert(self.challenge_by_nonce.remove(old));
+                const nonce = switch (fresh.transition) {
+                    .probe => |probe_retry| probe_retry.nonce,
+                    .response => |response_nonce| response_nonce,
+                };
+                recovery.nonce = nonce;
+                phase = switch (fresh.transition) {
+                    .probe => |probe_retry| .{ .awaiting_whoareyou = .{
+                        .retry_packet = probe_retry.retry_packet,
+                        .recovery = recovery,
+                    } },
+                    .response => .{ .awaiting_response = .{
+                        .recovery = recovery,
+                        .wait = response_wait.afterFreshRetry(),
+                    } },
+                };
+                self.challenge_by_nonce.putAssumeCapacityNoClobber(.init(handle.request.key.endpoint.addr, &nonce), handle.request);
+                if (fresh.transition == .probe) self.setEstablishing(handle.request);
+                switch (sending.response) {
+                    .nodes => |*nodes| nodes.resetGeneration(),
+                    .pong, .talkresp => {},
+                }
+                current_admission.release(admission);
+                current_admission = fresh.admission.move();
+            } else {
+                fresh.admission.release(admission);
+            },
+        }
+        const view = RetryCompletionView{ .kind = sending.response.kind() };
+        request.* = .{ .active = .{
+            .generation = sending.generation,
+            .origin = sending.origin,
+            .response = sending.response,
+            .phase = phase,
+            .admission = current_admission,
+            .deadline_ns = sending.next_deadline_ns,
+            .attempts = sending.attempts + 1,
+            .queued_intent = sending.queued_intent,
+        } };
+        return view;
     }
 
     pub fn getSending(self: *const RequestBook, handle: RequestHandle) ?ResponseExpectation {
@@ -711,58 +917,6 @@ pub const RequestBook = struct {
         return handleEql(establishing, current);
     }
 
-    pub fn commitRetry(self: *RequestBook, key: types.RequestKey, deadline_ns: i64) void {
-        const active = self.get(key) orelse unreachable;
-        active.attempts += 1;
-        active.deadline_ns = deadline_ns;
-    }
-
-    pub fn commitFreshRetry(
-        self: *RequestBook,
-        key: types.RequestKey,
-        transition: FreshRetryTransition,
-        deadline_ns: i64,
-        next_admission: AdmissionPermit,
-        admission: *admission_mod.IngressAdmission,
-    ) void {
-        const active = self.get(key) orelse unreachable;
-        var recovery = switch (active.phase) {
-            .awaiting_whoareyou => unreachable,
-            .awaiting_response => |response| response.recovery,
-        };
-        const response_wait = active.phase.awaiting_response.wait;
-        if (challengeForPhase(key.endpoint.addr, active.phase)) |old| std.debug.assert(self.challenge_by_nonce.remove(old));
-        const nonce = switch (transition) {
-            .probe => |probe_retry| probe_retry.nonce,
-            .response => |response_nonce| response_nonce,
-        };
-        recovery.nonce = nonce;
-        active.phase = switch (transition) {
-            .probe => |probe_retry| .{ .awaiting_whoareyou = .{
-                .retry_packet = probe_retry.retry_packet,
-                .recovery = recovery,
-            } },
-            .response => .{ .awaiting_response = .{
-                .recovery = recovery,
-                .wait = response_wait.afterFreshRetry(),
-            } },
-        };
-        self.challenge_by_nonce.putAssumeCapacityNoClobber(.init(key.endpoint.addr, &nonce), .{
-            .key = key,
-            .generation = active.generation,
-        });
-        if (transition == .probe) self.setEstablishing(.{ .key = key, .generation = active.generation });
-        switch (active.response) {
-            .nodes => |*nodes| nodes.resetGeneration(),
-            .pong, .talkresp => {},
-        }
-        active.attempts += 1;
-        active.deadline_ns = deadline_ns;
-        var previous_admission = active.admission;
-        active.admission = next_admission;
-        previous_admission.release(admission);
-    }
-
     pub fn takeQueued(self: *RequestBook, key: types.RequestKey) ?QueuedRequest {
         const lane = self.lanes.getPtr(key.endpoint) orelse return null;
         var live_index: usize = 0;
@@ -805,6 +959,7 @@ pub const RequestBook = struct {
         return switch (removed) {
             .sending => |request| .{ .sending = request },
             .active => |request| .{ .active = request },
+            .sending_retry => |request| .{ .sending_retry = request },
         };
     }
 
@@ -939,6 +1094,12 @@ pub const RequestBook = struct {
         removed.deinit(self.alloc);
     }
 };
+
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn exhaustRetryGeneration(book: *RequestBook) void {
+        book.next_retry_generation = std.math.maxInt(u64);
+    }
+} else struct {};
 
 fn handleEql(a: RequestHandle, b: RequestHandle) bool {
     return a.generation == b.generation and types.RequestKeyContext.eql(.{}, a.key, b.key);

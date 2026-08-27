@@ -13,6 +13,7 @@ const Env = actor_mod.Env;
 const MAX_REDRAIN_LANES_PER_MAINTENANCE: usize = 16;
 
 const RetryState = struct {
+    handle: types.RequestHandle,
     attempts: u32,
     kind: types.RequestKind,
     phase: request_book.Phase,
@@ -51,6 +52,7 @@ fn pruneActive(actor: *Actor, env: Env, now_ns: i64) void {
             const retry: RetryState = blk: {
                 const active = actor.requests.get(key) orelse continue;
                 break :blk .{
+                    .handle = actor.requests.handleFor(key) orelse unreachable,
                     .attempts = active.attempts,
                     .kind = active.response.kind(),
                     .phase = active.phase,
@@ -69,12 +71,12 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
     const deadline_ns = outbound.deadlineNs(now_ns, actor.request_timeout_ms);
     switch (retry.phase) {
         .awaiting_whoareyou => |probe| {
-            const effect = actor_mod.ActorEffect{ .retry = .{ .retained = .{
-                .key = key,
-                .packet = probe.retry_packet,
-                .deadline_ns = deadline_ns,
-                .kind = retry.kind,
-            } } };
+            _ = probe;
+            const prepared = actor.requests.prepareRetainedRetry(retry.handle, deadline_ns) catch return;
+            const effect = actor_mod.ActorEffect{ .retry = .{
+                .handle = prepared.handle,
+                .packet = prepared.packet,
+            } };
             const effects = env.effects orelse unreachable;
             effects.push(effect) catch {
                 actor.applyEffectCompletion(env, effect, .failed);
@@ -88,17 +90,17 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
             const awaiting_whoareyou = pending_write_key == null and stable == null;
             const encoded = if (pending_write_key) |write_key|
                 outbound.encodeMessage(actor, env.io, &buffer, key.endpoint.node_id, &write_key, response.recovery.plaintext.slice()) catch {
-                    actor.requests.commitRetry(key, deadline_ns);
+                    _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                     return;
                 }
             else if (stable) |session|
                 outbound.encodeMessage(actor, env.io, &buffer, key.endpoint.node_id, &session.initiator_key, response.recovery.plaintext.slice()) catch {
-                    actor.requests.commitRetry(key, deadline_ns);
+                    _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                     return;
                 }
             else
                 outbound.encodeProbe(actor, env.io, &buffer, key.endpoint.node_id, response.recovery.plaintext.slice()) catch {
-                    actor.requests.commitRetry(key, deadline_ns);
+                    _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                     return;
                 };
             actor.responses.removeExpired(key.endpoint.addr, &encoded.nonce, now_ns, env.ingress);
@@ -106,13 +108,13 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
                 (awaiting_whoareyou and !actor.requests.canEstablish(key)) or
                 actor.responses.hasLive(key.endpoint.addr, &encoded.nonce, now_ns))
             {
-                actor.requests.commitRetry(key, deadline_ns);
+                _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                 return;
             }
             const transition: request_book.FreshRetryTransition = if (awaiting_whoareyou)
                 .{ .probe = .{
                     .retry_packet = types.PacketBytes.init(encoded.bytes) catch {
-                        actor.requests.commitRetry(key, deadline_ns);
+                        _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                         return;
                     },
                     .nonce = encoded.nonce,
@@ -120,24 +122,30 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
             else
                 .{ .response = encoded.nonce };
             const retry_packet = types.PacketBytes.init(encoded.bytes) catch {
-                actor.requests.commitRetry(key, deadline_ns);
+                _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                 return;
             };
             var next_admission = env.ingress.acquire(
                 key.endpoint.addr,
                 @import("../admission.zig").requestPacketBudget(retry.kind),
             ) catch {
-                actor.requests.commitRetry(key, deadline_ns);
+                _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                 return;
             };
-            const effect = actor_mod.ActorEffect{ .retry = .{ .fresh = .{
-                .key = key,
-                .packet = retry_packet,
-                .deadline_ns = deadline_ns,
-                .kind = retry.kind,
-                .transition = transition,
-                .admission = next_admission.move(),
-            } } };
+            const prepared = actor.requests.prepareFreshRetry(
+                retry.handle,
+                retry_packet,
+                transition,
+                deadline_ns,
+                &next_admission,
+            ) catch {
+                next_admission.release(env.ingress);
+                return;
+            };
+            const effect = actor_mod.ActorEffect{ .retry = .{
+                .handle = prepared.handle,
+                .packet = prepared.packet,
+            } };
             const effects = env.effects orelse unreachable;
             effects.push(effect) catch {
                 actor.applyEffectCompletion(env, effect, .failed);
