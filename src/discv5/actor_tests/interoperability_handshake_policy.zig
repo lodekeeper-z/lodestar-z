@@ -12,6 +12,7 @@ const public_api = @import("../public_api.zig");
 const request_results = @import("../request_results.zig");
 const session_crypto = @import("../protocol/session.zig");
 const secp = @import("../secp256k1.zig");
+const peer_store = @import("../state/peer_store.zig");
 const types = @import("../types.zig");
 const PacketLink = @import("../test_support/packet_link.zig").PacketLink;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
@@ -323,8 +324,8 @@ test "paired Actors complete handshake PING and TALK request response flows" {
     var added_event = outbox_b.pop() orelse return error.MissingEnrAdded;
     defer added_event.deinit(alloc);
     try std.testing.expect(added_event == .enr_added);
-    const distance_c: u16 = @as(u16, @import("../kbucket.zig").logDistance(&id_b, &id_c).?) + 1;
-    const distance_d: u16 = @as(u16, @import("../kbucket.zig").logDistance(&id_b, &id_d).?) + 1;
+    const distance_c: u16 = @as(u16, peer_store.logDistance(&id_b, &id_c).?) + 1;
+    const distance_d: u16 = @as(u16, peer_store.logDistance(&id_b, &id_d).?) + 1;
     _ = try actor_mod.Testing.sendFindNodeResolvedForTest(
         &actor_a,
         env_a,
@@ -406,7 +407,7 @@ test "known contact rejects a matching claimed ENR whose key differs from the st
     // associated with stored key A even though key C derives ID C.
     actor_b.peers.rememberContact(id_c, &stored_pubkey_a, address_c, false);
     const peer_before = actor_b.peers.known(&id_c) orelse return error.MissingKnownPeer;
-    try std.testing.expectEqual(@as(usize, 1), actor_b.peers.contacts.count());
+    try std.testing.expectEqual(@as(usize, 1), actor_b.peers.fallbackCount());
 
     const triggering_nonce = [_]u8{0x41} ** packet.NONCE_SIZE;
     const message_masking_iv = [_]u8{0x42} ** packet.MASKING_IV_SIZE;
@@ -469,8 +470,8 @@ test "known contact rejects a matching claimed ENR whose key differs from the st
     try std.testing.expect(actor_b.sessions.get(endpoint, outbound.nowNs(io)) == null);
     try std.testing.expectEqual(@as(usize, 1), actor_b.sessions.challengeCount());
     try std.testing.expect(outbox_b.pop() == null);
-    try std.testing.expect(actor_b.peers.routing.getEntryWithPending(&id_c) == null);
-    try std.testing.expectEqual(@as(usize, 1), actor_b.peers.contacts.count());
+    try std.testing.expect(actor_b.peers.routeWithPending(&id_c) == null);
+    try std.testing.expectEqual(@as(usize, 1), actor_b.peers.fallbackCount());
     const peer_after = actor_b.peers.known(&id_c) orelse return error.KnownPeerRemoved;
     try std.testing.expectEqual(peer_before.pubkey, peer_after.pubkey);
     try std.testing.expect(peer_before.addr.eql(&peer_after.addr));
@@ -542,7 +543,7 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
 
     actor_b.peers.rememberContact(id_a, &pubkey_a, address_a, false);
     const peer_before = actor_b.peers.known(&id_a) orelse return error.MissingKnownPeer;
-    try std.testing.expectEqual(@as(usize, 1), actor_b.peers.contacts.count());
+    try std.testing.expectEqual(@as(usize, 1), actor_b.peers.fallbackCount());
     _ = try actor_mod.Testing.sendPingResolvedForTest(&actor_a, env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
     try drainEffects(&actor_a, env_a, &effects_a, &sender_a);
     try link_a_to_b.deliverNext();
@@ -586,9 +587,9 @@ test "known peer cannot authenticate with a foreign ENR or commit expected credi
     try std.testing.expect(actor_b.sessions.get(endpoint, outbound.nowNs(io)) == null);
     try std.testing.expectEqual(@as(usize, 1), actor_b.sessions.challengeCount());
     try std.testing.expect(outbox_b.pop() == null);
-    try std.testing.expect(actor_b.peers.routing.getEntryWithPending(&id_a) == null);
+    try std.testing.expect(actor_b.peers.routeWithPending(&id_a) == null);
     try std.testing.expect(actor_b.peers.known(&foreign_id) == null);
-    try std.testing.expectEqual(@as(usize, 1), actor_b.peers.contacts.count());
+    try std.testing.expectEqual(@as(usize, 1), actor_b.peers.fallbackCount());
     const peer_after = actor_b.peers.known(&id_a) orelse return error.KnownPeerRemoved;
     try std.testing.expectEqual(peer_before.pubkey, peer_after.pubkey);
     try std.testing.expect(peer_before.addr.eql(&peer_after.addr));
@@ -776,7 +777,7 @@ fn signedEnrHandshake(kind: SignedEnrKind, later_evidence: LaterEndpointEvidence
         defer alloc.free(prior_enr);
         try std.testing.expect(actor_b.learnDiscovered(prior_enr, outbound.nowNs(io)) != null);
         _ = actor_b.peers.markResponsive(id_a, observed_a, outbound.nowNs(io), null);
-        try std.testing.expect(actor_b.peers.routing.getEntry(&id_a).?.raw_enr_relay_eligible);
+        try std.testing.expect(actor_b.peers.routeIsRelayable(&id_a));
     }
 
     _ = try actor_mod.Testing.sendPingResolvedForTest(&actor_a, env_a, .{ .node_id = id_b, .addr = address_b }, &pubkey_b, .api);
@@ -791,16 +792,16 @@ fn signedEnrHandshake(kind: SignedEnrKind, later_evidence: LaterEndpointEvidence
         defer event.deinit(alloc);
         if (event == .peer_connected) established_event = true;
     }
-    const retained = actor_b.peers.routing.getEntry(&id_a);
+    const retained = actor_b.peers.activeRoute(&id_a);
     const observed_source_retained = if (retained) |entry| entry.addr.eql(&observed_a) else false;
-    const relay_eligible = if (retained) |entry| entry.relayableEnr() != null else false;
+    const relay_eligible = if (retained) |entry| entry.relayable else false;
     const advertised_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9486 } };
     switch (later_evidence) {
         .none => {},
         .prove_advertised_endpoint => _ = actor_b.peers.markResponsive(id_a, advertised_address, outbound.nowNs(io), null),
         .trust_advertised_endpoint => try std.testing.expect(actor_b.addNode(id_a, &pubkey_a, advertised_address, advertised_enr, outbound.nowNs(io))),
     }
-    const after_evidence = actor_b.peers.routing.getEntry(&id_a);
+    const after_evidence = actor_b.peers.activeRoute(&id_a);
     return .{
         .session_installed = actor_b.sessions.get(.{ .node_id = id_a, .addr = observed_a }, outbound.nowNs(io)) != null,
         .established_event = established_event,
@@ -808,7 +809,7 @@ fn signedEnrHandshake(kind: SignedEnrKind, later_evidence: LaterEndpointEvidence
         .runtime_contact_trusted = if (retained) |entry| entry.runtime_contact_trusted else false,
         .advertised_endpoint_trusted = if (retained) |entry| entry.advertised_endpoint_trusted else false,
         .relay_eligible = relay_eligible,
-        .later_relay_eligible = if (after_evidence) |entry| entry.relayableEnr() != null else false,
+        .later_relay_eligible = if (after_evidence) |entry| entry.relayable else false,
     };
 }
 

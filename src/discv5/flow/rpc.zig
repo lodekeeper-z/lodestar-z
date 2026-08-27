@@ -2,7 +2,7 @@ const std = @import("std");
 const actor_mod = @import("../actor.zig");
 const config = @import("../config.zig");
 const enr = @import("../enr.zig");
-const kbucket = @import("../kbucket.zig");
+const peer_store = @import("../state/peer_store.zig");
 const message = @import("../protocol/message.zig");
 const metrics = @import("../metrics.zig");
 const outbound = @import("outbound.zig");
@@ -88,6 +88,7 @@ fn handleFindNode(actor: *Actor, env: Env, findnode: *const message.DecodedFindN
     var seen = [_]bool{false} ** 257;
     var references_buffer: [MAX_NODES_RESPONSE][]const u8 = undefined;
     var references = std.ArrayListUnmanaged([]const u8).initBuffer(&references_buffer);
+    var retained_enrs: [MAX_NODES_RESPONSE]enr.RawEnr = undefined;
     for (findnode.distancesSlice()) |distance| {
         if (distance > 256 or seen[distance]) continue;
         seen[distance] = true;
@@ -95,10 +96,12 @@ fn handleFindNode(actor: *Actor, env: Env, findnode: *const message.DecodedFindN
             if (references.items.len < references.capacity) if (actor.local.raw) |*raw| references.appendAssumeCapacity(raw.slice());
             continue;
         }
-        for (actor.peers.routing.getBucket(@intCast(distance - 1))) |*entry| {
-            const raw = entry.relayableEnr() orelse continue;
-            if (references.items.len == references.capacity) break;
-            references.appendAssumeCapacity(raw);
+        const retained = actor.peers.collectBucketRelayable(
+            @intCast(distance - 1),
+            retained_enrs[references.items.len..],
+        );
+        for (retained_enrs[references.items.len .. references.items.len + retained]) |*raw| {
+            references.appendAssumeCapacity(raw.slice());
         }
         if (references.items.len == references.capacity) break;
     }
@@ -178,10 +181,16 @@ fn closerCandidates(actor: *const Actor, validated_enrs: []const enr.ValidatedEn
     var closer_len: usize = 0;
     for (validated_enrs) |*validated| {
         if (std.mem.eql(u8, &validated.node_id, &actor.local_node_id)) continue;
-        if (actor.peers.routing.getEntryWithPending(&validated.node_id)) |entry| {
-            if (entry.enr_seq >= validated.parsed.seq) {
-                if (lookup.Candidate.fromRoutingEntry(entry)) |candidate| {
-                    closer[closer_len] = candidate;
+        if (actor.peers.routeWithPending(&validated.node_id)) |route| {
+            if (route.enr_seq >= validated.parsed.seq) {
+                if (route.enr) |raw| {
+                    closer[closer_len] = .{
+                        .node_id = route.node_id,
+                        .pubkey = route.pubkey,
+                        .addr = route.addr,
+                        .raw = raw,
+                        .seq = route.enr_seq,
+                    };
                     closer_len += 1;
                     continue;
                 }
@@ -229,7 +238,7 @@ fn handleTalkResp(actor: *Actor, env: Env, response: *const message.TalkResp, en
 }
 
 fn matchesDistances(node_id: *const types.NodeId, responder: *const types.NodeId, accumulator: *const request_book.NodesAccumulator) bool {
-    const distance: u16 = if (kbucket.logDistance(node_id, responder)) |value| @as(u16, value) + 1 else 0;
+    const distance: u16 = if (peer_store.logDistance(node_id, responder)) |value| @as(u16, value) + 1 else 0;
     return accumulator.requested_distances.contains(distance);
 }
 

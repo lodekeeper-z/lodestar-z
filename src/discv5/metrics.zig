@@ -139,6 +139,6 @@ test "discv5 metrics message labels mirror ChainSafe TS enum labels" {
 test "metrics instrumentation types are root exported" {
     const root = @import("root.zig");
     try std.testing.expect(root.MetricsSnapshot == MetricsSnapshot);
-    try std.testing.expect(root.ContactMetricsSnapshot == @import("contact_book.zig").ContactMetricsSnapshot);
+    try std.testing.expect(root.ContactMetricsSnapshot == @import("state/peer_store.zig").ContactMetricsSnapshot);
     try std.testing.expect(root.SessionMetricsSnapshot == @import("state/session_book.zig").SessionMetricsSnapshot);
 }

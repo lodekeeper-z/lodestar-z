@@ -1,13 +1,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const enr = @import("../enr.zig");
-const kbucket = @import("../kbucket.zig");
+const peer_store = @import("../state/peer_store.zig");
 const types = @import("../types.zig");
 
 const NodeId = enr.NodeId;
 
-pub const MAX_RESULTS: usize = kbucket.K;
-pub const MAX_PARALLELISM: usize = kbucket.K;
+pub const MAX_RESULTS: usize = peer_store.K;
+pub const MAX_PARALLELISM: usize = peer_store.K;
 /// Bound the closest-candidate frontier while retaining contacted/in-flight
 /// entries so eviction cannot erase request history and cause repeated queries.
 pub const MAX_CANDIDATES: usize = MAX_RESULTS + MAX_PARALLELISM;
@@ -56,14 +56,14 @@ pub const Candidate = struct {
     /// preserves the validated representation without repeating verification.
     /// The runtime address may intentionally differ from the ENR-advertised
     /// address until traffic proves a newly advertised endpoint.
-    pub fn fromRoutingEntry(entry: *const kbucket.Entry) ?Candidate {
-        if (entry.enrBytes().len == 0) return null;
+    pub fn fromRouteSnapshot(route: *const peer_store.RouteSnapshot) ?Candidate {
+        const raw = route.enr orelse return null;
         return .{
-            .node_id = entry.node_id,
-            .pubkey = entry.pubkey,
-            .addr = entry.addr,
-            .raw = entry.enr,
-            .seq = entry.enr_seq,
+            .node_id = route.node_id,
+            .pubkey = route.pubkey,
+            .addr = route.addr,
+            .raw = raw,
+            .seq = route.enr_seq,
         };
     }
 };
@@ -149,10 +149,10 @@ pub const Lookup = struct {
             return null;
         }
 
-        const candidate_distance = kbucket.xorDistance(&self.target, node_id);
+        const candidate_distance = peer_store.xorDistance(&self.target, node_id);
         var insert_at = self.peers.items.len;
         for (self.peers.items, 0..) |*peer, i| {
-            const peer_distance = kbucket.xorDistance(&self.target, &peer.node_id);
+            const peer_distance = peer_store.xorDistance(&self.target, &peer.node_id);
             if (std.mem.lessThan(u8, &candidate_distance, &peer_distance)) {
                 insert_at = i;
                 break;
@@ -205,7 +205,7 @@ pub const Lookup = struct {
             return;
         };
 
-        const accepted_peers = closer_peers[0..@min(closer_peers.len, kbucket.K)];
+        const accepted_peers = closer_peers[0..@min(closer_peers.len, peer_store.K)];
         if (self.peers.items[peer_index].state == .waiting) {
             self.num_waiting -= 1;
             self.peers.items[peer_index].peers_returned += accepted_peers.len;
@@ -320,7 +320,7 @@ pub fn findNodeLogDistances(target: *const NodeId, peer_id: *const NodeId, max_d
 
     var len: usize = 0;
     var wire_distance: u16 = 1;
-    if (kbucket.logDistance(target, peer_id)) |distance| {
+    if (peer_store.logDistance(target, peer_id)) |distance| {
         wire_distance = @as(u16, distance) + 1;
     }
 
@@ -361,14 +361,21 @@ fn testConfig(num_results: usize, parallelism: usize) Config {
 }
 
 test "discv5 lookup: routing candidate requires stored raw ENR" {
-    const entry = kbucket.Entry{
+    const route = peer_store.RouteSnapshot{
         .node_id = testNodeId(1),
+        .pubkey = [_]u8{0} ** 33,
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } },
-        .last_seen = 0,
-        .status = .disconnected,
+        .connected = false,
+        .relayable = false,
+        .runtime_contact_trusted = false,
+        .advertised_endpoint_trusted = false,
+        .health_request = null,
+        .next_ping_at_ns = 0,
+        .enr = null,
+        .enr_seq = 0,
     };
 
-    try std.testing.expect(Candidate.fromRoutingEntry(&entry) == null);
+    try std.testing.expect(Candidate.fromRouteSnapshot(&route) == null);
 }
 
 test "discv5 lookup: initial peers are bounded to requested result count" {
@@ -446,8 +453,8 @@ test "discv5 lookup: candidate growth is bounded across responses" {
     const first_index = lookup.findPeerIndex(&first_peer) orelse return error.ContactedPeerEvicted;
     try std.testing.expectEqual(PeerState.succeeded, lookup.peers.items[first_index].state);
     for (lookup.peers.items[1..], lookup.peers.items[0 .. lookup.peers.items.len - 1]) |*peer, *previous| {
-        const peer_distance = kbucket.xorDistance(&target, &peer.node_id);
-        const previous_distance = kbucket.xorDistance(&target, &previous.node_id);
+        const peer_distance = peer_store.xorDistance(&target, &peer.node_id);
+        const previous_distance = peer_store.xorDistance(&target, &previous.node_id);
         try std.testing.expect(!std.mem.lessThan(u8, &peer_distance, &previous_distance));
     }
 }

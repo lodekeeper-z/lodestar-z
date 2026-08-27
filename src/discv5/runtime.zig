@@ -225,7 +225,6 @@ const RuntimeImpl = struct {
             error.BufferTooSmall,
             error.CapacityTooLarge,
             error.InvalidAdmissionCapacity,
-            error.InvalidContactCapacity,
             error.InvalidEventCapacity,
             error.InvalidLookupResultCapacity,
             error.InvalidPublicKey,

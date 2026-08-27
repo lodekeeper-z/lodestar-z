@@ -1,6 +1,6 @@
 const std = @import("std");
 const addr_votes = @import("service/addr_votes.zig");
-const kbucket = @import("kbucket.zig");
+const peer_store = @import("state/peer_store.zig");
 const lookup = @import("service/lookup.zig");
 const enr = @import("enr.zig");
 const packet = @import("protocol/packet.zig");
@@ -59,7 +59,7 @@ pub const Config = struct {
     challenge_timeout_ms: u64 = 2_000,
     response_recovery_timeout_ms: u64 = 2_000,
     whoareyou_rate_ttl_ms: u64 = 60_000,
-    bucket_pending_timeout_ms: u64 = kbucket.BUCKET_PENDING_TIMEOUT_MS,
+    bucket_pending_timeout_ms: u64 = peer_store.BUCKET_PENDING_TIMEOUT_MS,
     lookup_num_results: usize = lookup.MAX_RESULTS,
     lookup_parallelism: usize = 3,
     lookup_request_limit: usize = 3,

@@ -9,6 +9,7 @@ const packet = @import("../protocol/packet.zig");
 const message = @import("../protocol/message.zig");
 const metrics = @import("../metrics.zig");
 const secp = @import("../secp256k1.zig");
+const peer_store = @import("../state/peer_store.zig");
 const request_book = @import("../state/request_book.zig");
 const session_book = @import("../state/session_book.zig");
 const types = @import("../types.zig");
@@ -56,7 +57,7 @@ test "Actor isolates health request identity" {
     actor.onRequestCompletion(harness.env(), unrelated, .{ .maintenance = .health }, false, &.{});
     try expectActorHealthRequest(actor, remote_id, health);
     actor.onRequestCompletion(harness.env(), health, .{ .maintenance = .health }, true, &.{});
-    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+    try std.testing.expect(actor.peers.healthRequest(&remote_id) == null);
 }
 
 test "stale eviction candidate fails reservation before any send or permit" {
@@ -78,17 +79,17 @@ test "stale eviction candidate fails reservation before any send or permit" {
     defer harness.deinit();
     const actor = &harness.actor;
     try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, address_b, null, outbound.nowNs(io)));
-    const stale = @import("../kbucket.zig").Entry{
-        .node_id = remote_id,
-        .pubkey = remote_pubkey,
-        .addr = address_a,
-        .last_seen = 0,
-        .status = .connected,
-    };
+    const remote_ref = actor.peers.lookup(&remote_id).?;
 
     actor.probeEviction(harness.env(), .{
-        .entry = stale,
-        .ticket = .{ .incumbent_id = remote_id, .generation = 1 },
+        .endpoint = .{ .node_id = remote_id, .addr = address_a },
+        .pubkey = remote_pubkey,
+        .ticket = .{
+            .incumbent = remote_ref,
+            .candidate = remote_ref,
+            .probe = .{ .index = 0, .generation = 0 },
+            .generation = 1,
+        },
     });
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
@@ -102,14 +103,13 @@ const EvictionHarness = struct {
     recording: RecordingSender,
     effect_storage: []actor_mod.ActorEffect,
     effects: actor_mod.EffectQueue,
-    candidate: @import("../kbucket.zig").EvictionProbe,
+    candidate: peer_store.EvictionProbe,
     candidate_key: secp.KeyPair,
     candidate_id: types.NodeId,
     candidate_endpoint: types.Endpoint,
     pending_id: types.NodeId,
+    pending_inserted_at_ns: i64,
     bucket_distance: u8,
-
-    const kbucket_mod = @import("../kbucket.zig");
 
     fn init(alloc: std.mem.Allocator, io: std.Io) !EvictionHarness {
         const local_key = try secp.keyPairFromSecret(&([_]u8{0x25} ** 32));
@@ -117,7 +117,7 @@ const EvictionHarness = struct {
         const candidate_key = try secp.keyPairFromSecret(&([_]u8{0x26} ** 32));
         const candidate_pubkey = secp.compressedPubkey(&candidate_key);
         const candidate_id = try enr.nodeIdFromCompressedPubkey(&candidate_pubkey);
-        const distance = kbucket_mod.logDistance(&local_id, &candidate_id) orelse return error.SameNodeId;
+        const distance = peer_store.logDistance(&local_id, &candidate_id) orelse return error.SameNodeId;
         // Low-byte variations below preserve the bucket only when the highest
         // differing bit is far above them.
         try std.testing.expect(distance > 64);
@@ -150,34 +150,31 @@ const EvictionHarness = struct {
         const candidate_enr = try candidate_builder.encode();
         defer alloc.free(candidate_enr);
         try std.testing.expect(actor.peers.learnEnr(candidate_enr, 0) != null);
-        try std.testing.expectEqual(kbucket_mod.EntryStatus.disconnected, actor.peers.routing.getEntry(&candidate_id).?.status);
+        try std.testing.expect(!actor.peers.routeIsConnected(&candidate_id).?);
         var sibling = candidate_id;
-        for (1..kbucket_mod.K) |i| {
+        for (1..peer_store.K) |i| {
             sibling[31] = candidate_id[31] ^ @as(u8, @intCast(i));
-            try std.testing.expect(actor.peers.routing.insert(.{
-                .node_id = sibling,
-                .pubkey = candidate_pubkey,
-                .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 52 }, .port = @intCast(9052 + i) } },
-                .last_seen = 0,
-                .status = .disconnected,
-            }));
+            const sibling_ref = try actor.peers.remember(
+                sibling,
+                &candidate_pubkey,
+                .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 52 }, .port = @intCast(9052 + i) } },
+                false,
+            );
+            try std.testing.expect((try actor.peers.admitRoute(sibling_ref, false, 0)).inserted);
         }
 
         // A connected newcomer overflows the bucket; the genuine eviction
         // candidate handed back is the disconnected oldest entry.
         var pending_id = candidate_id;
         pending_id[30] = candidate_id[30] ^ 0x55;
-        const outcome = actor.peers.routing.insertDetailed(.{
-            .node_id = pending_id,
-            .pubkey = candidate_pubkey,
-            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 53 }, .port = 9053 } },
-            .last_seen = outbound.nowNs(io),
-            .status = .connected,
-        });
-        try std.testing.expect(!outcome.inserted);
-        const candidate = outcome.pending_eviction orelse return error.MissingEvictionCandidate;
-        try std.testing.expectEqualSlices(u8, &candidate_id, &candidate.entry.node_id);
-        try std.testing.expectEqual(kbucket_mod.EntryStatus.disconnected, candidate.entry.status);
+        const pending_addr = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 53 }, .port = 9053 } };
+        const pending_ref = try actor.peers.remember(pending_id, &candidate_pubkey, pending_addr, false);
+        try actor.peers.putEnr(pending_ref, &.{ 0xc1, 0x80 }, 1);
+        const pending_inserted_at_ns = outbound.nowNs(io);
+        const responsive = actor.peers.markResponsive(pending_id, pending_addr, pending_inserted_at_ns, null);
+        const candidate = responsive.eviction_candidate orelse return error.MissingEvictionCandidate;
+        try std.testing.expectEqualSlices(u8, &candidate_id, &candidate.endpoint.node_id);
+        try std.testing.expect(!actor.peers.routeIsConnected(&candidate_id).?);
 
         return .{
             .allocator = alloc,
@@ -192,6 +189,7 @@ const EvictionHarness = struct {
             .candidate_id = candidate_id,
             .candidate_endpoint = .{ .node_id = candidate_id, .addr = candidate_addr },
             .pending_id = pending_id,
+            .pending_inserted_at_ns = pending_inserted_at_ns,
             .bucket_distance = distance,
         };
     }
@@ -239,12 +237,13 @@ const EvictionHarness = struct {
         while (self.effects.pop()) |effect| self.actor.applyEffectCompletion(self.env(), effect, .failed);
     }
 
-    fn bucket(self: *EvictionHarness) *kbucket_mod.KBucket {
-        return &self.actor.peers.routing.buckets[self.bucket_distance];
+    fn hasPending(self: *EvictionHarness) bool {
+        const pending_ref = self.actor.peers.lookup(&self.pending_id) orelse return false;
+        return self.actor.peers.pendingContains(pending_ref);
     }
 
     fn armedKey(self: *EvictionHarness) !types.RequestKey {
-        return self.actor.peers.routing.getEntry(&self.candidate_id).?.health_request orelse error.MissingEvictionReservation;
+        return self.actor.peers.healthRequest(&self.candidate_id) orelse error.MissingEvictionReservation;
     }
 
     fn expectProbeRequest(self: *EvictionHarness) !types.RequestKey {
@@ -271,8 +270,8 @@ test "real full-bucket eviction probe stays active with a live permit after send
     harness.actor.probeEviction(harness.env(), harness.candidate);
     try harness.drainEffects();
     _ = try harness.expectProbeRequest();
-    try std.testing.expect(harness.bucket().pending != null);
-    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.disconnected, harness.actor.peers.routing.getEntry(&harness.candidate_id).?.status);
+    try std.testing.expect(harness.hasPending());
+    try std.testing.expect(!harness.actor.peers.routeIsConnected(&harness.candidate_id).?);
 }
 
 test "real eviction probe PONG keeps the candidate and clears the pending replacement" {
@@ -292,11 +291,11 @@ test "real eviction probe PONG keeps the candidate and clears the pending replac
 
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    const survivor = harness.actor.peers.routing.getEntry(&harness.candidate_id) orelse return error.CandidateEvicted;
-    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, survivor.status);
-    try std.testing.expect(survivor.health_request == null);
-    try std.testing.expect(harness.bucket().pending == null);
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.pending_id) == null);
+    try std.testing.expect(harness.actor.peers.activeRoute(&harness.candidate_id) != null);
+    try std.testing.expect(harness.actor.peers.routeIsConnected(&harness.candidate_id).?);
+    try std.testing.expect(harness.actor.peers.healthRequest(&harness.candidate_id) == null);
+    try std.testing.expect(!harness.hasPending());
+    try std.testing.expect(harness.actor.peers.activeRoute(&harness.pending_id) == null);
     var connected_event = harness.outbox.pop() orelse return error.MissingConnectedEvent;
     defer connected_event.deinit(alloc);
     try std.testing.expect(connected_event == .peer_connected);
@@ -339,8 +338,8 @@ test "real eviction probe WHOAREYOU recovery preserves reservation and completes
     try deliverEncrypted(&harness.actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, harness.candidate_endpoint, &pending.keys.recipient_key, try pong.encodeInto(&pong_buffer), 32);
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, harness.actor.peers.routing.getEntry(&harness.candidate_id).?.status);
-    try std.testing.expect(harness.bucket().pending == null);
+    try std.testing.expect(harness.actor.peers.routeIsConnected(&harness.candidate_id).?);
+    try std.testing.expect(!harness.hasPending());
 }
 
 test "real eviction probe timeout removes the exact candidate and promotes pending" {
@@ -359,10 +358,10 @@ test "real eviction probe timeout removes the exact candidate and promotes pendi
 
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id) == null);
-    const promoted = harness.actor.peers.routing.getEntry(&harness.pending_id) orelse return error.PendingNotPromoted;
-    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, promoted.status);
-    try std.testing.expect(harness.bucket().pending == null);
+    try std.testing.expect(harness.actor.peers.activeRoute(&harness.candidate_id) == null);
+    _ = harness.actor.peers.activeRoute(&harness.pending_id) orelse return error.PendingNotPromoted;
+    try std.testing.expect(harness.actor.peers.routeIsConnected(&harness.pending_id).?);
+    try std.testing.expect(!harness.hasPending());
     var saw_promoted_connected = false;
     while (harness.outbox.pop()) |event_value| {
         var event = event_value;
@@ -382,22 +381,19 @@ test "bucket expiry resolves a live eviction generation before request timeout" 
     try harness.drainEffects();
     const key = try harness.expectProbeRequest();
     const active_deadline = harness.actor.requests.get(key).?.deadline_ns;
-    const pending = harness.bucket().pending orelse return error.MissingPending;
-    const pending_deadline = pending.inserted_at_ns + std.time.ns_per_ms;
+    try std.testing.expect(harness.hasPending());
+    const pending_deadline = harness.pending_inserted_at_ns + std.time.ns_per_ms;
     try std.testing.expect(pending_deadline < active_deadline);
-    harness.actor.peers.rememberContact(pending.entry.node_id, &pending.entry.pubkey, pending.entry.addr, false);
-    try std.testing.expect(harness.actor.peers.contacts.get(pending.entry.node_id) != null);
 
     harness.actor.maintenanceAt(harness.env(), pending_deadline);
     harness.drainEffectsIgnoringFailures();
 
     try std.testing.expectEqual(@as(usize, 1), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id) == null);
-    try std.testing.expect(harness.bucket().pending == null);
-    const promoted = harness.actor.peers.routing.getEntry(&harness.pending_id) orelse return error.PendingNotPromoted;
-    try std.testing.expectEqual(EvictionHarness.kbucket_mod.EntryStatus.connected, promoted.status);
-    try std.testing.expect(harness.actor.peers.contacts.get(harness.pending_id) == null);
+    try std.testing.expect(harness.actor.peers.activeRoute(&harness.candidate_id) == null);
+    try std.testing.expect(!harness.hasPending());
+    _ = harness.actor.peers.activeRoute(&harness.pending_id) orelse return error.PendingNotPromoted;
+    try std.testing.expect(harness.actor.peers.routeIsConnected(&harness.pending_id).?);
     var saw_connected = false;
     while (harness.outbox.pop()) |event_value| {
         var event = event_value;
@@ -409,8 +405,8 @@ test "bucket expiry resolves a live eviction generation before request timeout" 
     // The still-indexed request belongs to the already-consumed generation.
     // A stale completion cannot remove the promoted peer or recreate pending.
     harness.actor.onRequestCompletion(harness.env(), key, .{ .eviction = harness.candidate.ticket.generation }, true, &.{});
-    try std.testing.expect(harness.bucket().pending == null);
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.pending_id) != null);
+    try std.testing.expect(!harness.hasPending());
+    try std.testing.expect(harness.actor.peers.activeRoute(&harness.pending_id) != null);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 
     const handle = types.RequestHandle{ .key = key, .generation = harness.actor.requests.get(key).?.generation };
@@ -418,7 +414,7 @@ test "bucket expiry resolves a live eviction generation before request timeout" 
     try std.testing.expect(!harness.actor.cancelRequest(harness.env(), handle));
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.pending_id) != null);
+    try std.testing.expect(harness.actor.peers.activeRoute(&harness.pending_id) != null);
 }
 
 test "real eviction probe cancellation releases only its ticketed reservation" {
@@ -434,9 +430,8 @@ test "real eviction probe cancellation releases only its ticketed reservation" {
     try std.testing.expect(harness.actor.cancelRequest(harness.env(), handle));
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id).?.health_request == null);
-    try std.testing.expect(harness.bucket().pending != null);
-    try std.testing.expect(harness.bucket().pending.?.request_key == null);
+    try std.testing.expect(harness.actor.peers.healthRequest(&harness.candidate_id) == null);
+    try std.testing.expect(harness.hasPending());
 }
 
 test "stale P1 eviction success preserves P2 reservation when RequestKey is reused" {
@@ -457,39 +452,34 @@ test "stale P1 eviction success preserves P2 reservation when RequestKey is reus
         true,
         &.{},
     );
-    try std.testing.expect(harness.bucket().pending == null);
+    try std.testing.expect(!harness.hasPending());
 
-    while (harness.bucket().count > 0) {
-        const node_id = harness.bucket().entries[0].node_id;
-        _ = harness.bucket().remove(&node_id);
+    const candidate_pubkey = secp.compressedPubkey(&harness.candidate_key);
+    var sibling = harness.candidate_id;
+    for (0..peer_store.K) |index| {
+        sibling[31] = harness.candidate_id[31] ^ @as(u8, @intCast(index));
+        const sibling_ref = harness.actor.peers.lookup(&sibling) orelse continue;
+        _ = harness.actor.peers.removeRoute(sibling_ref);
     }
-    try std.testing.expect(harness.actor.peers.routing.insert(.{
-        .node_id = harness.candidate_id,
-        .pubkey = secp.compressedPubkey(&harness.candidate_key),
-        .addr = harness.candidate_endpoint.addr,
-        .last_seen = 2,
-        .status = .disconnected,
-    }));
-    for (1..EvictionHarness.kbucket_mod.K) |index| {
-        var sibling = harness.candidate_id;
+    const incumbent_ref = harness.actor.peers.lookup(&harness.candidate_id).?;
+    try std.testing.expect((try harness.actor.peers.admitRoute(incumbent_ref, false, 2)).inserted);
+    for (1..peer_store.K) |index| {
+        sibling = harness.candidate_id;
         sibling[31] ^= @intCast(index);
-        try std.testing.expect(harness.actor.peers.routing.insert(.{
-            .node_id = sibling,
-            .pubkey = secp.compressedPubkey(&harness.candidate_key),
-            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 54 }, .port = @intCast(9054 + index) } },
-            .last_seen = 2,
-            .status = .disconnected,
-        }));
+        const sibling_ref = harness.actor.peers.lookup(&sibling) orelse try harness.actor.peers.remember(
+            sibling,
+            &candidate_pubkey,
+            .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 54 }, .port = @intCast(9054 + index) } },
+            false,
+        );
+        try std.testing.expect((try harness.actor.peers.admitRoute(sibling_ref, false, 2)).inserted);
     }
     var p2_id = harness.candidate_id;
     p2_id[30] ^= 0x56;
-    const p2_probe = harness.actor.peers.routing.insertDetailed(.{
-        .node_id = p2_id,
-        .pubkey = secp.compressedPubkey(&harness.candidate_key),
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 55 }, .port = 9055 } },
-        .last_seen = 3,
-        .status = .connected,
-    }).pending_eviction orelse return error.MissingP2;
+    const p2_addr = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 55 }, .port = 9055 } };
+    const p2_ref = try harness.actor.peers.remember(p2_id, &candidate_pubkey, p2_addr, false);
+    try harness.actor.peers.putEnr(p2_ref, &.{ 0xc1, 0x80 }, 1);
+    const p2_probe = harness.actor.peers.markResponsive(p2_id, p2_addr, 3, null).eviction_candidate orelse return error.MissingP2;
     try std.testing.expect(p2_probe.ticket.generation != harness.candidate.ticket.generation);
     try std.testing.expect(harness.actor.peers.armHealthRequest(reused_key, .{ .allow_eviction_candidate = p2_probe.ticket }));
 
@@ -498,9 +488,9 @@ test "stale P1 eviction success preserves P2 reservation when RequestKey is reus
         reused_key,
         .{ .eviction = harness.candidate.ticket.generation },
     );
-    const after_stale_cancel = harness.actor.peers.routing.getEntry(&harness.candidate_id) orelse return error.MissingIncumbent;
-    try std.testing.expect(after_stale_cancel.health_request != null);
-    try std.testing.expect(harness.bucket().pending != null);
+    _ = harness.actor.peers.activeRoute(&harness.candidate_id) orelse return error.MissingIncumbent;
+    try std.testing.expect(harness.actor.peers.healthRequest(&harness.candidate_id) != null);
+    try std.testing.expect(harness.actor.peers.pendingContains(p2_ref));
 
     // Exercise the actor completion boundary: stale authenticated P1 traffic
     // still proves incumbent liveness, but cannot consume P2's reservation.
@@ -511,12 +501,11 @@ test "stale P1 eviction success preserves P2 reservation when RequestKey is reus
         true,
         &.{},
     );
-    const incumbent = harness.actor.peers.routing.getEntry(&harness.candidate_id) orelse return error.MissingIncumbent;
-    try std.testing.expectEqual(EvictionHarness.kbucket_mod.EntryStatus.connected, incumbent.status);
-    const health_key = incumbent.health_request orelse return error.MissingP2Reservation;
+    _ = harness.actor.peers.activeRoute(&harness.candidate_id) orelse return error.MissingIncumbent;
+    try std.testing.expect(harness.actor.peers.routeIsConnected(&harness.candidate_id).?);
+    const health_key = harness.actor.peers.healthRequest(&harness.candidate_id) orelse return error.MissingP2Reservation;
     try std.testing.expect(types.RequestKeyContext.eql(.{}, reused_key, health_key));
-    try std.testing.expect(harness.bucket().pending != null);
-    try std.testing.expectEqualDeep(p2_id, harness.bucket().pending.?.entry.node_id);
+    try std.testing.expect(harness.actor.peers.pendingContains(p2_ref));
 }
 
 test "real eviction probe send failure rolls back reservation and bucket state" {
@@ -532,17 +521,16 @@ test "real eviction probe send failure rolls back reservation and bucket state" 
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id).?.health_request != null);
-    try std.testing.expect(harness.bucket().pending.?.request_key != null);
+    try std.testing.expect(harness.actor.peers.healthRequest(&harness.candidate_id) != null);
+    try std.testing.expect(harness.hasPending());
 
     try std.testing.expectError(error.TransportSendFailed, harness.drainEffects());
 
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), harness.actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&harness.candidate_id).?.health_request == null);
-    try std.testing.expect(harness.bucket().pending != null);
-    try std.testing.expectEqualSlices(u8, &harness.pending_id, &harness.bucket().pending.?.entry.node_id);
+    try std.testing.expect(harness.actor.peers.healthRequest(&harness.candidate_id) == null);
+    try std.testing.expect(harness.hasPending());
     harness.actor.requests.assertInvariants();
 }
 
@@ -585,7 +573,7 @@ test "health probe emits before transport and failed completion releases reserva
     harness.failEffects();
 
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expect(harness.actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+    try std.testing.expect(harness.actor.peers.healthRequest(&remote_id) == null);
 }
 
 test "health and eviction probes never queue behind endpoint establishment" {
@@ -622,14 +610,21 @@ test "health and eviction probes never queue behind endpoint establishment" {
     const req_id = try actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
     try std.testing.expectError(error.EndpointBusy, actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .{ .maintenance = .health }));
+    const remote_ref = actor.peers.lookup(&remote_id).?;
     actor.probeEviction(harness.env(), .{
-        .entry = actor.peers.routing.getEntry(&remote_id).?.*,
-        .ticket = .{ .incumbent_id = remote_id, .generation = 1 },
+        .endpoint = endpoint,
+        .pubkey = remote_pubkey,
+        .ticket = .{
+            .incumbent = remote_ref,
+            .candidate = remote_ref,
+            .probe = .{ .index = 0, .generation = 0 },
+            .generation = 1,
+        },
     });
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), actor.requests.queuedCount());
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
-    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+    try std.testing.expect(actor.peers.healthRequest(&remote_id) == null);
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
 
     const deadline_ns = actor.requests.get(req_id.key).?.deadline_ns;
@@ -637,13 +632,13 @@ test "health and eviction probes never queue behind endpoint establishment" {
     harness.drainEffectsIgnoringFailures();
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, actor.peers.routing.getEntry(&remote_id).?.status);
+    try std.testing.expect(actor.peers.routeIsConnected(&remote_id).?);
 }
 
 fn expectActorHealthRequest(actor: *const actor_mod.Actor, node_id: types.NodeId, expected: types.RequestKey) !void {
-    const actual = actor.peers.routing.getEntryWithPending(&node_id).?.health_request orelse return error.MissingHealthRequest;
+    const actual = actor.peers.healthRequest(&node_id) orelse return error.MissingHealthRequest;
     try std.testing.expect(types.RequestKeyContext.eql(.{}, actual, expected));
-    try std.testing.expectEqual(@import("../kbucket.zig").EntryStatus.connected, actor.peers.routing.getEntry(&node_id).?.status);
+    try std.testing.expect(actor.peers.routeIsConnected(&node_id).?);
 }
 
 test "named cancellation conserves permits and queued FIFO across drain failure" {
@@ -910,8 +905,8 @@ test "fresh FINDNODE retry resets multipart generation and swaps one permit" {
     const raw_b = try builder_b.encode();
     defer alloc.free(raw_b);
     const id_b = (try (try enr.decode(raw_b)).nodeId()).?;
-    const distance_a: u16 = if (@import("../kbucket.zig").logDistance(&id_a, &remote_id)) |value| @as(u16, value) + 1 else 0;
-    const distance_b: u16 = if (@import("../kbucket.zig").logDistance(&id_b, &remote_id)) |value| @as(u16, value) + 1 else 0;
+    const distance_a: u16 = if (peer_store.logDistance(&id_a, &remote_id)) |value| @as(u16, value) + 1 else 0;
+    const distance_b: u16 = if (peer_store.logDistance(&id_b, &remote_id)) |value| @as(u16, value) + 1 else 0;
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,

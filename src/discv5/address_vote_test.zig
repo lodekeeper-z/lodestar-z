@@ -212,7 +212,7 @@ test "Actor coalesces alternating address updates through a deterministic cooldo
     try drainEffects(&actor, env, &effects, &recording);
     try std.testing.expectEqual(@as(u64, 2), actor.localEnrSeq());
     try std.testing.expectEqual(@as(usize, 1), recording.datagrams.items.len);
-    const propagation = actor.peers.routing.getEntry(&remote_id).?.health_request orelse return error.MissingPropagationPing;
+    const propagation = actor.peers.healthRequest(&remote_id) orelse return error.MissingPropagationPing;
     const propagation_handle = actor.requests.handleFor(propagation) orelse return error.MissingPropagationHandle;
     try std.testing.expect(actor.cancelRequest(env, propagation_handle));
 

@@ -10,6 +10,7 @@ const lookup_mod = @import("../service/lookup.zig");
 const packet = @import("../protocol/packet.zig");
 const message = @import("../protocol/message.zig");
 const secp = @import("../secp256k1.zig");
+const peer_store = @import("../state/peer_store.zig");
 const session_book = @import("../state/session_book.zig");
 const types = @import("../types.zig");
 const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
@@ -286,7 +287,7 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try pong.encodeInto(&pong_buffer), 12);
 
     try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
-    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+    try std.testing.expect(actor.peers.healthRequest(&remote_id) == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 }
@@ -454,7 +455,7 @@ test "detached late multipart NODES still learns emits and releases final permit
     const discovered_enr = try discovered_builder.encode();
     defer alloc.free(discovered_enr);
     const discovered_id = (try (try enr.decode(discovered_enr)).nodeId()).?;
-    const distance: u16 = if (@import("../kbucket.zig").logDistance(&discovered_id, &remote_id)) |value| @as(u16, value) + 1 else 0;
+    const distance: u16 = if (peer_store.logDistance(&discovered_id, &remote_id)) |value| @as(u16, value) + 1 else 0;
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
@@ -519,8 +520,8 @@ test "Actor RPC NODES accumulation avoids compatibility payload allocations" {
     const raw_b = try builder_b.encode();
     defer alloc.free(raw_b);
     const id_b = (try (try enr.decode(raw_b)).nodeId()).?;
-    const distance_a: u16 = if (@import("../kbucket.zig").logDistance(&id_a, &remote_id)) |value| @as(u16, value) + 1 else 0;
-    const distance_b: u16 = if (@import("../kbucket.zig").logDistance(&id_b, &remote_id)) |value| @as(u16, value) + 1 else 0;
+    const distance_a: u16 = if (peer_store.logDistance(&id_a, &remote_id)) |value| @as(u16, value) + 1 else 0;
+    const distance_b: u16 = if (peer_store.logDistance(&id_b, &remote_id)) |value| @as(u16, value) + 1 else 0;
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,

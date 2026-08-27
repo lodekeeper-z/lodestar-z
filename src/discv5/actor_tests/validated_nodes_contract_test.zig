@@ -2,13 +2,13 @@ const std = @import("std");
 const actor_mod = @import("../actor.zig");
 const config = @import("../config.zig");
 const enr = @import("../enr.zig");
-const kbucket = @import("../kbucket.zig");
+const peer_store = @import("../state/peer_store.zig");
 const lookup_mod = @import("../service/lookup.zig");
 const message = @import("../protocol/message.zig");
 const metrics = @import("../metrics.zig");
 const outbound = @import("../flow/outbound.zig");
 const packet = @import("../protocol/packet.zig");
-const peer_book = @import("../state/peer_book.zig");
+
 const lookup_results = @import("../lookup_results.zig");
 const request_results = @import("../request_results.zig");
 const secp = @import("../secp256k1.zig");
@@ -108,20 +108,20 @@ test "validated NODES ENR preserves fields and enabled address selection" {
 
     const address4 = types.Address{ .ip4 = .{ .bytes = builder.ip.?, .port = builder.udp.? } };
     const address6 = types.Address{ .ip6 = .{ .bytes = builder.ip6.?, .port = builder.udp6.? } };
-    var ip4_only = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, false);
+    var ip4_only = try peer_store.PeerStore.initWithFallbackCapacity(alloc, [_]u8{0} ** 32, true, false, 4);
     defer ip4_only.deinit();
     try std.testing.expectEqual(remote_id, ip4_only.learnValidatedEnr(&validated, 1).?);
-    try std.testing.expect(ip4_only.routing.getEntry(&remote_id).?.addr.eql(&address4));
+    try std.testing.expect(ip4_only.activeRoute(&remote_id).?.addr.eql(&address4));
 
-    var ip6_only = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, false, true);
+    var ip6_only = try peer_store.PeerStore.initWithFallbackCapacity(alloc, [_]u8{0} ** 32, false, true, 4);
     defer ip6_only.deinit();
     try std.testing.expectEqual(remote_id, ip6_only.learnValidatedEnr(&validated, 2).?);
-    try std.testing.expect(ip6_only.routing.getEntry(&remote_id).?.addr.eql(&address6));
+    try std.testing.expect(ip6_only.activeRoute(&remote_id).?.addr.eql(&address6));
 
-    var dual = try peer_book.PeerBook.init(alloc, [_]u8{0} ** 32, 4, true, true);
+    var dual = try peer_store.PeerStore.initWithFallbackCapacity(alloc, [_]u8{0} ** 32, true, true, 4);
     defer dual.deinit();
     try std.testing.expectEqual(remote_id, dual.learnValidatedEnr(&validated, 3).?);
-    try std.testing.expect(dual.routing.getEntry(&remote_id).?.addr.eql(&address4));
+    try std.testing.expect(dual.activeRoute(&remote_id).?.addr.eql(&address4));
 
     const tampered = try alloc.dupe(u8, raw);
     defer alloc.free(tampered);
@@ -182,8 +182,8 @@ test "validated NODES boundary rejects invalid signatures and preserves reliable
     const partial = &actor.requests.get(req_id.key).?.response.nodes;
     try std.testing.expectEqual(@as(usize, 1), partial.validated_enrs.slice().len);
     try std.testing.expectEqual(returned_a.node_id, partial.validated_enrs.slice()[0].node_id);
-    const learned_a = actor.peers.routing.getEntry(&returned_a.node_id) orelse return error.MissingLearnedPeer;
-    try std.testing.expectEqualSlices(u8, returned_a.raw, learned_a.enrBytes());
+    const learned_a = actor.peers.activeRoute(&returned_a.node_id) orelse return error.MissingLearnedPeer;
+    try std.testing.expectEqualSlices(u8, returned_a.raw, learned_a.enr.?.slice());
     try std.testing.expectEqual(@as(u64, 4), learned_a.enr_seq);
     try std.testing.expect(learned_a.addr.eql(&returned_a.address));
     var discovered_a = harness.outbox.pop() orelse return error.MissingDiscoveredEvent;
@@ -392,10 +392,10 @@ test "discv5 lookup duplicate uses newer routed ENR for dispatch and result" {
     try deliverEncrypted(actor, env, responder_endpoint, &responder_session.recipient_key, try stale_nodes.encodeInto(&stale_buffer), 0xc8);
     try harness.drainEffects();
 
-    const routed = actor.peers.routing.getEntry(&newer.node_id) orelse return error.MissingRoutedCandidate;
+    const routed = actor.peers.activeRoute(&newer.node_id) orelse return error.MissingRoutedCandidate;
     try std.testing.expectEqual(@as(u64, 2), routed.enr_seq);
     try std.testing.expect(routed.addr.eql(&newer.address));
-    try std.testing.expectEqualSlices(u8, newer.raw, routed.enrBytes());
+    try std.testing.expectEqualSlices(u8, newer.raw, routed.enr.?.slice());
     const active_lookup = actor.lookups.getPtr(lookup_id) orelse return error.LookupFinishedBeforeCanonicalDispatch;
     const retained = active_lookup.localCandidate(&newer.node_id) orelse return error.MissingLookupLocalContact;
     try std.testing.expectEqual(@as(u64, 2), retained.seq);
@@ -447,20 +447,21 @@ test "discv5 lookup-local contact dispatch replaces full untrusted fallback rete
 
     const contact_id = [_]u8{0xa4} ** 32;
     actor.peers.rememberContact(contact_id, &responder_pubkey, endpoint.addr, false);
-    try std.testing.expectEqual(@as(usize, 1), actor.peers.contacts.count());
-    const candidate_bucket = kbucket.logDistance(&local_id, &returned.node_id) orelse return error.InvalidTestIdentity;
+    try std.testing.expectEqual(@as(usize, 1), actor.peers.fallbackCount());
+    const candidate_bucket = peer_store.logDistance(&local_id, &returned.node_id) orelse return error.InvalidTestIdentity;
     try std.testing.expect(candidate_bucket >= 8);
-    for (1..kbucket.K + 1) |value| {
+    for (1..peer_store.K + 1) |value| {
         var filler_id = returned.node_id;
         filler_id[31] ^= @intCast(value);
-        try std.testing.expect(actor.peers.routing.insert(.{
-            .node_id = filler_id,
-            .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 1, @intCast(value) }, .port = @intCast(9200 + value) } },
-            .last_seen = 0,
-            .status = .disconnected,
-        }));
+        const filler_ref = try actor.peers.remember(
+            filler_id,
+            &responder_pubkey,
+            .{ .ip4 = .{ .bytes = .{ 127, 0, 1, @intCast(value) }, .port = @intCast(9200 + value) } },
+            false,
+        );
+        try std.testing.expect((try actor.peers.admitRoute(filler_ref, false, 0)).inserted);
     }
-    try std.testing.expectEqual(kbucket.K, actor.peers.routing.getBucket(candidate_bucket).len);
+    try std.testing.expectEqual(peer_store.K, actor.peers.routeCount());
 
     const stable = session_book.StableSession{
         .initiator_key = [_]u8{0xa5} ** 16,
@@ -504,7 +505,7 @@ test "discv5 lookup-local contact dispatch replaces full untrusted fallback rete
     try std.testing.expect(harness.recording.datagrams.items[1].address.eql(&returned.address));
 }
 
-test "discv5 lookup-local successful result retains raw ENR without PeerBook" {
+test "discv5 lookup-local successful result retains raw ENR without long-lived fallback ownership" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0xa8} ** 32));
@@ -699,7 +700,7 @@ fn testConfig(local_key: secp.KeyPair, event_capacity: usize) config.Config {
 }
 
 fn wireDistance(node_id: *const types.NodeId, responder_id: *const types.NodeId) u16 {
-    return if (kbucket.logDistance(node_id, responder_id)) |value| @as(u16, value) + 1 else 0;
+    return if (peer_store.logDistance(node_id, responder_id)) |value| @as(u16, value) + 1 else 0;
 }
 
 fn deliverEncrypted(

@@ -11,6 +11,7 @@ const message = @import("../protocol/message.zig");
 const request_results = @import("../request_results.zig");
 const metrics = @import("../metrics.zig");
 const secp = @import("../secp256k1.zig");
+const peer_store = @import("../state/peer_store.zig");
 const session_book = @import("../state/session_book.zig");
 const types = @import("../types.zig");
 const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
@@ -588,18 +589,13 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
         const remote_key = try secp.keyPairFromSecret(&secret);
         const remote_pubkey = secp.compressedPubkey(&remote_key);
         const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
-        if (@import("../kbucket.zig").logDistance(&local_id, &remote_id) != 255) continue;
+        if (peer_store.logDistance(&local_id, &remote_id) != 255) continue;
         const address = types.Address{ .ip4 = .{
             .bytes = .{ 127, 0, 0, @as(u8, @intCast(candidate)) },
             .port = @as(u16, @intCast(10_000 + candidate)),
         } };
-        try std.testing.expect(actor.peers.routing.insert(.{
-            .node_id = remote_id,
-            .pubkey = remote_pubkey,
-            .addr = address,
-            .last_seen = 0,
-            .status = .connected,
-        }));
+        const peer_ref = try actor.peers.remember(remote_id, &remote_pubkey, address, false);
+        try std.testing.expect((try actor.peers.admitRoute(peer_ref, true, 0)).inserted);
         peer_ids[peer_count] = remote_id;
         peer_addresses[peer_count] = address;
         peer_count += 1;
@@ -613,7 +609,7 @@ test "local ENR update pings every connected peer in a live bucket exactly once"
     try std.testing.expectEqual(peer_ids.len, actor.requests.activeCount());
     try std.testing.expectEqual(peer_ids.len, harness.ingress.permitCount());
     for (peer_ids, peer_addresses) |peer_id, address| {
-        try std.testing.expect(actor.peers.routing.getEntry(&peer_id).?.health_request != null);
+        try std.testing.expect(actor.peers.healthRequest(&peer_id) != null);
         var address_count: usize = 0;
         for (harness.recording.datagrams.items) |datagram| {
             if (datagram.address.eql(&address)) address_count += 1;
@@ -642,25 +638,20 @@ test "maintenance schedules the next health probe only after a successful send" 
     const remote_pubkey = secp.compressedPubkey(&remote_key);
     const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
     const remote_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 90 }, .port = 10_059 } };
-    try std.testing.expect(actor.peers.routing.insert(.{
-        .node_id = remote_id,
-        .pubkey = remote_pubkey,
-        .addr = remote_address,
-        .last_seen = outbound.nowNs(io),
-        .status = .connected,
-    }));
+    const remote_ref = try actor.peers.remember(remote_id, &remote_pubkey, remote_address, false);
+    try std.testing.expect((try actor.peers.admitRoute(remote_ref, true, outbound.nowNs(io))).inserted);
 
     harness.recording.fail_next = true;
     actor.maintenance(harness.env());
     try std.testing.expectError(error.TransportSendFailed, harness.drainEffects());
     try std.testing.expectEqual(@as(usize, 0), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+    try std.testing.expect(actor.peers.healthRequest(&remote_id) == null);
 
     actor.maintenance(harness.env());
     try harness.drainEffects();
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
-    const health_request = actor.peers.routing.getEntry(&remote_id).?.health_request orelse
+    const health_request = actor.peers.healthRequest(&remote_id) orelse
         return error.MissingHealthRequest;
     const health_handle = actor.requests.handleFor(health_request) orelse return error.MissingHealthRequestHandle;
     try std.testing.expect(actor.cancelRequest(harness.env(), health_handle));
@@ -669,7 +660,7 @@ test "maintenance schedules the next health probe only after a successful send" 
     try harness.drainEffects();
     try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expect(actor.peers.routing.getEntry(&remote_id).?.health_request == null);
+    try std.testing.expect(actor.peers.healthRequest(&remote_id) == null);
 }
 
 test "NODES total is exact bounded consistent and controls final permit release" {

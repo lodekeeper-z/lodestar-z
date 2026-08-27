@@ -6,7 +6,6 @@ const config_mod = @import("config.zig");
 const enr = @import("enr.zig");
 const events = @import("events.zig");
 const completion = @import("flow/completion.zig");
-const kbucket = @import("kbucket.zig");
 const lookup_mod = @import("service/lookup.zig");
 const lookup_results = @import("lookup_results.zig");
 const message = @import("protocol/message.zig");
@@ -15,7 +14,7 @@ const metrics_mod = @import("metrics.zig");
 const outbound = @import("flow/outbound.zig");
 const maintenance_flow = @import("flow/maintenance.zig");
 const session_flow = @import("flow/session.zig");
-const peer_book = @import("state/peer_book.zig");
+const peer_store = @import("state/peer_store.zig");
 const public_api = @import("public_api.zig");
 const request_book = @import("state/request_book.zig");
 const response_book = @import("state/response_book.zig");
@@ -296,7 +295,7 @@ pub const Actor = struct {
     sessions: session_book.SessionBook,
     requests: request_book.RequestBook,
     responses: response_book.ResponseBook,
-    peers: peer_book.PeerBook,
+    peers: peer_store.PeerStore,
     lookups: std.AutoHashMap(u32, lookup_mod.Lookup),
     votes_ip4: addr_votes.AddrVotes,
     votes_ip6: addr_votes.AddrVotes,
@@ -325,12 +324,12 @@ pub const Actor = struct {
         errdefer requests.deinitEmpty();
         var responses = try response_book.ResponseBook.init(alloc, config);
         errdefer responses.deinitEmpty(alloc);
-        var peers = try peer_book.PeerBook.init(
+        var peers = try peer_store.PeerStore.initWithFallbackCapacity(
             alloc,
             local_node_id,
-            config.limits.contact_capacity,
             config.bind_addresses.ip4 != null,
             config.bind_addresses.ip6 != null,
+            config.limits.contact_capacity,
         );
         errdefer peers.deinit();
         var lookups = std.AutoHashMap(u32, lookup_mod.Lookup).init(alloc);
@@ -534,9 +533,7 @@ pub const Actor = struct {
     fn onRequestSendSuccess(self: *Actor, env: Env, key: types.RequestKey, origin: types.RequestOrigin) void {
         switch (origin) {
             .maintenance => |reason| switch (reason) {
-                .health => if (self.peers.routing.getEntryMutWithPending(&key.endpoint.node_id)) |peer| {
-                    peer.next_ping_at_ns = outbound.deadlineNs(outbound.nowNs(env.io), self.ping_interval_ms);
-                },
+                .health => _ = self.peers.setNextPing(&key.endpoint.node_id, outbound.deadlineNs(outbound.nowNs(env.io), self.ping_interval_ms)),
                 .enr_propagation, .enr_refresh => {},
             },
             .api, .reliable_api, .lookup, .detached_lookup, .eviction => {},
@@ -549,10 +546,11 @@ pub const Actor = struct {
                 .health, .enr_propagation => _ = self.peers.cancelHealthRequest(key),
                 .enr_refresh => {},
             },
-            .eviction => |generation| _ = self.peers.cancelEvictionRequest(.{
-                .incumbent_id = key.endpoint.node_id,
-                .generation = generation,
-            }, key),
+            .eviction => |generation| {
+                if (self.peers.currentEvictionTicket(&key.endpoint.node_id, generation)) |ticket| {
+                    _ = self.peers.cancelEvictionRequest(ticket, key);
+                }
+            },
             .lookup => |id| {
                 if (self.lookups.getPtr(id)) |lookup| {
                     lookup.onFailure(&key.endpoint.node_id, self.lookup_config);
@@ -754,7 +752,7 @@ pub const Actor = struct {
         if (!result_outbox.claim()) return error.LookupResultReservationMissing;
         if (self.lookups.count() >= MAX_LOOKUPS) return error.TooManyLookups;
         var seeds: [lookup_mod.MAX_RESULTS]types.NodeId = undefined;
-        const found = self.peers.routing.findClosestNodeIds(&target, lookup_mod.MAX_RESULTS, &seeds);
+        const found = self.peers.findClosest(&target, &seeds);
         const id = self.allocateLookupId() orelse return error.TooManyLookups;
         var lookup = try lookup_mod.Lookup.init(self.alloc, target, seeds[0..found], outbound.nowNs(env.io), self.lookup_config);
         errdefer lookup.deinit(self.alloc);
@@ -792,10 +790,11 @@ pub const Actor = struct {
                 .health, .enr_propagation => _ = self.peers.cancelHealthRequest(key),
                 .enr_refresh => {},
             },
-            .eviction => |generation| _ = self.peers.cancelEvictionRequest(.{
-                .incumbent_id = key.endpoint.node_id,
-                .generation = generation,
-            }, key),
+            .eviction => |generation| {
+                if (self.peers.currentEvictionTicket(&key.endpoint.node_id, generation)) |ticket| {
+                    _ = self.peers.cancelEvictionRequest(ticket, key);
+                }
+            },
             .api, .reliable_api, .detached_lookup => {},
         }
     }
@@ -811,10 +810,10 @@ pub const Actor = struct {
         if (success) {
             const now_ns = outbound.nowNs(env.io);
             const responsive = switch (origin) {
-                .eviction => |generation| self.peers.markEvictionResponsive(.{
-                    .incumbent_id = key.endpoint.node_id,
-                    .generation = generation,
-                }, key, now_ns),
+                .eviction => |generation| if (self.peers.currentEvictionTicket(&key.endpoint.node_id, generation)) |ticket|
+                    self.peers.markEvictionResponsive(ticket, key, now_ns)
+                else
+                    self.peers.markResponsive(key.endpoint.node_id, key.endpoint.addr, now_ns, null),
                 else => self.peers.markResponsive(key.endpoint.node_id, key.endpoint.addr, now_ns, key),
             };
             self.publishConnection(env.outbox, key.endpoint.node_id, responsive.transition);
@@ -831,13 +830,10 @@ pub const Actor = struct {
                 .enr_refresh => {},
             },
             .eviction => |generation| {
-                const ticket = kbucket.EvictionTicket{
-                    .incumbent_id = key.endpoint.node_id,
-                    .generation = generation,
-                };
+                const ticket = self.peers.currentEvictionTicket(&key.endpoint.node_id, generation) orelse return;
                 if (success) {
-                    _ = self.peers.resolveEvictionSuccess(ticket, key);
-                } else if (self.peers.completeEvictionTimeout(ticket, key)) |event| {
+                    _ = self.peers.resolveEvictionRequestSuccess(ticket, key);
+                } else if (self.peers.completeEvictionRequestTimeout(ticket, key)) |event| {
                     self.publishConnection(env.outbox, event.node_id, event.transition);
                 }
             },
@@ -888,7 +884,7 @@ pub const Actor = struct {
         std.debug.assert(self.requests.firstQueuedRequest() == null);
     }
 
-    pub fn publishConnection(self: *Actor, outbox: *events.EventOutbox, node_id: types.NodeId, transition: peer_book.ConnectionTransition) void {
+    pub fn publishConnection(self: *Actor, outbox: *events.EventOutbox, node_id: types.NodeId, transition: peer_store.ConnectionTransition) void {
         _ = self;
         switch (transition) {
             .none => {},
@@ -901,7 +897,7 @@ pub const Actor = struct {
         const contacts = self.peers.contactMetricsSnapshot();
         const sessions = self.sessions.metricsSnapshot();
         return .{
-            .kad_table_size = self.peers.routing.nodeCount(),
+            .kad_table_size = self.peers.routeCount(),
             .active_session_count = sessions.count,
             .connected_peer_count = self.peers.connectedCount(),
             .lookup_count = self.lookup_count,
@@ -989,14 +985,12 @@ pub const Actor = struct {
         self.pingAll(env);
     }
 
-    pub fn probeEviction(self: *Actor, env: Env, probe: kbucket.EvictionProbe) void {
+    pub fn probeEviction(self: *Actor, env: Env, probe: peer_store.EvictionProbe) void {
         self.sendEvictionProbe(env, probe) catch return;
     }
 
-    fn sendEvictionProbe(self: *Actor, env: Env, probe: kbucket.EvictionProbe) !void {
-        if (probe.entry.health_request != null) return error.ProbeUnavailable;
-        const known = self.peers.known(&probe.entry.node_id) orelse return error.ProbeUnavailable;
-        const endpoint = types.Endpoint{ .node_id = known.node_id, .addr = probe.entry.addr };
+    fn sendEvictionProbe(self: *Actor, env: Env, probe: peer_store.EvictionProbe) !void {
+        const endpoint = probe.endpoint;
         const req_id = randomReqId(env.io);
         const key = types.RequestKey.init(endpoint, req_id);
         if (!self.peers.armHealthRequest(key, .{ .allow_eviction_candidate = probe.ticket })) return error.ProbeUnavailable;
@@ -1010,7 +1004,7 @@ pub const Actor = struct {
             self,
             .{ .io = env.io, .ingress = env.ingress },
             endpoint,
-            &known.pubkey,
+            &probe.pubkey,
             req_id,
             .ping,
             &.{},
@@ -1036,7 +1030,7 @@ pub const Actor = struct {
         endpoint: types.Endpoint,
         pubkey: *const [33]u8,
         reason: types.MaintenanceReason,
-        policy: peer_book.PeerBook.HealthReservationPolicy,
+        policy: peer_store.HealthReservationPolicy,
     ) !message.ReqId {
         std.debug.assert(reason == .health or reason == .enr_propagation);
         const req_id = randomReqId(env.io);
@@ -1212,19 +1206,9 @@ pub const Actor = struct {
     }
 
     fn pingAll(self: *Actor, env: Env) void {
-        for (self.peers.routing.buckets) |*bucket| {
-            var snapshots: [kbucket.K]ProbeSnapshot = undefined;
-            var count: usize = 0;
-            for (bucket.entries[0..bucket.count]) |entry| {
-                if (entry.status != .connected or entry.health_request != null) continue;
-                const known = self.peers.known(&entry.node_id) orelse continue;
-                std.debug.assert(count < snapshots.len);
-                snapshots[count] = .{
-                    .endpoint = .{ .node_id = entry.node_id, .addr = entry.addr },
-                    .pubkey = known.pubkey,
-                };
-                count += 1;
-            }
+        for (0..peer_store.ROUTE_BUCKETS) |distance| {
+            var snapshots: [peer_store.K]peer_store.ProbeSnapshot = undefined;
+            const count = self.peers.collectDueProbesInBucket(@intCast(distance), std.math.maxInt(i64), &snapshots);
             for (snapshots[0..count]) |*snapshot| {
                 _ = self.sendProbe(env, snapshot.endpoint, &snapshot.pubkey, .enr_propagation, .connected_only) catch continue;
             }

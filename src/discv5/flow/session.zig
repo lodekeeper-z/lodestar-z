@@ -397,9 +397,9 @@ fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonc
     var challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
     var remote_enr: ?enr.RawEnr = null;
     var remote_seq: u64 = 0;
-    if (actor.peers.routing.getEntry(&endpoint.node_id)) |entry| {
-        remote_seq = entry.enr_seq;
-        remote_enr = entry.enr;
+    if (actor.peers.activeRoute(&endpoint.node_id)) |route| {
+        remote_seq = route.enr_seq;
+        remote_enr = route.enr;
     }
     var buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
     const datagram = packet.encodeWhoareyouPacketInto(&buffer, .{

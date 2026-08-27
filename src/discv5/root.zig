@@ -21,7 +21,7 @@ pub const RequestId = public_api.RequestId;
 pub const RequestHandle = public_api.RequestHandle;
 pub const RateLimitConfig = rate_limit.Config;
 pub const MetricsSnapshot = metrics.MetricsSnapshot;
-pub const ContactMetricsSnapshot = @import("contact_book.zig").ContactMetricsSnapshot;
+pub const ContactMetricsSnapshot = @import("state/peer_store.zig").ContactMetricsSnapshot;
 pub const SessionMetricsSnapshot = @import("state/session_book.zig").SessionMetricsSnapshot;
 pub const LookupResult = @import("lookup_results.zig").LookupResult;
 pub const LookupTerminalReason = @import("lookup_results.zig").LookupTerminalReason;
@@ -73,8 +73,6 @@ test {
     _ = @import("protocol/message.zig");
     _ = @import("protocol/message_test.zig");
     _ = @import("protocol/handshake.zig");
-    _ = @import("kbucket.zig");
-    _ = @import("kbucket_test.zig");
     _ = @import("lru.zig");
     _ = @import("rate_limit.zig");
     _ = @import("metrics.zig");
@@ -88,8 +86,7 @@ test {
     _ = @import("state/request_queue.zig");
     _ = @import("state/request_book_test.zig");
     _ = @import("state/response_book.zig");
-    _ = @import("state/peer_book_test.zig");
-    _ = @import("contact_book.zig");
+    _ = @import("state/peer_store_test.zig");
     _ = @import("actor_tests/eviction_request_lifecycle.zig");
     _ = @import("actor_tests/session_handshake_recovery.zig");
     _ = @import("actor_tests/event_lookup_allocator_failures.zig");

@@ -3,8 +3,7 @@ const actor_mod = @import("../actor.zig");
 const config = @import("../config.zig");
 const outbound = @import("outbound.zig");
 const completion = @import("completion.zig");
-const kbucket = @import("../kbucket.zig");
-const peer_book = @import("../state/peer_book.zig");
+const peer_store = @import("../state/peer_store.zig");
 const request_book = @import("../state/request_book.zig");
 const packet = @import("../protocol/packet.zig");
 const types = @import("../types.zig");
@@ -30,7 +29,7 @@ pub fn run(actor: *Actor, env: Env, now_ns: i64) void {
     redrainQueued(actor, env);
     pruneLookups(actor, env, now_ns);
     actor.repumpLookups(env);
-    var transitions: [kbucket.NUM_BUCKETS]peer_book.ConnectionEvent = undefined;
+    var transitions: [peer_store.ROUTE_BUCKETS]peer_store.ConnectionEvent = undefined;
     const transition_count = actor.peers.prune(now_ns, actor.bucket_pending_timeout_ms, &transitions);
     for (transitions[0..transition_count]) |event| actor.publishConnection(env.outbox, event.node_id, event.transition);
     pingDue(actor, env, now_ns);
@@ -183,19 +182,9 @@ fn pruneLookups(actor: *Actor, env: Env, now_ns: i64) void {
 
 fn pingDue(actor: *Actor, env: Env, now_ns: i64) void {
     if (actor.ping_interval_ms == 0) return;
-    for (actor.peers.routing.buckets) |*bucket| {
-        var snapshots: [kbucket.K]actor_mod.ProbeSnapshot = undefined;
-        var count: usize = 0;
-        for (bucket.entries[0..bucket.count]) |entry| {
-            if (entry.status != .connected or entry.health_request != null or entry.next_ping_at_ns > now_ns) continue;
-            const known = actor.peers.known(&entry.node_id) orelse continue;
-            std.debug.assert(count < snapshots.len);
-            snapshots[count] = .{
-                .endpoint = .{ .node_id = entry.node_id, .addr = entry.addr },
-                .pubkey = known.pubkey,
-            };
-            count += 1;
-        }
+    for (0..peer_store.ROUTE_BUCKETS) |distance| {
+        var snapshots: [peer_store.K]peer_store.ProbeSnapshot = undefined;
+        const count = actor.peers.collectDueProbesInBucket(@intCast(distance), now_ns, &snapshots);
         for (snapshots[0..count]) |*snapshot| {
             _ = actor.sendProbe(
                 env,
