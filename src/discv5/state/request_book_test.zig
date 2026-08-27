@@ -1,7 +1,9 @@
 const std = @import("std");
 const admission = @import("../admission.zig");
+const enr = @import("../enr.zig");
 const message = @import("../protocol/message.zig");
 const book_mod = @import("request_book.zig");
+const secp = @import("../secp256k1.zig");
 const types = @import("../types.zig");
 const config_mod = @import("../config.zig");
 
@@ -202,7 +204,7 @@ test "copied request handshake completion commits exact generation once" {
     try std.testing.expectEqual(@as(i64, 9), book.get(key).?.deadline_ns);
 }
 
-test "failed request handshake restores exact challengeable request and rejects copied success" {
+test "large NODES request stays canonical and unchanged across handshake rollback and send" {
     var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
     defer ingress.deinit();
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
@@ -218,25 +220,81 @@ test "failed request handshake restores exact challengeable request and rejects 
     active_before.attempts = 7;
     active_before.response.nodes.total_responses = 3;
     active_before.response.nodes.responses_received = 1;
+    const enr_key = try secp.keyPairFromSecret(&([_]u8{0x38} ** 32));
+    var enr_builder = enr.Builder.init(std.testing.allocator, enr_key, 38);
+    enr_builder.ip = .{ 127, 0, 0, 38 };
+    enr_builder.udp = 9038;
+    const raw_enr = try enr_builder.encode();
+    defer std.testing.allocator.free(raw_enr);
+    active_before.response.nodes.validated_enrs.append(try enr.ValidatedEnr.init(raw_enr));
+    const canonical_address = @intFromPtr(active_before);
     const preparation = try book.challenge(&recovery.nonce, key.endpoint.addr);
     const handle = try book.beginHandshake(preparation, .{
         .initiator_key = [_]u8{12} ** 16,
         .recipient_key = [_]u8{13} ** 16,
     }, 99);
     const copied = handle;
+    const sending = book_mod.Testing.handshakeCanonicalActive(&book, handle) orelse return error.MissingCanonicalHandshakeRequest;
+    try std.testing.expectEqual(canonical_address, @intFromPtr(sending));
+    try expectSeededNodesUnchanged(sending, &distances, &recovery, raw_enr);
+    try std.testing.expectEqual(@as(i64, 4), sending.deadline_ns);
+    try std.testing.expectEqual(@as(u32, 7), sending.attempts);
+    try std.testing.expect(book.get(key) == null);
+    try std.testing.expect(book.pendingKeys(key.endpoint) == null);
+    try std.testing.expectError(error.InvalidChallenge, book.challenge(&recovery.nonce, key.endpoint.addr));
+    try std.testing.expectError(error.StaleRequest, book.beginHandshake(preparation, .{
+        .initiator_key = [_]u8{1} ** 16,
+        .recipient_key = [_]u8{2} ** 16,
+    }, 100));
+    var timeout_scan = book_mod.RequestBook.ActiveScan{};
+    var timed_out: [1]types.RequestKey = undefined;
+    try std.testing.expectEqual(@as(usize, 0), book.collectTimedOutBatch(&timed_out, 100, &timeout_scan));
     try std.testing.expect(!book.hasChallenge(&recovery.nonce, key.endpoint.addr));
 
     try std.testing.expectEqual(types.RequestKind.findnode, (book.completeHandshake(handle, .failed) orelse return error.HandshakeCompletionRejected).kind);
     try std.testing.expect(book.completeHandshake(copied, .sent) == null);
     const restored = book.get(key) orelse return error.MissingRestoredRequest;
+    try std.testing.expectEqual(canonical_address, @intFromPtr(restored));
+    try expectSeededNodesUnchanged(restored, &distances, &recovery, raw_enr);
     try std.testing.expectEqual(@as(i64, 4), restored.deadline_ns);
     try std.testing.expectEqual(@as(u32, 7), restored.attempts);
-    try std.testing.expectEqual(@as(u64, 3), restored.response.nodes.total_responses.?);
-    try std.testing.expectEqual(@as(u64, 1), restored.response.nodes.responses_received);
-    try std.testing.expect(restored.phase.awaiting_response.wait == .session_request);
     try std.testing.expect(book.hasChallenge(&recovery.nonce, key.endpoint.addr));
     try std.testing.expect(book.canEstablish(key));
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+
+    const sent = try book.beginHandshake(try book.challenge(&recovery.nonce, key.endpoint.addr), .{
+        .initiator_key = [_]u8{14} ** 16,
+        .recipient_key = [_]u8{15} ** 16,
+    }, 101);
+    _ = book.completeHandshake(sent, .sent) orelse return error.HandshakeCompletionRejected;
+    const committed = book.get(key) orelse return error.MissingCommittedRequest;
+    try std.testing.expectEqual(canonical_address, @intFromPtr(committed));
+    try std.testing.expectEqual(@as(u64, 3), committed.response.nodes.total_responses.?);
+    try std.testing.expectEqual(@as(u64, 1), committed.response.nodes.responses_received);
+    try std.testing.expectEqual(@as(usize, 1), committed.response.nodes.validated_enrs.slice().len);
+    try std.testing.expectEqualSlices(u8, raw_enr, committed.response.nodes.validated_enrs.slice()[0].raw.slice());
+    try std.testing.expectEqual(@as(u32, 7), committed.attempts);
+    try std.testing.expectEqual(@as(i64, 101), committed.deadline_ns);
+    try std.testing.expect(committed.phase.awaiting_response.wait == .handshake_sent);
+}
+
+fn expectSeededNodesUnchanged(
+    active: *const book_mod.ActiveRequest,
+    distances: *const book_mod.RequestDistances,
+    recovery: *const book_mod.RecoveryState,
+    raw_enr: []const u8,
+) !void {
+    try std.testing.expect(active.response == .nodes);
+    try std.testing.expectEqual(@as(u64, 3), active.response.nodes.total_responses.?);
+    try std.testing.expectEqual(@as(u64, 1), active.response.nodes.responses_received);
+    try std.testing.expectEqual(distances.*, active.response.nodes.requested_distances);
+    try std.testing.expectEqual(@as(usize, 1), active.response.nodes.validated_enrs.slice().len);
+    try std.testing.expectEqualSlices(u8, raw_enr, active.response.nodes.validated_enrs.slice()[0].raw.slice());
+    try std.testing.expect(active.phase == .awaiting_response);
+    try std.testing.expect(active.phase.awaiting_response.wait == .session_request);
+    try std.testing.expectEqual(recovery.nonce, active.phase.awaiting_response.recovery.nonce);
+    try std.testing.expectEqual(recovery.dest_pubkey, active.phase.awaiting_response.recovery.dest_pubkey);
+    try std.testing.expectEqualSlices(u8, recovery.plaintext.slice(), active.phase.awaiting_response.recovery.plaintext.slice());
 }
 
 test "request handshake generation exhaustion is failure atomic" {

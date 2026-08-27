@@ -1287,13 +1287,15 @@ test "discv5 actor: staged effect layouts remain exact" {
     try std.testing.expectEqual(@as(usize, 96), request_layout.handshake_handle);
     try std.testing.expectEqual(@as(usize, 40), request_layout.pending_handshake);
     try std.testing.expectEqual(@as(usize, 2_616), request_layout.phase);
+    try std.testing.expectEqual(@as(usize, 56), request_layout.handshake_send_state);
+    try std.testing.expectEqual(@as(usize, 10_496), request_layout.active_request);
     try std.testing.expectEqual(@as(usize, 11_776), request_layout.stored_request);
     const expected_request_book_size: usize = if (builtin.mode == .ReleaseFast) 248 else 272;
     try std.testing.expectEqual(expected_request_book_size, request_layout.request_book);
     try std.testing.expectEqual(@as(usize, 1_024), config_mod.MAX_ACTIVE_REQUESTS);
     std.debug.print(
-        "REQUEST_HANDSHAKE_LAYOUT request_handle={} unified_handle={} effect={} actor_effect={} request_book={} pending={} wait={} phase={} sending={} active={} stored={} fifo={}\n",
-        .{ request_layout.handshake_handle, @sizeOf(HandshakeHandle), @sizeOf(HandshakeSendEffect), @sizeOf(ActorEffect), request_layout.request_book, request_layout.pending_handshake, request_layout.response_wait, request_layout.phase, request_layout.sending_handshake, request_layout.active_request, request_layout.stored_request, config_mod.MAX_ACTIVE_REQUESTS },
+        "REQUEST_HANDSHAKE_LAYOUT request_handle={} unified_handle={} effect={} actor_effect={} request_book={} pending={} wait={} phase={} handshake_send={} active={} stored={} fifo={}\n",
+        .{ request_layout.handshake_handle, @sizeOf(HandshakeHandle), @sizeOf(HandshakeSendEffect), @sizeOf(ActorEffect), request_layout.request_book, request_layout.pending_handshake, request_layout.response_wait, request_layout.phase, request_layout.handshake_send_state, request_layout.active_request, request_layout.stored_request, config_mod.MAX_ACTIVE_REQUESTS },
     );
 }
 

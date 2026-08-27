@@ -154,8 +154,8 @@ pub const Response = union(enum) {
     nodes: NodesAccumulator,
     talkresp,
 
-    pub fn kind(self: Response) types.RequestKind {
-        return switch (self) {
+    pub fn kind(self: *const Response) types.RequestKind {
+        return switch (self.*) {
             .pong => .ping,
             .nodes => .findnode,
             .talkresp => .talkreq,
@@ -186,6 +186,13 @@ pub const ResponseExpectation = union(enum) {
     }
 };
 
+pub const HandshakeSendState = struct {
+    send_generation: u64,
+    keys: PendingSessionKeys,
+    next_deadline_ns: i64,
+    prior_establishing: bool,
+};
+
 pub const ActiveRequest = struct {
     generation: u64,
     origin: types.RequestOrigin,
@@ -195,6 +202,7 @@ pub const ActiveRequest = struct {
     deadline_ns: i64,
     attempts: u32 = 0,
     queued_intent: bool,
+    handshake_send: ?HandshakeSendState = null,
 };
 
 const SendingRequest = struct {
@@ -227,33 +235,22 @@ const SendingRetry = struct {
     },
 };
 
-const SendingHandshake = struct {
-    prior: ActiveRequest,
-    send_generation: u64,
-    keys: PendingSessionKeys,
-    next_deadline_ns: i64,
-    prior_establishing: bool,
-};
-
 const StoredRequest = union(enum) {
     sending: SendingRequest,
     active: ActiveRequest,
     sending_retry: SendingRetry,
-    sending_handshake: SendingHandshake,
 };
 
 pub const TerminalRequest = union(enum) {
     sending: SendingRequest,
     active: ActiveRequest,
     sending_retry: SendingRetry,
-    sending_handshake: SendingHandshake,
 
     pub fn origin(self: *const TerminalRequest) types.RequestOrigin {
         return switch (self.*) {
             .sending => |request| request.origin,
             .active => |request| request.origin,
             .sending_retry => |request| request.origin,
-            .sending_handshake => |request| request.prior.origin,
         };
     }
 
@@ -262,7 +259,6 @@ pub const TerminalRequest = union(enum) {
             .sending => |request| request.response.kind(),
             .active => |request| request.response.kind(),
             .sending_retry => |request| request.response.kind(),
-            .sending_handshake => |request| request.prior.response.kind(),
         };
     }
 
@@ -271,7 +267,6 @@ pub const TerminalRequest = union(enum) {
             .sending => |request| request.generation,
             .active => |request| request.generation,
             .sending_retry => |request| request.generation,
-            .sending_handshake => |request| request.prior.generation,
         } };
     }
 
@@ -286,7 +281,6 @@ pub const TerminalRequest = union(enum) {
                     .fresh => |*fresh| fresh.admission.release(admission),
                 }
             },
-            .sending_handshake => |*request| request.prior.admission.release(admission),
         }
     }
 };
@@ -340,7 +334,7 @@ pub const RequestBook = struct {
         pending_handshake: usize,
         response_wait: usize,
         phase: usize,
-        sending_handshake: usize,
+        handshake_send_state: usize,
         active_request: usize,
         stored_request: usize,
         request_book: usize,
@@ -353,7 +347,7 @@ pub const RequestBook = struct {
             .pending_handshake = @sizeOf(PendingHandshake),
             .response_wait = @sizeOf(ResponseWait),
             .phase = @sizeOf(Phase),
-            .sending_handshake = @sizeOf(SendingHandshake),
+            .handshake_send_state = @sizeOf(HandshakeSendState),
             .active_request = @sizeOf(ActiveRequest),
             .stored_request = @sizeOf(StoredRequest),
             .request_book = @sizeOf(RequestBook),
@@ -390,7 +384,6 @@ pub const RequestBook = struct {
                         .fresh => |*fresh| fresh.admission.release(admission),
                     }
                 },
-                .sending_handshake => |*request| request.prior.admission.release(admission),
             }
         }
         self.active.deinit();
@@ -560,7 +553,7 @@ pub const RequestBook = struct {
     pub fn activeCount(self: *const RequestBook) usize {
         var count: usize = 0;
         var requests = self.active.iterator();
-        while (requests.next()) |entry| if (entry.value_ptr.* == .active) {
+        while (requests.next()) |entry| if (entry.value_ptr.* == .active and entry.value_ptr.active.handshake_send == null) {
             count += 1;
         };
         return count;
@@ -587,7 +580,7 @@ pub const RequestBook = struct {
     pub fn firstActive(self: *const RequestBook) ?RequestSnapshot {
         var active = self.active.iterator();
         while (active.next()) |entry| {
-            if (entry.value_ptr.* != .active) continue;
+            if (entry.value_ptr.* != .active or entry.value_ptr.active.handshake_send != null) continue;
             return .{ .key = entry.key_ptr.*, .kind = entry.value_ptr.active.response.kind() };
         }
         return null;
@@ -600,7 +593,6 @@ pub const RequestBook = struct {
             .sending => |request| request.response.kind(),
             .active => |request| request.response.kind(),
             .sending_retry => |request| request.response.kind(),
-            .sending_handshake => |request| request.prior.response.kind(),
         } };
     }
 
@@ -644,7 +636,7 @@ pub const RequestBook = struct {
         var iterator = self.active.iterator();
         while (iterator.next()) |entry| {
             if (!std.mem.eql(u8, &entry.key_ptr.endpoint.node_id, node_id)) continue;
-            if (entry.value_ptr.* == .active and entry.value_ptr.active.response == .nodes) return true;
+            if (entry.value_ptr.* == .active and entry.value_ptr.active.handshake_send == null and entry.value_ptr.active.response == .nodes) return true;
         }
         return false;
     }
@@ -655,10 +647,10 @@ pub const RequestBook = struct {
         return lane.queued.first();
     }
 
-    pub fn challenge(self: *const RequestBook, nonce: *const [12]u8, from: types.Address) !ChallengePreparation {
+    pub fn challenge(self: *RequestBook, nonce: *const [12]u8, from: types.Address) !ChallengePreparation {
         const challenge_key = types.ChallengeKey.init(from, nonce);
         const handle = self.challenge_by_nonce.get(challenge_key) orelse return error.InvalidChallenge;
-        const active = self.getActive(handle) orelse return error.InvalidChallenge;
+        const active = self.getActivePtr(handle) orelse return error.InvalidChallenge;
         const recovery = switch (active.phase) {
             .awaiting_whoareyou => |value| value.recovery,
             .awaiting_response => |value| if (value.wait.canChallenge()) value.recovery else return error.InvalidChallenge,
@@ -675,11 +667,10 @@ pub const RequestBook = struct {
         return self.challenge_by_nonce.contains(.init(from, nonce));
     }
 
-    pub fn preflightHandshake(self: *const RequestBook, preparation: ChallengePreparation) !void {
-        const request = self.active.get(preparation.handle.key) orelse return error.StaleRequest;
-        if (request != .active or request.active.generation != preparation.handle.generation) return error.StaleRequest;
-        const recovery = challengeableRecovery(request.active.phase) orelse return error.InvalidChallenge;
-        if (!std.meta.eql(recovery, preparation.recovery)) return error.InvalidChallenge;
+    pub fn preflightHandshake(self: *RequestBook, preparation: ChallengePreparation) !void {
+        const active = self.getActivePtr(preparation.handle) orelse return error.StaleRequest;
+        const recovery = challengeableRecoveryPtr(&active.phase) orelse return error.InvalidChallenge;
+        if (!std.meta.eql(recovery.*, preparation.recovery)) return error.InvalidChallenge;
         const indexed = self.challenge_by_nonce.get(.init(preparation.handle.key.endpoint.addr, &recovery.nonce)) orelse return error.InvalidChallenge;
         if (!handleEql(indexed, preparation.handle)) return error.InvalidChallenge;
         _ = std.math.add(u64, self.next_handshake_generation, 1) catch return error.GenerationExhausted;
@@ -693,55 +684,70 @@ pub const RequestBook = struct {
     ) !HandshakeHandle {
         try self.preflightHandshake(preparation);
         const request = self.active.getPtr(preparation.handle.key) orelse return error.StaleRequest;
+        if (request.* != .active or request.active.generation != preparation.handle.generation or request.active.handshake_send != null) return error.StaleRequest;
+        const recovery = challengeableRecoveryPtr(&request.active.phase) orelse return error.InvalidChallenge;
+        if (!std.meta.eql(recovery.*, preparation.recovery)) return error.InvalidChallenge;
+        const indexed = self.challenge_by_nonce.get(.init(preparation.handle.key.endpoint.addr, &recovery.nonce)) orelse return error.InvalidChallenge;
+        if (!handleEql(indexed, preparation.handle)) return error.InvalidChallenge;
         const next_generation = std.math.add(u64, self.next_handshake_generation, 1) catch return error.GenerationExhausted;
         const handle = HandshakeHandle{ .request = preparation.handle, .send_generation = self.next_handshake_generation };
-        const prior = request.active;
         const prior_establishing = if (self.lanes.get(preparation.handle.key.endpoint)) |lane|
             if (lane.establishing) |existing| handleEql(existing, preparation.handle) else false
         else
             false;
         self.next_handshake_generation = next_generation;
         std.debug.assert(self.challenge_by_nonce.remove(.init(preparation.handle.key.endpoint.addr, &preparation.recovery.nonce)));
-        request.* = .{ .sending_handshake = .{
-            .prior = prior,
+        request.active.handshake_send = .{
             .send_generation = handle.send_generation,
             .keys = keys,
             .next_deadline_ns = deadline_ns,
             .prior_establishing = prior_establishing,
-        } };
+        };
         self.setEstablishing(preparation.handle);
         return handle;
     }
 
     pub fn completeHandshake(self: *RequestBook, handle: HandshakeHandle, completion: HandshakeSendCompletion) ?RetryCompletionView {
         const request = self.active.getPtr(handle.request.key) orelse return null;
-        if (request.* != .sending_handshake or
-            request.sending_handshake.prior.generation != handle.request.generation or
-            request.sending_handshake.send_generation != handle.send_generation) return null;
-        const sending = request.sending_handshake;
-        const view = RetryCompletionView{ .kind = sending.prior.response.kind() };
+        if (request.* != .active or request.active.generation != handle.request.generation) return null;
+        const sending = request.active.handshake_send orelse return null;
+        if (sending.send_generation != handle.send_generation) return null;
+        const view = RetryCompletionView{ .kind = request.active.response.kind() };
         if (completion == .sent) {
-            const recovery = challengeableRecovery(sending.prior.phase) orelse unreachable;
-            var active = sending.prior;
-            active.phase = .{ .awaiting_response = .{
-                .recovery = recovery,
-                .wait = .{ .handshake_sent = .{ .send_generation = handle.send_generation, .keys = sending.keys } },
-            } };
-            active.deadline_ns = sending.next_deadline_ns;
-            request.* = .{ .active = active };
+            const pending = PendingHandshake{ .send_generation = handle.send_generation, .keys = sending.keys };
+            switch (request.active.phase) {
+                .awaiting_whoareyou => |*whoareyou| {
+                    const recovery = whoareyou.recovery;
+                    request.active.phase = .{ .awaiting_response = .{
+                        .recovery = recovery,
+                        .wait = .{ .handshake_sent = pending },
+                    } };
+                },
+                .awaiting_response => |*response| {
+                    std.debug.assert(response.wait.canChallenge());
+                    response.wait = .{ .handshake_sent = pending };
+                },
+            }
+            request.active.deadline_ns = sending.next_deadline_ns;
+            request.active.handshake_send = null;
         } else {
-            const recovery = challengeableRecovery(sending.prior.phase) orelse unreachable;
-            request.* = .{ .active = sending.prior };
+            const recovery = challengeableRecoveryPtr(&request.active.phase) orelse unreachable;
+            // beginHandshake removed this exact entry from a map preallocated
+            // for every active request. Reinsertion is therefore infallible and
+            // is completed before disarming the send, so rollback cannot expose
+            // a challengeable request without its nonce index.
+            std.debug.assert(!self.challenge_by_nonce.contains(.init(handle.request.key.endpoint.addr, &recovery.nonce)));
             self.challenge_by_nonce.putAssumeCapacityNoClobber(.init(handle.request.key.endpoint.addr, &recovery.nonce), handle.request);
+            request.active.handshake_send = null;
             if (!sending.prior_establishing) self.clearEstablishing(handle.request);
         }
         return view;
     }
 
-    pub fn pendingKeys(self: *const RequestBook, endpoint: types.Endpoint) ?PendingKeysView {
+    pub fn pendingKeys(self: *RequestBook, endpoint: types.Endpoint) ?PendingKeysView {
         const lane = self.lanes.get(endpoint) orelse return null;
         const handle = lane.establishing orelse return null;
-        const active = self.getActive(handle) orelse return null;
+        const active = self.getActivePtr(handle) orelse return null;
         const response = switch (active.phase) {
             .awaiting_whoareyou => return null,
             .awaiting_response => |value| value,
@@ -774,17 +780,13 @@ pub const RequestBook = struct {
 
     pub fn get(self: *RequestBook, key: types.RequestKey) ?*ActiveRequest {
         const request = self.active.getPtr(key) orelse return null;
-        return switch (request.*) {
-            .sending => null,
-            .active => |*active| active,
-            .sending_retry => null,
-            .sending_handshake => null,
-        };
+        if (request.* != .active or request.active.handshake_send != null) return null;
+        return &request.active;
     }
 
     pub fn prepareRetainedRetry(self: *RequestBook, handle: RequestHandle, deadline_ns: i64) !RetryPreparationView {
         const request = self.active.getPtr(handle.key) orelse return error.StaleRequest;
-        if (request.* != .active or request.active.generation != handle.generation) return error.StaleRequest;
+        if (request.* != .active or request.active.generation != handle.generation or request.active.handshake_send != null) return error.StaleRequest;
         const next_generation = std.math.add(u64, self.next_retry_generation, 1) catch return error.GenerationExhausted;
         const packet = switch (request.active.phase) {
             .awaiting_whoareyou => |phase| phase.retry_packet,
@@ -816,9 +818,9 @@ pub const RequestBook = struct {
         return true;
     }
 
-    pub fn preflightFreshRetry(self: *const RequestBook, handle: RequestHandle) !void {
-        const request = self.active.get(handle.key) orelse return error.StaleRequest;
-        if (request != .active or request.active.generation != handle.generation) return error.StaleRequest;
+    pub fn preflightFreshRetry(self: *RequestBook, handle: RequestHandle) !void {
+        const request = self.active.getPtr(handle.key) orelse return error.StaleRequest;
+        if (request.* != .active or request.active.generation != handle.generation or request.active.handshake_send != null) return error.StaleRequest;
         if (request.active.phase != .awaiting_response) return error.InvalidRetryPhase;
         _ = std.math.add(u64, self.next_retry_generation, 1) catch return error.GenerationExhausted;
     }
@@ -832,7 +834,7 @@ pub const RequestBook = struct {
         next_admission: *AdmissionPermit,
     ) !RetryPreparationView {
         const request = self.active.getPtr(handle.key) orelse return error.StaleRequest;
-        if (request.* != .active or request.active.generation != handle.generation) return error.StaleRequest;
+        if (request.* != .active or request.active.generation != handle.generation or request.active.handshake_send != null) return error.StaleRequest;
         if (request.active.phase != .awaiting_response) return error.InvalidRetryPhase;
         const next_generation = std.math.add(u64, self.next_retry_generation, 1) catch return error.GenerationExhausted;
         const send_generation = self.next_retry_generation;
@@ -1004,7 +1006,7 @@ pub const RequestBook = struct {
             };
             scan.index = iterator.index;
             scan.slots_scanned += scan.index - previous;
-            if (entry.value_ptr.* == .active and now_ns >= entry.value_ptr.active.deadline_ns) {
+            if (entry.value_ptr.* == .active and entry.value_ptr.active.handshake_send == null and now_ns >= entry.value_ptr.active.deadline_ns) {
                 out[count] = entry.key_ptr.*;
                 count += 1;
             }
@@ -1072,22 +1074,17 @@ pub const RequestBook = struct {
                 self.clearIndexes(handle, request.phase);
                 if (request.queued_intent) self.discardQueuedIntent(key);
             },
-            .sending_handshake => |request| {
-                self.clearIndexes(handle, request.prior.phase);
-                if (request.prior.queued_intent) self.discardQueuedIntent(key);
-            },
         }
         return switch (removed) {
             .sending => |request| .{ .sending = request },
             .active => |request| .{ .active = request },
             .sending_retry => |request| .{ .sending_retry = request },
-            .sending_handshake => |request| .{ .sending_handshake = request },
         };
     }
 
     pub fn take(self: *RequestBook, key: types.RequestKey) ?ActiveRequest {
         const current = self.active.getPtr(key) orelse return null;
-        if (current.* != .active) return null;
+        if (current.* != .active or current.active.handshake_send != null) return null;
         return (self.takeTerminal(key) orelse unreachable).active;
     }
 
@@ -1097,7 +1094,6 @@ pub const RequestBook = struct {
             .sending => |*request| detachOrigin(&request.origin, lookup_id),
             .active => |*request| detachOrigin(&request.origin, lookup_id),
             .sending_retry => |*request| detachOrigin(&request.origin, lookup_id),
-            .sending_handshake => |*request| detachOrigin(&request.prior.origin, lookup_id),
         };
         var lanes = self.lanes.iterator();
         while (lanes.next()) |entry| {
@@ -1162,15 +1158,9 @@ pub const RequestBook = struct {
         return .{ .key = key, .generation = storedGeneration(request) };
     }
 
-    fn getActive(self: *const RequestBook, handle: RequestHandle) ?ActiveRequest {
-        const request = self.active.get(handle.key) orelse return null;
-        if (request != .active or request.active.generation != handle.generation) return null;
-        return request.active;
-    }
-
     fn getActivePtr(self: *RequestBook, handle: RequestHandle) ?*ActiveRequest {
         const request = self.active.getPtr(handle.key) orelse return null;
-        if (request.* != .active or request.active.generation != handle.generation) return null;
+        if (request.* != .active or request.active.generation != handle.generation or request.active.handshake_send != null) return null;
         return &request.active;
     }
 
@@ -1217,7 +1207,6 @@ fn storedGeneration(request: StoredRequest) u64 {
         .sending => |value| value.generation,
         .active => |value| value.generation,
         .sending_retry => |value| value.generation,
-        .sending_handshake => |value| value.prior.generation,
     };
 }
 
@@ -1226,7 +1215,6 @@ fn storedPhase(request: StoredRequest) Phase {
         .sending => |value| value.phase,
         .active => |value| value.phase,
         .sending_retry => |value| value.phase,
-        .sending_handshake => |value| value.prior.phase,
     };
 }
 
@@ -1246,6 +1234,14 @@ pub const Testing = if (@import("builtin").is_test) struct {
 
     pub fn exhaustHandshakeGeneration(book: *RequestBook) void {
         book.next_handshake_generation = std.math.maxInt(u64);
+    }
+
+    pub fn handshakeCanonicalActive(book: *RequestBook, handle: HandshakeHandle) ?*ActiveRequest {
+        const stored = book.active.getPtr(handle.request.key) orelse return null;
+        if (stored.* != .active or stored.active.generation != handle.request.generation) return null;
+        const sending = stored.active.handshake_send orelse return null;
+        if (sending.send_generation != handle.send_generation) return null;
+        return &stored.active;
     }
 
     /// Replace only the candidate generation after a caller has copied a
@@ -1293,9 +1289,10 @@ pub const Testing = if (@import("builtin").is_test) struct {
         const stored = book.active.get(handle.request.key);
         return .{
             .active = stored != null,
-            .sending = if (stored) |value| value == .sending_handshake and
-                value.sending_handshake.prior.generation == handle.request.generation and
-                value.sending_handshake.send_generation == handle.send_generation else false,
+            .sending = if (stored) |value| value == .active and
+                value.active.generation == handle.request.generation and
+                value.active.handshake_send != null and
+                value.active.handshake_send.?.send_generation == handle.send_generation else false,
             .lane = if (book.lanes.get(handle.request.key.endpoint)) |lane|
                 if (lane.establishing) |owner| handleEql(owner, handle.request) else false
             else
@@ -1316,9 +1313,32 @@ fn challengeForPhase(address: types.Address, phase: Phase) ?types.ChallengeKey {
     };
 }
 
-fn challengeableRecovery(phase: Phase) ?RecoveryState {
-    return switch (phase) {
-        .awaiting_whoareyou => |state| state.recovery,
-        .awaiting_response => |response| if (response.wait.canChallenge()) response.recovery else null,
+fn challengeableRecoveryPtr(phase: *const Phase) ?*const RecoveryState {
+    return switch (phase.*) {
+        .awaiting_whoareyou => |*state| &state.recovery,
+        .awaiting_response => |*response| if (response.wait.canChallenge()) &response.recovery else null,
     };
+}
+
+test "request handshake in-flight state is compact canonical active substate" {
+    try std.testing.expect(@sizeOf(HandshakeSendState) <= 64);
+    try std.testing.expectEqual(@as(usize, 4), @typeInfo(HandshakeSendState).@"struct".fields.len);
+    try std.testing.expect(@hasField(HandshakeSendState, "send_generation"));
+    try std.testing.expect(@hasField(HandshakeSendState, "keys"));
+    try std.testing.expect(@hasField(HandshakeSendState, "next_deadline_ns"));
+    try std.testing.expect(@hasField(HandshakeSendState, "prior_establishing"));
+    try std.testing.expect(!@hasField(HandshakeSendState, "prior"));
+    try std.testing.expect(!@hasField(HandshakeSendState, "phase"));
+    try std.testing.expect(!@hasField(HandshakeSendState, "response"));
+    try std.testing.expect(!@hasField(HandshakeSendState, "recovery"));
+    try std.testing.expect(!@hasField(HandshakeSendState, "admission"));
+    inline for (@typeInfo(HandshakeSendState).@"struct".fields) |field| {
+        try std.testing.expect(field.type != ActiveRequest);
+        try std.testing.expect(field.type != Phase);
+        try std.testing.expect(field.type != Response);
+        try std.testing.expect(field.type != RecoveryState);
+        try std.testing.expect(field.type != AdmissionPermit);
+    }
+    try std.testing.expect(@hasField(ActiveRequest, "handshake_send"));
+    try std.testing.expect(!@hasField(StoredRequest, "sending_handshake"));
 }
