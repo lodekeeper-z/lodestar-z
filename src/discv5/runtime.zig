@@ -224,6 +224,7 @@ const RuntimeImpl = struct {
             error.AdmissionCapacityOverflow,
             error.BufferTooSmall,
             error.CapacityTooLarge,
+            error.ChallengeCapacityOverflow,
             error.InvalidAdmissionCapacity,
             error.InvalidEventCapacity,
             error.InvalidLookupResultCapacity,
@@ -372,10 +373,11 @@ const RuntimeImpl = struct {
         if (self.terminalized.swap(true, .acq_rel)) return;
         self.abortEffects();
         const env = self.actorEnv();
-        // Effect aborts consume exact queued response generations first. Sweep
-        // residual phases only afterward so permits are released exactly once
-        // and any copied late completion is stale.
+        // Effect aborts consume exact queued response and challenge generations
+        // first. Sweep residual phases only afterward so permits are released
+        // exactly once and copied late completions are stale.
         self.actor.finishAllResponses(&self.admission);
+        self.actor.sessions.pruneChallenges(std.math.maxInt(i64), &self.admission);
         self.actor.finishAllLookups(env, .runtime_stopped);
         self.actor.finishAllRequests(env);
         self.request_result_outbox.close();

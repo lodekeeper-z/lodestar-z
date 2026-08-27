@@ -221,13 +221,15 @@ test "Runtime shutdown drains queued response completion then sweeps every resid
     const fixture = try runtime_mod.Testing.seedResponseShutdownFixture(runtime);
     const before = runtime_mod.Testing.responseShutdownState(runtime, &fixture);
     try std.testing.expectEqual(@as(usize, 4), before.responses);
-    try std.testing.expectEqual(@as(usize, 3), before.permits);
-    try std.testing.expectEqual(@as(usize, 1), before.effects);
+    try std.testing.expectEqual(@as(usize, 2), before.challenges);
+    try std.testing.expectEqual(@as(usize, 5), before.permits);
+    try std.testing.expectEqual(@as(usize, 2), before.effects);
     try std.testing.expect(before.stable_unchanged);
 
     runtime.stop();
     const stopped = runtime_mod.Testing.responseShutdownState(runtime, &fixture);
     try std.testing.expectEqual(@as(usize, 0), stopped.responses);
+    try std.testing.expectEqual(@as(usize, 0), stopped.challenges);
     try std.testing.expectEqual(@as(usize, 0), stopped.permits);
     try std.testing.expectEqual(@as(usize, 0), stopped.effects);
     try std.testing.expect(stopped.stable_unchanged);
@@ -235,6 +237,7 @@ test "Runtime shutdown drains queued response completion then sweeps every resid
     runtime_mod.Testing.applyCopiedResponseCompletion(runtime, &fixture);
     const stale = runtime_mod.Testing.responseShutdownState(runtime, &fixture);
     try std.testing.expectEqual(@as(usize, 0), stale.responses);
+    try std.testing.expectEqual(@as(usize, 0), stale.challenges);
     try std.testing.expectEqual(@as(usize, 0), stale.permits);
     try std.testing.expect(stale.stable_unchanged);
 }

@@ -379,7 +379,7 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
     std.debug.assert(stable.seen_nonces.insert(&challenge.triggering_nonce));
     std.debug.assert(stable.seen_nonces.insert(&parsed.static_header.nonce));
 
-    std.debug.assert(actor.sessions.removeChallenge(endpoint, env.ingress));
+    std.debug.assert(actor.sessions.removeChallenge(challenge.handle, env.ingress));
     actor.sessions.put(endpoint, stable, now_ns);
     const responsive = actor.peers.acceptValidatedHandshake(
         endpoint.node_id,
@@ -395,17 +395,16 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
 
 fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonce: *const [12]u8) bool {
     const now_ns = outbound.nowNs(env.io);
-    if (actor.sessions.peekChallenge(endpoint, now_ns)) |challenge| {
-        if (!std.mem.eql(u8, &challenge.triggering_nonce, request_nonce)) return false;
-        const effect = actor_mod.ActorEffect{ .whoareyou = .{ .replay = .{
-            .destination = endpoint.addr,
+    const existing = actor.sessions.preflightChallenge(endpoint, request_nonce, now_ns) catch return false;
+    if (existing) |challenge| {
+        const effect = actor_mod.ActorEffect{ .whoareyou = .{
+            .handle = challenge.handle,
             .packet = challenge.datagram,
-        } } };
+        } };
         const effects = env.effects orelse unreachable;
         effects.push(effect) catch return false;
         return true;
     }
-    _ = actor.sessions.removeExpiredChallenge(endpoint, now_ns, env.ingress);
     if (!actor.sessions.allowWhoareyou(endpoint.addr, now_ns)) return false;
     var id_nonce: [packet.ID_NONCE_SIZE]u8 = undefined;
     env.io.random(&id_nonce);
@@ -431,15 +430,20 @@ fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonc
         endpoint.addr,
         @import("../admission.zig").challengePacketBudget(actor.request_retries),
     ) catch return false;
-    const effect = actor_mod.ActorEffect{ .whoareyou = .{ .fresh = .{
-        .endpoint = endpoint,
+    const handle = actor.sessions.publishChallenge(endpoint, .{
         .challenge_data = challenge_data,
         .triggering_nonce = request_nonce.*,
-        .packet = retained,
-        .admission = permit.move(),
+        .datagram = retained,
         .remote_enr = remote_enr,
         .prepared_at_ns = now_ns,
-    } } };
+    }, &permit, env.ingress) catch {
+        permit.release(env.ingress);
+        return false;
+    };
+    const effect = actor_mod.ActorEffect{ .whoareyou = .{
+        .handle = handle,
+        .packet = retained,
+    } };
     const effects = env.effects orelse unreachable;
     effects.push(effect) catch {
         actor.applyEffectCompletion(env, effect, .failed);

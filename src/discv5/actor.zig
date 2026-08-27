@@ -121,7 +121,7 @@ pub const ActorEffect = union(enum) {
             .response => |*effect| effect.handle.endpoint.addr,
             .retry => |*effect| effect.handle.request.key.endpoint.addr,
             .handshake => |*effect| effect.destination(),
-            .whoareyou => |*effect| effect.destination(),
+            .whoareyou => |*effect| effect.handle.endpoint.addr,
         };
     }
 
@@ -131,7 +131,7 @@ pub const ActorEffect = union(enum) {
             .response => |*effect| effect.packet.slice(),
             .retry => |*effect| effect.packet.slice(),
             .handshake => |*effect| effect.packetBytes(),
-            .whoareyou => |*effect| effect.packetBytes(),
+            .whoareyou => |*effect| effect.packet.slice(),
         };
     }
 
@@ -154,6 +154,8 @@ pub const ResponseSendEffect = CompactSendEffect(response_book.ResponseHandle);
 
 pub const RetrySendEffect = CompactSendEffect(request_book.RetryHandle);
 
+pub const WhoareyouSendEffect = CompactSendEffect(session_book.ChallengeHandle);
+
 pub const WhoareyouSource = union(enum) {
     request: request_book.ChallengePreparation,
     response: response_book.ChallengeView,
@@ -175,6 +177,8 @@ pub const ResponseHandshakeSendEffect = CompactSendEffect(response_book.Handshak
 const staged_response_send_effect_size = 1_376;
 const staged_retry_send_effect_size = 1_384;
 const staged_response_handshake_send_effect_size = 1_384;
+const challenge_handle_size = 72;
+const whoareyou_send_effect_size = 1_360;
 // ActorEffect 4_080 is a temporary staged baseline dominated by legacy request handshake.
 // It MUST be updated/replaced by the final <= 1_536 assertion when request handshake is compacted.
 const staged_actor_effect_size = 4_080;
@@ -182,6 +186,14 @@ const staged_actor_effect_size = 4_080;
 comptime {
     if (@sizeOf(ActorEffect) != staged_actor_effect_size) {
         @compileError("ActorEffect must remain at the temporary staged 4080-byte layout");
+    }
+    if (@sizeOf(session_book.ChallengeHandle) != challenge_handle_size or
+        @typeInfo(WhoareyouSendEffect).@"struct".fields.len != 2 or
+        !@hasField(WhoareyouSendEffect, "handle") or
+        !@hasField(WhoareyouSendEffect, "packet") or
+        @sizeOf(WhoareyouSendEffect) != whoareyou_send_effect_size)
+    {
+        @compileError("WHOAREYOU effect must remain exact challenge handle plus packet at 1360 bytes");
     }
     if (@typeInfo(ResponseSendEffect).@"struct".fields.len != 2 or
         !@hasField(ResponseSendEffect, "handle") or
@@ -211,6 +223,14 @@ comptime {
         if (@hasField(ResponseSendEffect, field) or @hasField(ResponseHandshakeSendEffect, field)) {
             @compileError("compact response effects may not regain canonical response ownership");
         }
+        if (@hasField(WhoareyouSendEffect, field)) {
+            @compileError("compact WHOAREYOU effect may not regain canonical challenge ownership");
+        }
+    }
+    for (.{ "admission", "challenge_data", "triggering_nonce", "remote_enr", "prepared_at_ns", "deadline", "deadline_ns", "destination", "endpoint" }) |field| {
+        if (@hasField(WhoareyouSendEffect, field)) {
+            @compileError("compact WHOAREYOU effect contains a forbidden ownership field");
+        }
     }
 }
 
@@ -230,46 +250,6 @@ pub const HandshakeSendEffect = union(enum) {
             .request => |*value| value.packet.slice(),
             .response => |*value| value.packet.slice(),
         };
-    }
-};
-
-pub const WhoareyouSendEffect = union(enum) {
-    replay: struct {
-        destination: types.Address,
-        packet: types.PacketBytes,
-    },
-    fresh: struct {
-        endpoint: types.Endpoint,
-        challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8,
-        triggering_nonce: [packet.NONCE_SIZE]u8,
-        packet: types.PacketBytes,
-        admission: admission.AdmissionPermit,
-        remote_enr: ?enr.RawEnr,
-        prepared_at_ns: i64,
-    },
-
-    pub fn destination(self: *const WhoareyouSendEffect) types.Address {
-        return switch (self.*) {
-            .replay => |*value| value.destination,
-            .fresh => |*value| value.endpoint.addr,
-        };
-    }
-
-    pub fn packetBytes(self: *const WhoareyouSendEffect) []const u8 {
-        return switch (self.*) {
-            .replay => |*value| value.packet.slice(),
-            .fresh => |*value| value.packet.slice(),
-        };
-    }
-
-    pub fn abortPreparation(self: WhoareyouSendEffect, ingress: *admission.IngressAdmission) void {
-        switch (self) {
-            .replay => {},
-            .fresh => |value| {
-                var permit = value.admission;
-                permit.release(ingress);
-            },
-        }
     }
 };
 
@@ -476,22 +456,12 @@ pub const Actor = struct {
                     if (completion_event == .sent) outbound.noteSent(self, plaintext.slice());
                 },
             },
-            .whoareyou => |whoareyou| switch (whoareyou) {
-                .replay => {},
-                .fresh => |value| {
-                    var permit = value.admission;
-                    if (completion_event == .sent) {
-                        self.sessions.putChallenge(value.endpoint, .{
-                            .challenge_data = value.challenge_data,
-                            .triggering_nonce = value.triggering_nonce,
-                            .datagram = value.packet,
-                            .admission = permit.move(),
-                            .remote_enr = value.remote_enr,
-                        }, value.prepared_at_ns, env.ingress);
-                    } else {
-                        permit.release(env.ingress);
-                    }
-                },
+            .whoareyou => |whoareyou| {
+                _ = self.sessions.completeChallengeSend(whoareyou.handle, switch (completion_event) {
+                    .sent => .sent,
+                    .failed => .failed,
+                    .runtime_stopped => .runtime_stopped,
+                }, env.ingress);
             },
         }
     }
@@ -1312,6 +1282,9 @@ fn isLookupBackpressure(err: anyerror) bool {
 }
 
 test "discv5 actor: staged effect layouts remain exact" {
+    try std.testing.expectEqual(challenge_handle_size, @sizeOf(session_book.ChallengeHandle));
+    try std.testing.expectEqual(whoareyou_send_effect_size, @sizeOf(WhoareyouSendEffect));
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(WhoareyouSendEffect).@"struct".fields.len);
     try std.testing.expectEqual(staged_response_send_effect_size, @sizeOf(ResponseSendEffect));
     try std.testing.expectEqual(staged_retry_send_effect_size, @sizeOf(RetrySendEffect));
     try std.testing.expectEqual(@as(usize, 2), @typeInfo(RetrySendEffect).@"struct".fields.len);

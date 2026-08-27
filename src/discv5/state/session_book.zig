@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const admission_mod = @import("../admission.zig");
 const config_mod = @import("../config.zig");
 const enr = @import("../enr.zig");
@@ -56,12 +57,37 @@ pub const SessionMetricsSnapshot = struct {
     nonce_exhaustion_rejected_total: u64,
 };
 
-pub const ActiveChallenge = struct {
+pub const ChallengeHandle = struct {
+    endpoint: types.Endpoint,
+    generation: u64,
+};
+
+pub const ChallengePublication = struct {
+    challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8,
+    triggering_nonce: [packet.NONCE_SIZE]u8,
+    datagram: types.PacketBytes,
+    remote_enr: ?enr.RawEnr = null,
+    prepared_at_ns: i64,
+};
+
+pub const ChallengeView = struct {
+    handle: ChallengeHandle,
+    challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8,
+    triggering_nonce: [packet.NONCE_SIZE]u8,
+    datagram: types.PacketBytes,
+    remote_enr: ?enr.RawEnr,
+};
+
+const ChallengePhase = enum { sending_whoareyou, live };
+
+const StoredChallenge = struct {
+    generation: u64,
+    phase: ChallengePhase,
     challenge_data: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8,
     triggering_nonce: [packet.NONCE_SIZE]u8,
     datagram: types.PacketBytes,
     admission: admission_mod.AdmissionPermit,
-    remote_enr: ?enr.RawEnr = null,
+    remote_enr: ?enr.RawEnr,
 };
 
 const RateEntry = struct {
@@ -70,7 +96,7 @@ const RateEntry = struct {
 };
 
 const SessionCache = lru.LruCacheWithContext(types.Endpoint, StableSession, types.EndpointContext);
-const ChallengeCache = lru.LruCacheWithContext(types.Endpoint, ActiveChallenge, types.EndpointContext);
+const ChallengeCache = lru.LruCacheWithContext(types.Endpoint, StoredChallenge, types.EndpointContext);
 const RateCache = lru.LruCache(rate_limit.IpKey, RateEntry);
 
 pub const SessionBook = struct {
@@ -87,11 +113,16 @@ pub const SessionBook = struct {
     authenticated_refreshed_total: u64 = 0,
     replay_rejected_total: u64 = 0,
     nonce_exhaustion_rejected_total: u64 = 0,
+    next_challenge_generation: u64 = 1,
+    live_challenge_count: usize = 0,
 
     pub fn init(alloc: Allocator, config: config_mod.Config) !SessionBook {
+        if (config.limits.challenge_capacity == 0) return error.InvalidCapacity;
+        const challenge_phase_capacity = std.math.add(usize, config.limits.challenge_capacity, 1) catch
+            return error.ChallengeCapacityOverflow;
         var sessions = try SessionCache.init(alloc, config.limits.session_capacity);
         errdefer sessions.deinit(alloc);
-        var challenges = try ChallengeCache.init(alloc, config.limits.challenge_capacity);
+        var challenges = try ChallengeCache.init(alloc, challenge_phase_capacity);
         errdefer challenges.deinit(alloc);
         const rate = try RateCache.init(alloc, config.limits.whoareyou_rate_capacity);
         return .{
@@ -212,51 +243,161 @@ pub const SessionBook = struct {
         };
     }
 
-    pub fn peekChallenge(self: *const SessionBook, endpoint: types.Endpoint, now_ns: i64) ?*const ActiveChallenge {
-        return self.challenges.peekPtr(endpoint, now_ns);
+    const LivePhase = struct {
+        pub fn accepts(_: @This(), challenge: *const StoredChallenge) bool {
+            return challenge.phase == .live;
+        }
+    };
+
+    const AnyPhase = struct {
+        pub fn accepts(_: @This(), _: *const StoredChallenge) bool {
+            return true;
+        }
+    };
+
+    pub fn preflightChallenge(
+        self: *const SessionBook,
+        endpoint: types.Endpoint,
+        triggering_nonce: *const [packet.NONCE_SIZE]u8,
+        now_ns: i64,
+    ) error{ ChallengeInProgress, ChallengeNonceConflict, ChallengeCapacity, GenerationExhausted }!?ChallengeView {
+        if (self.challenges.peekPtrRaw(endpoint)) |stored| {
+            if (stored.phase == .sending_whoareyou) return error.ChallengeInProgress;
+            if (!self.challenges.isKeyExpired(endpoint, now_ns)) {
+                if (!std.mem.eql(u8, &stored.triggering_nonce, triggering_nonce)) return error.ChallengeNonceConflict;
+                return challengeView(endpoint, stored.*);
+            }
+        }
+        _ = std.math.add(u64, self.next_challenge_generation, 1) catch return error.GenerationExhausted;
+        if (self.challenges.count() == self.challenges.capacity() and
+            !self.challenges.hasExpiredWhere(now_ns, LivePhase{})) return error.ChallengeCapacity;
+        return null;
     }
 
-    pub fn removeExpiredChallenge(
+    pub fn publishChallenge(
         self: *SessionBook,
         endpoint: types.Endpoint,
-        now_ns: i64,
+        publication: ChallengePublication,
+        permit: *admission_mod.AdmissionPermit,
+        admission: *admission_mod.IngressAdmission,
+    ) !ChallengeHandle {
+        _ = try self.preflightChallenge(endpoint, &publication.triggering_nonce, publication.prepared_at_ns);
+        const successor = std.math.add(u64, self.next_challenge_generation, 1) catch return error.GenerationExhausted;
+
+        if (self.challenges.peekPtrRaw(endpoint) != null) {
+            var expired = self.challenges.takeExpiredMove(endpoint, publication.prepared_at_ns) orelse
+                return error.ChallengeConflict;
+            std.debug.assert(expired.phase == .live);
+            self.live_challenge_count -= 1;
+            expired.admission.release(admission);
+        }
+        if (self.challenges.count() == self.challenges.capacity()) {
+            var expired = (self.challenges.popExpiredLruWhereMove(publication.prepared_at_ns, LivePhase{}) orelse
+                return error.ChallengeCapacity).value;
+            self.live_challenge_count -= 1;
+            expired.admission.release(admission);
+        }
+
+        const generation = self.next_challenge_generation;
+        self.next_challenge_generation = successor;
+        const replaced = self.challenges.putMove(endpoint, .{
+            .generation = generation,
+            .phase = .sending_whoareyou,
+            .challenge_data = publication.challenge_data,
+            .triggering_nonce = publication.triggering_nonce,
+            .datagram = publication.datagram,
+            .admission = permit.move(),
+            .remote_enr = publication.remote_enr,
+        }, self.challenge_timeout_ms, publication.prepared_at_ns);
+        std.debug.assert(replaced == null);
+        return .{ .endpoint = endpoint, .generation = generation };
+    }
+
+    pub fn completeChallengeSend(
+        self: *SessionBook,
+        handle: ChallengeHandle,
+        completion: enum { sent, failed, runtime_stopped },
         admission: *admission_mod.IngressAdmission,
     ) bool {
-        var challenge = self.challenges.takeExpiredMove(endpoint, now_ns) orelse return false;
-        challenge.admission.release(admission);
+        const stored = self.challenges.peekPtrRaw(handle.endpoint) orelse return false;
+        if (stored.generation != handle.generation or
+            stored.phase != .sending_whoareyou) return false;
+        if (completion != .sent) return self.removeChallenge(handle, admission);
+
+        if (self.live_challenge_count == self.liveChallengeCapacity()) {
+            var evicted = (self.challenges.popLruWhereMove(LivePhase{}) orelse unreachable).value;
+            self.live_challenge_count -= 1;
+            evicted.admission.release(admission);
+        }
+        const sending = self.challenges.getPtrRaw(handle.endpoint) orelse unreachable;
+        std.debug.assert(sending.generation == handle.generation and sending.phase == .sending_whoareyou);
+        sending.phase = .live;
+        self.live_challenge_count += 1;
+        std.debug.assert(self.challenges.promoteRaw(handle.endpoint));
         return true;
     }
 
-    pub fn putChallenge(
-        self: *SessionBook,
-        endpoint: types.Endpoint,
-        value: ActiveChallenge,
-        now_ns: i64,
-        admission: *admission_mod.IngressAdmission,
-    ) void {
-        if (self.challenges.putMove(endpoint, value, self.challenge_timeout_ms, now_ns)) |entry| {
-            var removed = entry.value;
-            removed.admission.release(admission);
-        }
-    }
-
-    pub fn removeChallenge(self: *SessionBook, endpoint: types.Endpoint, admission: *admission_mod.IngressAdmission) bool {
-        var removed = self.challenges.takeMove(endpoint) orelse return false;
+    pub fn removeChallenge(self: *SessionBook, handle: ChallengeHandle, admission: *admission_mod.IngressAdmission) bool {
+        const stored = self.challenges.peekPtrRaw(handle.endpoint) orelse return false;
+        if (stored.generation != handle.generation) return false;
+        var removed = self.challenges.takeMove(handle.endpoint) orelse unreachable;
+        if (removed.phase == .live) self.live_challenge_count -= 1;
         removed.admission.release(admission);
         return true;
+    }
+
+    pub fn peekChallenge(self: *const SessionBook, endpoint: types.Endpoint, now_ns: i64) ?ChallengeView {
+        const stored = self.challenges.peekPtr(endpoint, now_ns) orelse return null;
+        if (stored.phase != .live) return null;
+        return challengeView(endpoint, stored.*);
     }
 
     pub fn pruneChallenges(self: *SessionBook, now_ns: i64, admission: *admission_mod.IngressAdmission) void {
         var pruned: usize = 0;
         while (pruned < self.challenges.capacity()) : (pruned += 1) {
-            var removed = (self.challenges.popExpiredLruMove(now_ns) orelse return).value;
+            var removed = (self.challenges.popExpiredLruWhereMove(now_ns, AnyPhase{}) orelse return).value;
+            if (removed.phase == .live) self.live_challenge_count -= 1;
             removed.admission.release(admission);
         }
     }
 
     pub fn challengeCount(self: *const SessionBook) usize {
+        return self.live_challenge_count;
+    }
+
+    pub fn challengePhaseCount(self: *const SessionBook) usize {
         return self.challenges.count();
     }
+
+    pub fn liveChallengeCapacity(self: *const SessionBook) usize {
+        return self.challenges.capacity() - 1;
+    }
+
+    pub const Testing = if (@import("builtin").is_test) struct {
+        pub fn setNextChallengeGeneration(self: *SessionBook, generation: u64) void {
+            self.next_challenge_generation = generation;
+        }
+
+        pub fn challengeGenerationFingerprint(self: *const SessionBook) u64 {
+            return self.next_challenge_generation +% @as(u64, @intCast(self.challengePhaseCount())) +%
+                (@as(u64, @intCast(self.challengeCount())) << 32);
+        }
+
+        pub fn whoareyouRateState(self: *const SessionBook, address: types.Address, now_ns: i64) ?struct { count: u32, window_start_ns: i64 } {
+            const entry = self.whoareyou_rate.peek(rate_limit.IpKey.fromAddress(address), now_ns) orelse return null;
+            return .{ .count = entry.count, .window_start_ns = entry.window_start_ns };
+        }
+
+        pub fn challengeLayout(self: *const SessionBook) struct { stored: usize, node: usize, node_bytes: usize, map_capacity: usize, physical_capacity: usize } {
+            return .{
+                .stored = @sizeOf(StoredChallenge),
+                .node = ChallengeCache.Testing.nodeSize(),
+                .node_bytes = ChallengeCache.Testing.nodeBackingBytes(&self.challenges),
+                .map_capacity = ChallengeCache.Testing.mapCapacity(&self.challenges),
+                .physical_capacity = self.challenges.capacity(),
+            };
+        }
+    } else struct {};
 
     pub fn allowWhoareyou(self: *SessionBook, address: types.Address, now_ns: i64) bool {
         const ip = rate_limit.IpKey.fromAddress(address);
@@ -271,6 +412,16 @@ pub const SessionBook = struct {
         return true;
     }
 };
+
+fn challengeView(endpoint: types.Endpoint, stored: StoredChallenge) ChallengeView {
+    return .{
+        .handle = .{ .endpoint = endpoint, .generation = stored.generation },
+        .challenge_data = stored.challenge_data,
+        .triggering_nonce = stored.triggering_nonce,
+        .datagram = stored.datagram,
+        .remote_enr = stored.remote_enr,
+    };
+}
 
 test "session book stores stable keys independently from challenges" {
     const secp = @import("../secp256k1.zig");
@@ -287,10 +438,11 @@ test "session book stores stable keys independently from challenges" {
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } },
     };
     book.put(endpoint, .{ .initiator_key = [_]u8{3} ** 16, .recipient_key = [_]u8{4} ** 16 }, 0);
-    book.putChallenge(endpoint, try testChallenge(&admission, endpoint.addr, 5), 0, &admission);
+    const handle = try publishTestChallenge(&book, &admission, endpoint, 5, 0);
+    try std.testing.expect(book.completeChallengeSend(handle, .sent, &admission));
     try std.testing.expect(book.get(endpoint, 1) != null);
     try std.testing.expect(book.peekChallenge(endpoint, 1) != null);
-    try std.testing.expect(book.removeChallenge(endpoint, &admission));
+    try std.testing.expect(book.removeChallenge(handle, &admission));
     try std.testing.expect(book.get(endpoint, 1) != null);
 }
 
@@ -587,16 +739,231 @@ test "session challenge cache moves permit ownership through TTL and LRU cleanup
     const first = testEndpoint(11);
     const second = testEndpoint(12);
     const third = testEndpoint(13);
-    book.putChallenge(first, try testChallenge(&admission, first.addr, 1), 0, &admission);
-    book.putChallenge(second, try testChallenge(&admission, second.addr, 2), 0, &admission);
+    const first_handle = try publishTestChallenge(&book, &admission, first, 1, 0);
+    try std.testing.expect(book.completeChallengeSend(first_handle, .sent, &admission));
+    const second_handle = try publishTestChallenge(&book, &admission, second, 2, 0);
+    try std.testing.expect(book.completeChallengeSend(second_handle, .sent, &admission));
     try std.testing.expectEqual(@as(usize, 2), admission.permitCount());
-    book.putChallenge(third, try testChallenge(&admission, third.addr, 3), 2, &admission);
+    const third_handle = try publishTestChallenge(&book, &admission, third, 3, 2);
+    try std.testing.expect(book.completeChallengeSend(third_handle, .sent, &admission));
     try std.testing.expect(book.peekChallenge(first, 2) == null);
     try std.testing.expect(book.peekChallenge(second, 2) != null);
     try std.testing.expect(book.peekChallenge(third, 2) != null);
     try std.testing.expectEqual(@as(usize, 2), admission.permitCount());
     try std.testing.expect(book.peekChallenge(second, 10 * std.time.ns_per_ms) == null);
-    try std.testing.expect(book.removeExpiredChallenge(second, 10 * std.time.ns_per_ms, &admission));
+    book.pruneChallenges(10 * std.time.ns_per_ms, &admission);
+    try std.testing.expectEqual(@as(usize, 1), admission.permitCount());
+}
+
+test "copied fresh WHOAREYOU sent completion transitions canonical generation once" {
+    const secp = @import("../secp256k1.zig");
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x41} ** 32));
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 1);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .limits = .{ .session_capacity = 1, .challenge_capacity = 1, .whoareyou_rate_capacity = 1 },
+    });
+    defer book.deinit(std.testing.allocator, &admission);
+
+    const endpoint = testEndpoint(41);
+    var permit = try admission.acquire(endpoint.addr, admission_mod.challengePacketBudget(0));
+    const handle = try book.publishChallenge(endpoint, .{
+        .challenge_data = [_]u8{0x41} ** packet.WHOAREYOU_CHALLENGE_DATA_SIZE,
+        .triggering_nonce = [_]u8{0x42} ** packet.NONCE_SIZE,
+        .datagram = try .init(&.{0x43}),
+        .prepared_at_ns = 0,
+    }, &permit, &admission);
+
+    try std.testing.expect(book.completeChallengeSend(handle, .sent, &admission));
+    try std.testing.expect(!book.completeChallengeSend(handle, .sent, &admission));
+    const live = book.peekChallenge(endpoint, 0) orelse return error.MissingChallenge;
+    try std.testing.expectEqual(handle, live.handle);
+    try std.testing.expectEqual(@as(usize, 1), admission.permitCount());
+}
+
+test "failed fresh WHOAREYOU completion makes copied stale success harmless" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 1);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x44} ** 32)), 1, 10));
+    defer book.deinit(std.testing.allocator, &admission);
+    const handle = try publishTestChallenge(&book, &admission, testEndpoint(44), 0x44, 0);
+
+    try std.testing.expect(book.completeChallengeSend(handle, .failed, &admission));
+    try std.testing.expect(!book.completeChallengeSend(handle, .sent, &admission));
+    try std.testing.expectEqual(@as(usize, 0), book.challengePhaseCount());
+    try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
+}
+
+test "stale WHOAREYOU completions preserve reused endpoint generation" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x45} ** 32)), 1, 10));
+    defer book.deinit(std.testing.allocator, &admission);
+    const endpoint = testEndpoint(45);
+    const old = try publishTestChallenge(&book, &admission, endpoint, 0x45, 0);
+    try std.testing.expect(book.completeChallengeSend(old, .failed, &admission));
+    const newer = try publishTestChallenge(&book, &admission, endpoint, 0x46, 1);
+
+    try std.testing.expect(!book.completeChallengeSend(old, .sent, &admission));
+    try std.testing.expect(!book.completeChallengeSend(old, .failed, &admission));
+    try std.testing.expect(book.completeChallengeSend(newer, .sent, &admission));
+    const live = book.peekChallenge(endpoint, 1) orelse return error.MissingNewChallenge;
+    try std.testing.expectEqual(newer, live.handle);
+    try std.testing.expectEqual([_]u8{0x46} ** packet.NONCE_SIZE, live.triggering_nonce);
+    try std.testing.expectEqual(@as(usize, 1), admission.permitCount());
+}
+
+test "stale WHOAREYOU handle cannot remove newer reused endpoint generation" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x46} ** 32)), 1, 10));
+    defer book.deinit(std.testing.allocator, &admission);
+    const endpoint = testEndpoint(46);
+    const old = try publishTestChallenge(&book, &admission, endpoint, 0x46, 0);
+    try std.testing.expect(book.completeChallengeSend(old, .failed, &admission));
+    const newer = try publishTestChallenge(&book, &admission, endpoint, 0x47, 1);
+    try std.testing.expect(book.completeChallengeSend(newer, .sent, &admission));
+
+    try std.testing.expect(!book.removeChallenge(old, &admission));
+    const retained = book.peekChallenge(endpoint, 1) orelse return error.NewerChallengeRemoved;
+    try std.testing.expectEqual(newer, retained.handle);
+    try std.testing.expectEqual([_]u8{0x47} ** packet.NONCE_SIZE, retained.triggering_nonce);
+    try std.testing.expectEqual(@as(usize, 1), admission.permitCount());
+}
+
+test "challenge expiry exact removal makes stale success harmless" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x47} ** 32)), 1, 1));
+    defer book.deinit(std.testing.allocator, &admission);
+    const sending = try publishTestChallenge(&book, &admission, testEndpoint(47), 0x47, 0);
+    book.pruneChallenges(std.time.ns_per_ms, &admission);
+
+    try std.testing.expect(!book.completeChallengeSend(sending, .sent, &admission));
+    try std.testing.expectEqual(@as(usize, 0), book.challengePhaseCount());
+    try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
+}
+
+test "challenge generation exhaustion is side effect free" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 1);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x48} ** 32)), 1, 10));
+    defer book.deinit(std.testing.allocator, &admission);
+    book.next_challenge_generation = std.math.maxInt(u64);
+    const endpoint = testEndpoint(48);
+    const rate_before = book.whoareyou_rate.count();
+
+    try std.testing.expectError(error.GenerationExhausted, book.preflightChallenge(endpoint, &([_]u8{0x48} ** packet.NONCE_SIZE), 0));
+    try std.testing.expectEqual(rate_before, book.whoareyou_rate.count());
+    try std.testing.expectEqual(@as(usize, 0), book.challengePhaseCount());
+    try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
+}
+
+test "challenge C plus one backing preserves live capacity and oldest live replacement" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 3);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x49} ** 32)), 2, 10));
+    defer book.deinit(std.testing.allocator, &admission);
+    const first = try publishTestChallenge(&book, &admission, testEndpoint(49), 0x49, 0);
+    try std.testing.expect(book.completeChallengeSend(first, .sent, &admission));
+    const second = try publishTestChallenge(&book, &admission, testEndpoint(50), 0x50, 1);
+    try std.testing.expect(book.completeChallengeSend(second, .sent, &admission));
+    const prepared = try publishTestChallenge(&book, &admission, testEndpoint(51), 0x51, 2);
+
+    try std.testing.expectEqual(@as(usize, 3), book.challenges.capacity());
+    try std.testing.expectEqual(@as(usize, 3), book.challengePhaseCount());
+    try std.testing.expectEqual(@as(usize, 2), book.challengeCount());
+    try std.testing.expect(book.completeChallengeSend(prepared, .sent, &admission));
+    try std.testing.expect(book.peekChallenge(first.endpoint, 2) == null);
+    try std.testing.expect(book.peekChallenge(second.endpoint, 2) != null);
+    try std.testing.expect(book.peekChallenge(prepared.endpoint, 2) != null);
+    try std.testing.expectEqual(@as(usize, 2), book.challengeCount());
+    try std.testing.expectEqual(@as(usize, 2), admission.permitCount());
+}
+
+test "multiple sending WHOAREYOU phases stay bounded and never evict one another" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 4);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x52} ** 32)), 2, 10));
+    defer book.deinit(std.testing.allocator, &admission);
+    const first = try publishTestChallenge(&book, &admission, testEndpoint(52), 0x52, 0);
+    const second = try publishTestChallenge(&book, &admission, testEndpoint(53), 0x53, 0);
+    const third = try publishTestChallenge(&book, &admission, testEndpoint(54), 0x54, 0);
+    var fourth_permit = try admission.acquire(testEndpoint(55).addr, admission_mod.challengePacketBudget(0));
+    defer fourth_permit.release(&admission);
+
+    try std.testing.expectError(error.ChallengeCapacity, book.publishChallenge(testEndpoint(55), .{
+        .challenge_data = [_]u8{0x55} ** packet.WHOAREYOU_CHALLENGE_DATA_SIZE,
+        .triggering_nonce = [_]u8{0x55} ** packet.NONCE_SIZE,
+        .datagram = try .init(&.{0x55}),
+        .prepared_at_ns = 0,
+    }, &fourth_permit, &admission));
+    try std.testing.expect(book.completeChallengeSend(first, .sent, &admission));
+    try std.testing.expect(book.completeChallengeSend(second, .sent, &admission));
+    try std.testing.expect(book.completeChallengeSend(third, .sent, &admission));
+    try std.testing.expect(book.peekChallenge(first.endpoint, 0) == null);
+    try std.testing.expect(book.peekChallenge(second.endpoint, 0) != null);
+    try std.testing.expect(book.peekChallenge(third.endpoint, 0) != null);
+}
+
+test "challenge ledger registered layout report locks physical backing" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 1);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x58} ** 32)), 3, 10));
+    defer book.deinit(std.testing.allocator, &admission);
+    const layout = SessionBook.Testing.challengeLayout(&book);
+    const actor_mod = @import("../actor.zig");
+    std.debug.print("CHALLENGE_LEDGER_LAYOUT handle={} effect={} publication={} view={} book={} stored={} node={} node_bytes={} map_capacity={} live_capacity={} physical_capacity={} actor_effect={} fifo={}\n", .{
+        @sizeOf(ChallengeHandle), @sizeOf(actor_mod.WhoareyouSendEffect), @sizeOf(ChallengePublication), @sizeOf(ChallengeView), @sizeOf(SessionBook), layout.stored, layout.node, layout.node_bytes, layout.map_capacity, book.liveChallengeCapacity(), layout.physical_capacity, @sizeOf(actor_mod.ActorEffect), 1_024,
+    });
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(ChallengeHandle));
+    try std.testing.expectEqual(@as(usize, 1_360), @sizeOf(actor_mod.WhoareyouSendEffect));
+    try std.testing.expectEqual(@as(usize, 1_672), @sizeOf(ChallengePublication));
+    try std.testing.expectEqual(@as(usize, 1_736), @sizeOf(ChallengeView));
+    try std.testing.expectEqual(@as(usize, if (builtin.mode == .ReleaseFast) 360 else 384), @sizeOf(SessionBook));
+    try std.testing.expectEqual(@as(usize, 1_688), layout.stored);
+    try std.testing.expectEqual(@as(usize, 1_808), layout.node);
+    try std.testing.expectEqual(@as(usize, 7_232), layout.node_bytes);
+    try std.testing.expectEqual(@as(usize, 8), layout.map_capacity);
+    try std.testing.expectEqual(@as(usize, 3), book.liveChallengeCapacity());
+    try std.testing.expectEqual(@as(usize, 4), layout.physical_capacity);
+    try std.testing.expectEqual(layout.physical_capacity * layout.node, layout.node_bytes);
+    try std.testing.expectEqual(@as(usize, 4_080), @sizeOf(@import("../actor.zig").ActorEffect));
+    try std.testing.expectEqual(@as(usize, 1_024), 1_024);
+}
+
+test "challenge capacity zero is rejected and C plus one overflow is failure atomic" {
+    const secp = @import("../secp256k1.zig");
+    var zero = testConfig(try secp.keyPairFromSecret(&([_]u8{0x59} ** 32)), 0, 10);
+    try std.testing.expectError(error.InvalidCapacity, zero.validate());
+    try std.testing.expectError(error.InvalidCapacity, SessionBook.init(std.testing.allocator, zero));
+    zero.limits.challenge_capacity = std.math.maxInt(usize);
+    try std.testing.expectError(error.ChallengeCapacityOverflow, SessionBook.init(std.testing.allocator, zero));
+}
+
+test "same endpoint live nonce conflicts and sending phase reject without mutation" {
+    const secp = @import("../secp256k1.zig");
+    var admission = try admission_mod.IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    var book = try SessionBook.init(std.testing.allocator, testConfig(try secp.keyPairFromSecret(&([_]u8{0x56} ** 32)), 1, 10));
+    defer book.deinit(std.testing.allocator, &admission);
+    const endpoint = testEndpoint(56);
+    const sending = try publishTestChallenge(&book, &admission, endpoint, 0x56, 0);
+    try std.testing.expectError(error.ChallengeInProgress, book.preflightChallenge(endpoint, &([_]u8{0x56} ** packet.NONCE_SIZE), 0));
+    try std.testing.expectEqual(@as(usize, 1), book.challengePhaseCount());
+    try std.testing.expect(book.completeChallengeSend(sending, .sent, &admission));
+    try std.testing.expectError(error.ChallengeNonceConflict, book.preflightChallenge(endpoint, &([_]u8{0x57} ** packet.NONCE_SIZE), 0));
+    try std.testing.expectEqual(@as(usize, 1), book.challengeCount());
     try std.testing.expectEqual(@as(usize, 1), admission.permitCount());
 }
 
@@ -631,12 +998,32 @@ fn testEndpoint(last: u8) types.Endpoint {
     };
 }
 
-fn testChallenge(admission: *admission_mod.IngressAdmission, address: types.Address, byte: u8) !ActiveChallenge {
-    var permit = try admission.acquire(address, admission_mod.challengePacketBudget(0));
+fn testConfig(key_pair: @import("../secp256k1.zig").KeyPair, challenge_capacity: usize, challenge_timeout_ms: u64) config_mod.Config {
     return .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = key_pair,
+        .challenge_timeout_ms = challenge_timeout_ms,
+        .limits = .{
+            .session_capacity = 2,
+            .challenge_capacity = challenge_capacity,
+            .whoareyou_rate_capacity = 2,
+        },
+    };
+}
+
+fn publishTestChallenge(
+    book: *SessionBook,
+    admission: *admission_mod.IngressAdmission,
+    endpoint: types.Endpoint,
+    byte: u8,
+    now_ns: i64,
+) !ChallengeHandle {
+    var permit = try admission.acquire(endpoint.addr, admission_mod.challengePacketBudget(0));
+    errdefer permit.release(admission);
+    return book.publishChallenge(endpoint, .{
         .challenge_data = [_]u8{byte} ** packet.WHOAREYOU_CHALLENGE_DATA_SIZE,
         .triggering_nonce = [_]u8{byte} ** packet.NONCE_SIZE,
         .datagram = try .init(&.{byte}),
-        .admission = permit.move(),
-    };
+        .prepared_at_ns = now_ns,
+    }, &permit, admission);
 }

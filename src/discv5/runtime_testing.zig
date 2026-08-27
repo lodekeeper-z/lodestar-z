@@ -2,6 +2,7 @@ const std = @import("std");
 const admission = @import("admission.zig");
 const actor_mod = @import("actor.zig");
 const message = @import("protocol/message.zig");
+const packet = @import("protocol/packet.zig");
 const public_api = @import("public_api.zig");
 const response_book = @import("state/response_book.zig");
 const session_book = @import("state/session_book.zig");
@@ -163,6 +164,7 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
 
         pub const ResponseShutdownFixture = struct {
             copied_effect: actor_mod.ActorEffect,
+            copied_challenge_effect: actor_mod.ActorEffect,
             stable_endpoint: types.Endpoint,
             stable: session_book.StableSession,
         };
@@ -199,11 +201,39 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
                 .initiator_key = [_]u8{0xc1} ** 16,
                 .recipient_key = [_]u8{0xc2} ** 16,
             }, 0);
-            return .{ .copied_effect = copied_effect, .stable_endpoint = stable_endpoint, .stable = stable };
+
+            var live_permit = try storage.admission.acquire(testEndpoint(0xe5).addr, admission.challengePacketBudget(0));
+            const live_handle = try storage.actor.sessions.publishChallenge(testEndpoint(0xe5), .{
+                .challenge_data = [_]u8{0xd1} ** packet.WHOAREYOU_CHALLENGE_DATA_SIZE,
+                .triggering_nonce = [_]u8{0xd2} ** packet.NONCE_SIZE,
+                .datagram = try .init(&.{0xd3}),
+                .prepared_at_ns = 0,
+            }, &live_permit, &storage.admission);
+            std.debug.assert(storage.actor.sessions.completeChallengeSend(live_handle, .sent, &storage.admission));
+
+            var sending_permit = try storage.admission.acquire(testEndpoint(0xe6).addr, admission.challengePacketBudget(0));
+            const sending_handle = try storage.actor.sessions.publishChallenge(testEndpoint(0xe6), .{
+                .challenge_data = [_]u8{0xd4} ** packet.WHOAREYOU_CHALLENGE_DATA_SIZE,
+                .triggering_nonce = [_]u8{0xd5} ** packet.NONCE_SIZE,
+                .datagram = try .init(&.{0xd6}),
+                .prepared_at_ns = 0,
+            }, &sending_permit, &storage.admission);
+            const copied_challenge_effect = actor_mod.ActorEffect{ .whoareyou = .{
+                .handle = sending_handle,
+                .packet = try .init(&.{0xd6}),
+            } };
+            try storage.effects.push(copied_challenge_effect);
+            return .{
+                .copied_effect = copied_effect,
+                .copied_challenge_effect = copied_challenge_effect,
+                .stable_endpoint = stable_endpoint,
+                .stable = stable,
+            };
         }
 
         pub fn responseShutdownState(runtime: *Runtime, fixture: *const ResponseShutdownFixture) struct {
             responses: usize,
+            challenges: usize,
             permits: usize,
             effects: usize,
             stable_unchanged: bool,
@@ -212,6 +242,7 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             const stable = storage.actor.sessions.get(fixture.stable_endpoint, 0);
             return .{
                 .responses = storage.actor.responses.count(),
+                .challenges = storage.actor.sessions.challengePhaseCount(),
                 .permits = storage.admission.permitCount(),
                 .effects = storage.effects.count(),
                 .stable_unchanged = if (stable) |value|
@@ -232,6 +263,14 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
                 .lookup_results = &storage.lookup_result_outbox,
                 .request_results = &storage.request_result_outbox,
             }, fixture.copied_effect, .sent);
+            storage.actor.applyEffectCompletion(.{
+                .io = storage.io,
+                .ingress = &storage.admission,
+                .outbox = &storage.outbox,
+                .effects = &storage.effects,
+                .lookup_results = &storage.lookup_result_outbox,
+                .request_results = &storage.request_result_outbox,
+            }, fixture.copied_challenge_effect, .sent);
         }
 
         pub const ActiveRequestEvidence = struct {

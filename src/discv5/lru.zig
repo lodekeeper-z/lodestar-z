@@ -131,6 +131,18 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             return &self.nodes[index].value;
         }
 
+        /// Promote an existing value without applying TTL policy.
+        pub fn promoteRaw(self: *Self, key: K) bool {
+            const index = self.map.get(key) orelse return false;
+            self.moveToFront(index);
+            return true;
+        }
+
+        pub fn isKeyExpired(self: *const Self, key: K, now_ns: i64) bool {
+            const index = self.map.get(key) orelse return false;
+            return self.isExpired(index, now_ns);
+        }
+
         pub fn getRefreshPtr(self: *Self, key: K, ttl_ms: u64, now_ns: i64) ?*V {
             const index = self.map.get(key) orelse return null;
             if (self.isExpired(index, now_ns)) {
@@ -234,8 +246,8 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
         pub fn popLruWhereMove(self: *Self, predicate: anytype) ?Entry {
             var current = self.tail;
             var scanned: usize = 0;
-            while (current) |index| : (scanned += 1) {
-                std.debug.assert(scanned < self.nodes.len);
+            while (current != null and scanned < self.nodes.len) : (scanned += 1) {
+                const index = current.?;
                 if (predicate.accepts(&self.nodes[index].value)) {
                     const entry = Entry{ .key = self.nodes[index].key, .value = self.nodes[index].value };
                     self.removeIndex(index);
@@ -243,7 +255,38 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
                 }
                 current = self.nodes[index].prev;
             }
+            std.debug.assert(current == null);
             return null;
+        }
+
+        /// Remove the least-recent expired value accepted by `predicate`.
+        /// The scan is bounded by physical cache capacity.
+        pub fn popExpiredLruWhereMove(self: *Self, now_ns: i64, predicate: anytype) ?Entry {
+            var current = self.tail;
+            var scanned: usize = 0;
+            while (current != null and scanned < self.nodes.len) : (scanned += 1) {
+                const index = current.?;
+                if (self.isExpired(index, now_ns) and predicate.accepts(&self.nodes[index].value)) {
+                    const entry = Entry{ .key = self.nodes[index].key, .value = self.nodes[index].value };
+                    self.removeIndex(index);
+                    return entry;
+                }
+                current = self.nodes[index].prev;
+            }
+            std.debug.assert(current == null);
+            return null;
+        }
+
+        pub fn hasExpiredWhere(self: *const Self, now_ns: i64, predicate: anytype) bool {
+            var current = self.tail;
+            var scanned: usize = 0;
+            while (current != null and scanned < self.nodes.len) : (scanned += 1) {
+                const index = current.?;
+                if (self.isExpired(index, now_ns) and predicate.accepts(&self.nodes[index].value)) return true;
+                current = self.nodes[index].prev;
+            }
+            std.debug.assert(current == null);
+            return false;
         }
 
         pub fn pruneExpired(self: *Self, now_ns: i64) void {
@@ -457,6 +500,34 @@ test "lru expired entries are removed by get and prune" {
     cache.pruneExpired(std.time.ns_per_ms);
     cache.assertInvariants();
     try cache.expectOrder(&.{2});
+}
+
+test "lru predicate helpers preserve bounds order and rejected entries" {
+    const Value = struct { live: bool, byte: u8 };
+    const Live = struct {
+        fn accepts(_: @This(), value: *const Value) bool {
+            return value.live;
+        }
+    };
+    const Cache = LruCache(u8, Value);
+    var cache = try Cache.init(std.testing.allocator, 3);
+    defer cache.deinit(std.testing.allocator);
+
+    cache.put(1, .{ .live = true, .byte = 1 }, 1, 0);
+    cache.put(2, .{ .live = false, .byte = 2 }, 1, 0);
+    cache.put(3, .{ .live = true, .byte = 3 }, 100, 0);
+    try cache.expectOrder(&.{ 3, 2, 1 });
+    try std.testing.expect(cache.hasExpiredWhere(std.time.ns_per_ms, Live{}));
+    const expired = cache.popExpiredLruWhereMove(std.time.ns_per_ms, Live{}) orelse return error.MissingExpiredLive;
+    try std.testing.expectEqual(@as(u8, 1), expired.key);
+    try cache.expectOrder(&.{ 3, 2 });
+    try std.testing.expect(cache.contains(2));
+    try std.testing.expect(cache.promoteRaw(2));
+    try cache.expectOrder(&.{ 2, 3 });
+    const live = cache.popLruWhereMove(Live{}) orelse return error.MissingLive;
+    try std.testing.expectEqual(@as(u8, 3), live.key);
+    try cache.expectOrder(&.{2});
+    cache.assertInvariants();
 }
 
 test "lru remove unlinks map and recency list" {

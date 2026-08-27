@@ -264,6 +264,122 @@ test "paired Actors retry an established PING with a fresh nonce and complete on
     try std.testing.expect(outbox_a.pop() == null);
 }
 
+test "fresh WHOAREYOU effect queue rejection exact-aborts its challenge and permit" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x90} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x91} ** 32));
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&remote_key));
+    const remote_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 90 }, .port = 9290 } };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .challenge_capacity = 1, .response_recovery_capacity = 1, .event_capacity = 1, .command_capacity = 1 },
+    };
+    var ingress = try admission.IngressAdmission.init(alloc, null, try admission.permitCapacity(cfg.limits));
+    defer ingress.deinit();
+    var outbox = try events.EventOutbox.init(io, alloc, 1);
+    defer outbox.deinit();
+    var actor = try actor_mod.Actor.init(alloc, cfg);
+    defer actor.deinit(&ingress);
+    var effect_storage: [1]actor_mod.ActorEffect = undefined;
+    var effects = actor_mod.EffectQueue.init(&effect_storage);
+    const env = actor_mod.Env{ .io = io, .ingress = &ingress, .outbox = &outbox, .effects = &effects };
+
+    const stale_handle = session_book.ChallengeHandle{
+        .endpoint = .{ .node_id = [_]u8{0xee} ** 32, .addr = remote_address },
+        .generation = std.math.maxInt(u64),
+    };
+    const filler = actor_mod.ActorEffect{ .whoareyou = .{ .handle = stale_handle, .packet = try .init(&.{0xee}) } };
+    try effects.push(filler);
+
+    var datagram_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const datagram = try packet.encodeMessagePacketInto(&datagram_buffer, .{
+        .kind = .ordinary,
+        .masking_iv = &([_]u8{0x92} ** packet.MASKING_IV_SIZE),
+        .recipient_node_id = &local_id,
+        .nonce = &([_]u8{0x93} ** packet.NONCE_SIZE),
+        .authdata = &remote_id,
+        .write_key = &([_]u8{0x94} ** 16),
+        .plaintext = &.{0x95},
+    });
+    actor.handlePacket(env, datagram_buffer[0..datagram.len], remote_address);
+
+    try std.testing.expectEqual(@as(usize, 0), actor.sessions.challengePhaseCount());
+    try std.testing.expectEqual(@as(usize, 0), actor.sessions.challengeCount());
+    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    const retained_filler = effects.pop() orelse return error.MissingFiller;
+    try std.testing.expectEqual(stale_handle, retained_filler.whoareyou.handle);
+    actor.applyEffectCompletion(env, retained_filler, .sent);
+    actor.applyEffectCompletion(env, filler, .failed);
+    try std.testing.expectEqual(@as(usize, 0), actor.sessions.challengePhaseCount());
+    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+}
+
+test "actor challenge generation exhaustion preflight preserves every downstream sentinel" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x98} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x99} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const remote_address = types.Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 99 }, .port = 9299 } };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .challenge_capacity = 2, .response_recovery_capacity = 1, .event_capacity = 2, .command_capacity = 1, .whoareyou_rate_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const now_ns = outbound.nowNs(io);
+    harness.actor.peers.rememberContact(remote_id, &remote_pubkey, remote_address, false);
+    const stable_endpoint = types.Endpoint{ .node_id = [_]u8{0x97} ** 32, .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 97 }, .port = 9297 } } };
+    const stable = session_book.StableSession{ .initiator_key = [_]u8{0xa1} ** 16, .recipient_key = [_]u8{0xa2} ** 16 };
+    harness.actor.sessions.put(stable_endpoint, stable, now_ns);
+    const live_endpoint = types.Endpoint{ .node_id = [_]u8{0x96} ** 32, .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 96 }, .port = 9296 } } };
+    var live_permit = try harness.ingress.acquire(live_endpoint.addr, admission.challengePacketBudget(0));
+    const live_handle = try harness.actor.sessions.publishChallenge(live_endpoint, .{
+        .challenge_data = [_]u8{0xb1} ** packet.WHOAREYOU_CHALLENGE_DATA_SIZE,
+        .triggering_nonce = [_]u8{0xb2} ** packet.NONCE_SIZE,
+        .datagram = try .init(&.{0xb3}),
+        .prepared_at_ns = now_ns,
+    }, &live_permit, &harness.ingress);
+    try std.testing.expect(harness.actor.sessions.completeChallengeSend(live_handle, .sent, &harness.ingress));
+    try std.testing.expect(harness.actor.sessions.allowWhoareyou(remote_address, now_ns));
+    session_book.SessionBook.Testing.setNextChallengeGeneration(&harness.actor.sessions, std.math.maxInt(u64));
+
+    const rate_before = session_book.SessionBook.Testing.whoareyouRateState(&harness.actor.sessions, remote_address, now_ns) orelse return error.MissingRateSentinel;
+    const challenge_before = session_book.SessionBook.Testing.challengeGenerationFingerprint(&harness.actor.sessions);
+    const permit_before = admission.IngressAdmission.Testing.permitGenerationFingerprint(&harness.ingress);
+    const metrics_before = harness.actor.metrics;
+    const peer_before = harness.actor.peers.known(&remote_id) orelse return error.MissingPeerSentinel;
+    var datagram_buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
+    const datagram = try packet.encodeMessagePacketInto(&datagram_buffer, .{
+        .kind = .ordinary,
+        .masking_iv = &([_]u8{0xc1} ** packet.MASKING_IV_SIZE),
+        .recipient_node_id = &local_id,
+        .nonce = &([_]u8{0xc2} ** packet.NONCE_SIZE),
+        .authdata = &remote_id,
+        .write_key = &([_]u8{0xc3} ** 16),
+        .plaintext = &.{0xc4},
+    });
+    harness.actor.handlePacket(harness.env(), datagram_buffer[0..datagram.len], remote_address);
+
+    try std.testing.expectEqual(rate_before, session_book.SessionBook.Testing.whoareyouRateState(&harness.actor.sessions, remote_address, now_ns).?);
+    try std.testing.expectEqual(challenge_before, session_book.SessionBook.Testing.challengeGenerationFingerprint(&harness.actor.sessions));
+    try std.testing.expectEqual(live_handle, (harness.actor.sessions.peekChallenge(live_endpoint, now_ns) orelse return error.LiveSentinelRemoved).handle);
+    try std.testing.expectEqual(permit_before, admission.IngressAdmission.Testing.permitGenerationFingerprint(&harness.ingress));
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 0), harness.effects.count());
+    try std.testing.expect(std.meta.eql(metrics_before, harness.actor.metrics));
+    try std.testing.expectEqual(peer_before, harness.actor.peers.known(&remote_id).?);
+    try std.testing.expectEqual(stable, harness.actor.sessions.get(stable_endpoint, now_ns).?);
+}
+
 test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained datagram" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -333,6 +449,13 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 1), sender_b.datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
+    const endpoint_a = types.Endpoint{ .node_id = id_a, .addr = address_a };
+    const live_before_replay = actor_b.sessions.peekChallenge(endpoint_a, outbound.nowNs(io)) orelse return error.MissingLiveChallenge;
+    const permit_fingerprint = admission.IngressAdmission.Testing.permitGenerationFingerprint(&ingress_b);
+    const copied_replay = actor_mod.ActorEffect{ .whoareyou = .{
+        .handle = live_before_replay.handle,
+        .packet = live_before_replay.datagram,
+    } };
     try link_b_to_a.dropNext();
 
     const deadline_ns = actor_a.requests.get(req_id.key).?.deadline_ns;
@@ -342,10 +465,24 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     try link_a_to_b.deliverNext();
     try std.testing.expectEqual(@as(usize, 2), sender_b.datagrams.items.len);
     try std.testing.expectEqualSlices(u8, sender_b.datagrams.items[0].bytes.slice(), sender_b.datagrams.items[1].bytes.slice());
+    const live_after_replay = actor_b.sessions.peekChallenge(endpoint_a, outbound.nowNs(io)) orelse return error.ReplayRemovedChallenge;
+    try std.testing.expectEqual(live_before_replay.handle, live_after_replay.handle);
+    try std.testing.expectEqual(live_before_replay.triggering_nonce, live_after_replay.triggering_nonce);
+    try std.testing.expectEqualSlices(u8, live_before_replay.datagram.slice(), live_after_replay.datagram.slice());
+    try std.testing.expectEqual(@as(usize, 1), actor_b.sessions.challengeCount());
+    try std.testing.expectEqual(permit_fingerprint, admission.IngressAdmission.Testing.permitGenerationFingerprint(&ingress_b));
+    actor_b.applyEffectCompletion(.{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, copied_replay, .sent);
+    actor_b.applyEffectCompletion(.{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, copied_replay, .failed);
+    try std.testing.expectEqual(live_before_replay.handle, (actor_b.sessions.peekChallenge(endpoint_a, outbound.nowNs(io)) orelse return error.CopiedReplayMutatedChallenge).handle);
+    try std.testing.expectEqual(permit_fingerprint, admission.IngressAdmission.Testing.permitGenerationFingerprint(&ingress_b));
     try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
 
     try link_b_to_a.deliverNext();
     try link_a_to_b.deliverNext();
+    try std.testing.expectEqual(@as(usize, 0), actor_b.sessions.challengeCount());
+    actor_b.applyEffectCompletion(.{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, copied_replay, .sent);
+    actor_b.applyEffectCompletion(.{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, copied_replay, .failed);
+    try std.testing.expectEqual(@as(usize, 0), actor_b.sessions.challengePhaseCount());
     try link_b_to_a.deliverNext();
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());

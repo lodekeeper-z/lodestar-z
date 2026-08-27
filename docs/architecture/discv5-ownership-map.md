@@ -105,7 +105,7 @@ Runtime delivers command | packet | maintenance | completion
 - `response`: an exact response handle plus packet for PONG, NODES, and TALKRESP; `ResponseBook` already owns the response permit and recovery material before this effect is published;
 - `retry`: exact `RetryHandle` (`RequestHandle` plus non-wrapping retry-send generation) and packet bytes only; `RequestBook.sending_retry` owns the prior phase, prepared future transition, current and replacement permits, next deadline, and retry policy until exact completion;
 - `handshake`: request-source handshakes still carry their prepared source, candidate keys, clocks, plaintext, and packet; response-source handshakes carry only an exact response/handshake handle plus packet while `ResponseBook` owns their keys, plaintext, permit, and candidate transition;
-- `whoareyou`: replay-only or fresh challenge state plus its moved challenge permit.
+- `whoareyou`: exact `ChallengeHandle` (endpoint plus non-wrapping generation) and immutable packet bytes only. `SessionBook` owns challenge data, triggering nonce, retained datagram, optional remote ENR, permit, TTL, and the canonical `sending_whoareyou` or `live` phase.
 
 ### Final measured ownership delta
 
@@ -118,8 +118,8 @@ Runtime delivers command | packet | maintenance | completion
 | Ordered Actor effect queues | request-only | 1 queue for every datagram effect |
 | Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
 | Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
-| DiscV5 tests after migration | 307 | 395 after response- and retry-ledger canonicalization |
-| Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 4,080 bytes; compact request/response/retry effects are packet plus semantic handle, with retry exactly 1,384 bytes; a final `<= 1,536` union ceiling is still required after the remaining legacy variants are compacted |
+| DiscV5 tests after migration | 307 | 409 after response-, retry-, and challenge-ledger canonicalization |
+| Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 4,080 bytes; compact request/response/retry/WHOAREYOU effects are packet plus semantic handle, with WHOAREYOU exactly 1,360 bytes and retry exactly 1,384 bytes; a final `<= 1,536` union ceiling is still required after the remaining legacy request-source handshake is compacted |
 
 ### Canonical completion ownership
 
@@ -129,8 +129,11 @@ Runtime delivers command | packet | maintenance | completion
 - **Retry `.sent`:** only the exact request generation and retry-send generation may restore `.active`; retained success consumes one attempt/deadline, while fresh success installs the prepared phase and nonce, resets multipart state, swaps the exact permit, and consumes one attempt/deadline. Exact `.failed` or `.runtime_stopped` releases the prepared permit, preserves the prior phase and current permit, and consumes the same one-attempt/deadline policy. Duplicate, stale, canceled, timed-out, key-reused, or post-shutdown completions are no-ops.
 - **Request-source handshake `.sent`:** commit the prepared request challenge and candidate keys; failure leaves the challenged request state unchanged.
 - **Response-source handshake `.sent`:** advance only the exact response and handshake generations to a candidate and release the canonical response permit; failure or `runtime_stopped` removes that exact sending phase and releases the permit without creating a candidate.
-- **Fresh WHOAREYOU `.sent`:** install challenge state and moved permit; failure releases it. Replay has no domain mutation.
-- **`runtime_stopped`:** Runtime first synthesizes exact completion for every queued effect, then sweeps residual response phases, lookups, and requests before closing result/event planes; lookup work terminates as `runtime_stopped` rather than ordinary failure/repump.
+- **Fresh WHOAREYOU `.sent`:** advance only the exact challenge generation from `sending_whoareyou` to `live`. If the configured live capacity is full, evict only the least-recent live challenge and release its permit. Exact `.failed` or `.runtime_stopped` removes that sending generation and releases its permit. Duplicate, stale, wrong-phase, expired, authenticated-removed, or endpoint-reused completions are no-ops.
+- **WHOAREYOU replay:** publish the existing exact handle and retained packet without changing challenge phase, TTL, recency, permit, generation, or metrics. Sent and failed replay completions are both mutation-free because the canonical challenge is already `live`.
+- **Authenticated HANDSHAKE:** look up the live challenge by the full endpoint, retain its exact generation-bearing handle through identity verification and decryption, then remove only that handle before installing stable keys. An old handle cannot remove a newer generation at the same endpoint.
+- **Challenge expiry:** bounded maintenance removes every expired sending or live phase and releases each canonical permit exactly once. Late completions are stale.
+- **`runtime_stopped`:** Runtime first synthesizes exact completion for every queued effect, then sweeps residual response and challenge phases, lookups, and requests before closing result/event planes. Copied post-shutdown completions are no-ops, and unrelated stable sessions remain intact. Lookup work terminates as `runtime_stopped` rather than ordinary failure/repump.
 
 ### Ordering, bounds, and late completion policy
 
@@ -139,8 +142,28 @@ Runtime delivers command | packet | maintenance | completion
 - Request effects are bounded by canonical sending entries, which share the active-request capacity `A`. An atomic authenticated FINDNODE turn is bounded by `M` response chunks plus one eviction probe, while all permit-bearing effects are also bounded by `P`.
 - Runtime pops before applying completion and drains before the next command, so the request and atomic-ingress bounds are alternatives rather than additive queue residents. No per-effect allocation occurs.
 - Queue redrain emits one head. `.sent` removes that head and may emit exactly the next head only under a stable session.
-- Runtime execution is deliberately synchronous in the actor-loop task, but copied, stale, delayed, or reordered completions remain harmless because each migrated family uses its canonical semantic handle: request key plus request generation, retry request generation plus retry-send generation, or response endpoint plus nonce plus response generation and handshake send generation. Generations are checked, never wrapped, and exhausted rather than reused.
-- Cancellation during send maps to `runtime_stopped`; ordinary transport failure maps to `failed`; all remaining queued values are synthesized as `runtime_stopped` during terminalization. Runtime then sweeps residual canonical response phases, making copied post-shutdown response completions no-ops.
+- Runtime execution is deliberately synchronous in the actor-loop task, but copied, stale, delayed, or reordered completions remain harmless because each migrated family uses its canonical semantic handle: request key plus request generation, retry request generation plus retry-send generation, response endpoint plus nonce plus response generation and handshake send generation, or challenge endpoint plus challenge generation. Generations are checked, never wrapped, and exhausted rather than reused.
+- Cancellation during send maps to `runtime_stopped`; ordinary transport failure maps to `failed`; all remaining queued values are synthesized as `runtime_stopped` during terminalization. Runtime then sweeps residual canonical response and challenge phases, making copied post-shutdown completions no-ops.
+
+### Challenge ledger layout gates
+
+The registered layout report runs in Debug, ReleaseSafe, and ReleaseFast and distinguishes transport effects from canonical state views:
+
+| Layout | Exact bytes |
+| --- | ---: |
+| `ChallengeHandle` | 72 |
+| `WhoareyouSendEffect` (`handle` plus `packet`, exactly two fields) | 1,360 |
+| `ChallengePublication` (pre-publication canonical input, not an effect) | 1,672 |
+| `ChallengeView` (canonical read view, not an effect) | 1,736 |
+| Stored challenge | 1,688 |
+| Challenge LRU node | 1,808 |
+| Configured fixture node backing (`C = 3`, physical `C + 1 = 4`) | 7,232 |
+| Configured fixture map capacity | 8 |
+| `SessionBook` | 384 Debug/ReleaseSafe, 360 ReleaseFast |
+| `ActorEffect` staged union | 4,080 |
+| Runtime effect FIFO capacity at supported defaults | 1,024 entries |
+
+The compact WHOAREYOU effect is forbidden from regaining admission, challenge data, nonce, ENR, deadline, destination, or other future-ownership fields. The canonical challenge backing is checked as `C + 1`; configuration rejects `C = 0`, and checked addition rejects overflow before allocation.
 
 ## Remaining ownership work
 
@@ -148,8 +171,8 @@ The Runtime-only transport executor and single FIFO are complete. Canonical effe
 
 - Retry effects are compact and complete: they carry only exact `RetryHandle` plus `PacketBytes`, while canonical retry future state lives in `RequestBook.sending_retry` and terminal cleanup releases both current and prepared permits.
 - Request-source handshake effects still carry prepared request source, candidate keys, clocks, plaintext, and packet; response-source handshakes are already compact and canonical in `ResponseBook`.
-- Fresh WHOAREYOU effects still carry challenge state and a permit; replay remains mutation-free.
-- Challenge generation ownership, request-source handshake send generations, fresh WHOAREYOU canonicalization, and exact admission receipt ownership remain pending staged work.
+- Fresh and replay WHOAREYOU effects are compact and complete: both carry only exact `ChallengeHandle` plus `PacketBytes`, while canonical sending/live state and permits remain in `SessionBook`.
+- Request-source handshake send generations and exact admission receipt ownership remain pending staged work.
 - Reliable result reservation is represented by Runtime outbox reservation state and `RequestOrigin.reliable_api`; a future consume-and-resolve result capability may consolidate that representation.
 - Peer/contact/routing canonicalization is independent of transport execution ownership.
 - The final `ActorEffect <= 1,536` compact-union gate is not complete; the exact 4,080-byte staged union remains dominated by the legacy request-source handshake.
