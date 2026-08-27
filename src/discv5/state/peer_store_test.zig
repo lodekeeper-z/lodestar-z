@@ -162,6 +162,25 @@ fn bucketNode(index: usize) types.NodeId {
     return node_id;
 }
 
+fn fillCandidateBucket(
+    store: *peer_store.PeerStore,
+    candidate_id: types.NodeId,
+    disconnected_count: usize,
+    port_base: u16,
+) ![peer_store.K]peer_store.PeerRef {
+    const distance = peer_store.logDistance(&([_]u8{0} ** 32), &candidate_id) orelse return error.InvalidCandidate;
+    try std.testing.expect(distance >= 8);
+    var refs: [peer_store.K]peer_store.PeerRef = undefined;
+    for (&refs, 0..) |*ref, index| {
+        var sibling = candidate_id;
+        sibling[31] ^= @intCast(index + 1);
+        try std.testing.expectEqual(distance, peer_store.logDistance(&([_]u8{0} ** 32), &sibling).?);
+        ref.* = try store.remember(sibling, &([_]u8{0x76} ** 33), address(port_base + @as(u16, @intCast(index))), false);
+        try std.testing.expect((try store.admitRoute(ref.*, index >= disconnected_count, @intCast(index))).inserted);
+    }
+    return refs;
+}
+
 test "compact routing duplicate refresh pins an active peer exactly once" {
     var store = try peer_store.PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
     defer store.deinit();
@@ -741,6 +760,130 @@ test "discovered ENR preserves authenticated no-ENR fallback liveness" {
     try std.testing.expectEqual(@as(i64, 0), retained.next_ping_at_ns);
     try std.testing.expectEqualSlices(u8, discovered_raw, store.findEnr(&node_id).?);
     try std.testing.expect(store.advertisedEvidence(store.lookup(&node_id).?).?.ip4.address().eql(&advertised_addr));
+}
+
+test "authenticated fallback learned ENR becomes pending behind a disconnected full-bucket incumbent" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x75} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const runtime_addr = address(13_000);
+    const advertised_addr = address(13_001);
+    const raw = try encodeEnr(alloc, key_pair, 2, advertised_addr);
+    defer alloc.free(raw);
+    var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+
+    _ = store.acceptValidatedHandshake(node_id, &pubkey, runtime_addr, null, 20);
+    const candidate = store.lookup(&node_id) orelse return error.MissingFallbackContact;
+    try std.testing.expect(peer_store.Testing.connected(&store, &node_id).?);
+    try std.testing.expect(store.routeWithPending(&node_id) == null);
+    try std.testing.expectEqual(@as(usize, 1), store.fallbackCount());
+    const incumbents = try fillCandidateBucket(&store, node_id, 4, 13_100);
+    const probes_before = peer_store.Testing.probeFreeCount(&store);
+
+    try std.testing.expect(store.learnEnr(raw, 30) != null);
+    const retained = store.routeWithPending(&node_id) orelse return error.MissingPendingRoute;
+    const ticket = peer_store.Testing.pendingTicket(&store, &node_id) orelse return error.MissingEvictionTicket;
+    try std.testing.expect(retained.connected);
+    try std.testing.expect(retained.addr.eql(&runtime_addr));
+    try std.testing.expectEqual(@as(i64, 20), store.resolve(candidate).?.last_seen);
+    try std.testing.expectEqualSlices(u8, raw, store.findEnr(&node_id).?);
+    try std.testing.expect(store.advertisedEvidence(candidate).?.ip4.address().eql(&advertised_addr));
+    try std.testing.expectEqual(incumbents[0], ticket.incumbent);
+    try std.testing.expectEqual(candidate, ticket.candidate);
+    try std.testing.expect(store.routeContains(incumbents[0]));
+    try std.testing.expectEqual(@as(u8, 0), store.resolve(candidate).?.activePins());
+    try std.testing.expectEqual(@as(u8, 1), store.resolve(candidate).?.pendingPins());
+    try std.testing.expectEqual(probes_before - 1, peer_store.Testing.probeFreeCount(&store));
+    try std.testing.expectEqual(@as(usize, 1), store.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), store.fallbackCount());
+}
+
+test "authenticated fallback learned ENR becomes exact pending candidate in a connected full bucket" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x77} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const runtime_addr = address(13_200);
+    const advertised_addr = address(13_201);
+    const raw = try encodeEnr(alloc, key_pair, 3, advertised_addr);
+    defer alloc.free(raw);
+    var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+
+    _ = store.acceptValidatedHandshake(node_id, &pubkey, runtime_addr, null, 40);
+    const candidate = store.lookup(&node_id) orelse return error.MissingFallbackContact;
+    const incumbents = try fillCandidateBucket(&store, node_id, 0, 13_300);
+    const probes_before = peer_store.Testing.probeFreeCount(&store);
+
+    try std.testing.expect(store.learnEnr(raw, 50) != null);
+    const retained = store.routeWithPending(&node_id) orelse return error.MissingPendingRoute;
+    const ticket = peer_store.Testing.pendingTicket(&store, &node_id) orelse return error.MissingEvictionTicket;
+    try std.testing.expect(retained.connected);
+    try std.testing.expect(retained.addr.eql(&runtime_addr));
+    try std.testing.expectEqual(incumbents[0], ticket.incumbent);
+    try std.testing.expectEqual(candidate, ticket.candidate);
+    try std.testing.expectEqualSlices(u8, raw, store.findEnr(&node_id).?);
+    try std.testing.expect(store.advertisedEvidence(candidate).?.ip4.address().eql(&advertised_addr));
+    try std.testing.expectEqual(@as(u8, 0), store.resolve(candidate).?.activePins());
+    try std.testing.expectEqual(@as(u8, 1), store.resolve(candidate).?.pendingPins());
+    try std.testing.expectEqual(probes_before - 1, peer_store.Testing.probeFreeCount(&store));
+    try std.testing.expectEqual(@as(usize, 1), store.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), store.fallbackCount());
+}
+
+test "disconnected learned ENR cannot claim full-bucket candidate admission" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x78} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const advertised_addr = address(13_400);
+    const raw = try encodeEnr(alloc, key_pair, 1, advertised_addr);
+    defer alloc.free(raw);
+    var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    _ = try fillCandidateBucket(&store, node_id, 0, 13_500);
+    const probes_before = peer_store.Testing.probeFreeCount(&store);
+
+    try std.testing.expect(store.learnEnr(raw, 60) != null);
+    const candidate = store.lookup(&node_id) orelse return error.MissingFallbackContact;
+    try std.testing.expect(!peer_store.Testing.connected(&store, &node_id).?);
+    try std.testing.expect(store.routeWithPending(&node_id) == null);
+    try std.testing.expect(store.findEnr(&node_id) == null);
+    try std.testing.expectEqual(probes_before, peer_store.Testing.probeFreeCount(&store));
+    try std.testing.expectEqual(@as(usize, 0), store.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), store.fallbackCount());
+    try std.testing.expectEqual(@as(u8, 0), store.resolve(candidate).?.activePins());
+    try std.testing.expectEqual(@as(u8, 0), store.resolve(candidate).?.pendingPins());
+}
+
+test "authenticated fallback pending preflight failure preserves exact canonical state" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x79} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const runtime_addr = address(13_600);
+    const advertised_addr = address(13_601);
+    const raw = try encodeEnr(alloc, key_pair, 4, advertised_addr);
+    defer alloc.free(raw);
+    const validated = try enr.ValidatedEnr.init(raw);
+
+    for ([_]peer_store.RetentionFailure{ .probe, .pending }) |failure| {
+        var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+        defer store.deinit();
+        _ = store.acceptValidatedHandshake(node_id, &pubkey, runtime_addr, null, 70);
+        _ = try fillCandidateBucket(&store, node_id, 0, 13_700);
+        const before = store.stateHashForTest();
+
+        try std.testing.expect(store.retainValidatedForTest(&validated, advertised_addr, false, false, 80, failure) == null);
+        try std.testing.expectEqual(before, store.stateHashForTest());
+        try std.testing.expect(peer_store.Testing.connected(&store, &node_id).?);
+        try std.testing.expect(store.known(&node_id).?.addr.eql(&runtime_addr));
+        try std.testing.expect(store.routeWithPending(&node_id) == null);
+        try std.testing.expect(store.findEnr(&node_id) == null);
+        try std.testing.expectEqual(@as(usize, 1), store.fallbackCount());
+    }
 }
 
 test "newer ENR exactly replaces advertised families and preserves proof only for unchanged endpoint" {

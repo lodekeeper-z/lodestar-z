@@ -837,8 +837,7 @@ pub const PeerStore = struct {
             insertRouteOrdered(self, bucket, .{ .peer = ref, .routing_recency = now_ns });
             return .{ .inserted = true };
         }
-        if (!connected or bucket.first_connected == 0 or bucket.has_pending != 0)
-            return .{ .inserted = false };
+        if (!connected or bucket.has_pending != 0) return .{ .inserted = false };
 
         const probe = try self.reserveProbe();
         errdefer self.releaseProbe(probe);
@@ -1123,15 +1122,17 @@ pub const PeerStore = struct {
             const prior = self.resolve(ref) orelse return null;
             if (!std.mem.eql(u8, &prior.pubkey, &key)) return null;
         }
+        const effective_connected = connected or if (existing) |ref| isConnected(self, ref) else false;
         if (!was_known and (failure == .map or self.backing.control.free_slot_count == 0)) return null;
 
         const distance = logDistance(&self.backing.routing.local_id, &validated.node_id) orelse return null;
         const bucket = &self.backing.routing.buckets[distance];
         const already_active = if (existing) |ref| findRoute(bucket, ref) != null else false;
         const already_pending = if (existing) |ref| bucket.has_pending != 0 and peerRefEql(bucket.pending.newcomer, ref) else false;
-        const needs_pending = !already_active and !already_pending and bucket.count == K and connected and
-            bucket.first_connected != 0 and bucket.has_pending == 0;
-        const retains_raw = already_active or already_pending or bucket.count < K or needs_pending;
+        const full_candidate = !already_active and !already_pending and bucket.count == K and effective_connected and
+            bucket.has_pending == 0;
+        const needs_pending = full_candidate;
+        const retains_raw = already_active or already_pending or bucket.count < K or full_candidate;
         const has_raw = if (existing) |ref| self.resolve(ref).?.enr_index != NONE else false;
         if (failure == .enr and retains_raw) return null;
         if (retains_raw and !has_raw and self.backing.control.enr_free_count == 0) return null;
@@ -1162,7 +1163,7 @@ pub const PeerStore = struct {
             setConnected(record, true);
         }
         self.replaceAdvertisedEvidence(ref, &validated.parsed, trusted);
-        const admission = self.admitRoute(ref, connected, now_ns) catch return null;
+        const admission = self.admitRoute(ref, effective_connected, now_ns) catch return null;
         if (!self.routeContains(ref) and self.fallbackCount() > self.fallback_capacity) {
             if (!self.evictUntrustedFallback(ref)) {
                 if (admission.eviction) |ticket| _ = self.rollbackEviction(ticket);
@@ -1481,6 +1482,18 @@ pub const Testing = if (builtin.is_test) struct {
 
     pub fn enrFreeCount(store: *const PeerStore) usize {
         return store.backing.control.enr_free_count;
+    }
+
+    pub fn probeFreeCount(store: *const PeerStore) usize {
+        return store.backing.control.probe_free_count;
+    }
+
+    pub fn pendingTicket(store: *const PeerStore, node_id: *const types.NodeId) ?EvictionTicket {
+        const ref = store.lookup(node_id) orelse return null;
+        const record = store.resolve(ref) orelse return null;
+        const distance = logDistance(&store.backing.routing.local_id, &record.node_id) orelse return null;
+        const ticket = store.ticketForBucket(&store.backing.routing.buckets[distance]) orelse return null;
+        return if (peerRefEql(ticket.candidate, ref)) ticket else null;
     }
 } else struct {};
 
