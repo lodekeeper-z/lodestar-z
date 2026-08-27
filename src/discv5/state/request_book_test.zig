@@ -302,6 +302,30 @@ fn expectSeededNodesUnchanged(
     try std.testing.expectEqualSlices(u8, recovery.plaintext.slice(), active.phase.awaiting_response.recovery.plaintext.slice());
 }
 
+fn expectRecoveryUnchanged(actual: *const book_mod.RecoveryState, expected: *const book_mod.RecoveryState) !void {
+    try std.testing.expectEqualSlices(u8, &expected.nonce, &actual.nonce);
+    try std.testing.expectEqualSlices(u8, &expected.dest_pubkey, &actual.dest_pubkey);
+    try std.testing.expectEqualSlices(u8, expected.plaintext.slice(), actual.plaintext.slice());
+}
+
+fn expectNodesStateUnchanged(
+    active: *const book_mod.ActiveRequest,
+    distances: *const book_mod.RequestDistances,
+    total_responses: u64,
+    responses_received: u64,
+    raw_enrs: []const []u8,
+) !void {
+    try std.testing.expect(active.response == .nodes);
+    try std.testing.expectEqual(total_responses, active.response.nodes.total_responses.?);
+    try std.testing.expectEqual(responses_received, active.response.nodes.responses_received);
+    try std.testing.expectEqual(distances.*, active.response.nodes.requested_distances);
+    const validated = active.response.nodes.validated_enrs.slice();
+    try std.testing.expectEqual(raw_enrs.len, validated.len);
+    for (raw_enrs, validated) |expected, actual| {
+        try std.testing.expectEqualSlices(u8, expected, actual.raw.slice());
+    }
+}
+
 test "request handshake generation exhaustion is failure atomic" {
     var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
     defer ingress.deinit();
@@ -431,33 +455,38 @@ test "large multipart NODES accumulator stays canonical across retained retry ou
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(52), try message.ReqId.fromSlice(&.{ 5, 2 }));
     const distances = requestedDistances(&.{ 1, 17, 256 });
+    const original_probe = try probe(52);
     const handle = try book.beginSending(&ingress, key, .api, .{ .nodes = distances }, .{
-        .awaiting_whoareyou = try probe(52),
+        .awaiting_whoareyou = original_probe,
     }, 1, true, false);
     _ = book.completeSending(handle) orelse return error.SendingCompletionRejected;
     const active = book.get(key) orelse return error.MissingActiveRequest;
     active.response.nodes.total_responses = 7;
     active.response.nodes.responses_received = 2;
-    inline for (.{ @as(u8, 0x52), @as(u8, 0x53) }) |secret| {
+    var raw_enrs: [2][]u8 = undefined;
+    var raw_enr_count: usize = 0;
+    defer for (raw_enrs[0..raw_enr_count]) |raw| std.testing.allocator.free(raw);
+    inline for (.{ @as(u8, 0x52), @as(u8, 0x53) }, 0..) |secret, index| {
         const enr_key = try secp.keyPairFromSecret(&([_]u8{secret} ** 32));
         var builder = enr.Builder.init(std.testing.allocator, enr_key, secret);
         builder.ip = .{ 127, 0, 0, secret };
         builder.udp = 9000 + @as(u16, secret);
         const raw = try builder.encode();
-        defer std.testing.allocator.free(raw);
+        raw_enrs[index] = raw;
+        raw_enr_count += 1;
         active.response.nodes.validated_enrs.append(try enr.ValidatedEnr.init(raw));
     }
     const canonical_address = @intFromPtr(active);
-    const response_fingerprint = active.response;
-    const phase_fingerprint = active.phase;
     const permit_fingerprint = active.permitHandle();
 
     const failed = try book.prepareRetainedRetry(handle, 9);
     _ = book.completeRetry(failed.handle, .failed, &ingress) orelse return error.RetryCompletionRejected;
     const after_failed = book.get(key) orelse return error.MissingActiveRequest;
     try std.testing.expectEqual(canonical_address, @intFromPtr(after_failed));
-    try std.testing.expect(std.meta.eql(response_fingerprint, after_failed.response));
-    try std.testing.expect(std.meta.eql(phase_fingerprint, after_failed.phase));
+    try expectNodesStateUnchanged(after_failed, &distances, 7, 2, &raw_enrs);
+    try std.testing.expect(after_failed.phase == .awaiting_whoareyou);
+    try expectRecoveryUnchanged(&after_failed.phase.awaiting_whoareyou.recovery, &original_probe.recovery);
+    try std.testing.expectEqualSlices(u8, original_probe.retry_packet.slice(), after_failed.phase.awaiting_whoareyou.retry_packet.slice());
     try std.testing.expectEqual(permit_fingerprint, after_failed.permitHandle());
     try std.testing.expectEqual(@as(u32, 1), after_failed.attempts);
     try std.testing.expectEqual(@as(i64, 9), after_failed.deadline_ns);
@@ -466,8 +495,10 @@ test "large multipart NODES accumulator stays canonical across retained retry ou
     _ = book.completeRetry(sent.handle, .sent, &ingress) orelse return error.RetryCompletionRejected;
     const after_sent = book.get(key) orelse return error.MissingActiveRequest;
     try std.testing.expectEqual(canonical_address, @intFromPtr(after_sent));
-    try std.testing.expect(std.meta.eql(response_fingerprint, after_sent.response));
-    try std.testing.expect(std.meta.eql(phase_fingerprint, after_sent.phase));
+    try expectNodesStateUnchanged(after_sent, &distances, 7, 2, &raw_enrs);
+    try std.testing.expect(after_sent.phase == .awaiting_whoareyou);
+    try expectRecoveryUnchanged(&after_sent.phase.awaiting_whoareyou.recovery, &original_probe.recovery);
+    try std.testing.expectEqualSlices(u8, original_probe.retry_packet.slice(), after_sent.phase.awaiting_whoareyou.retry_packet.slice());
     try std.testing.expectEqual(permit_fingerprint, after_sent.permitHandle());
     try std.testing.expectEqual(@as(u32, 2), after_sent.attempts);
     try std.testing.expectEqual(@as(i64, 10), after_sent.deadline_ns);
@@ -543,13 +574,14 @@ test "fresh retry failure and runtime stop preserve canonical NODES phase and cu
     const key = types.RequestKey.init(endpoint(42), try message.ReqId.fromSlice(&.{ 4, 2 }));
     const original_nonce = [_]u8{42} ** 12;
     const distances = requestedDistances(&.{ 2, 42, 256 });
+    const original_probe = try probe(42);
     const handle = try book.beginSending(
         &ingress,
         key,
         .api,
         .{ .nodes = distances },
         .{ .awaiting_response = .{
-            .recovery = (try probe(42)).recovery,
+            .recovery = original_probe.recovery,
             .wait = .session_request,
         } },
         1,
@@ -560,8 +592,6 @@ test "fresh retry failure and runtime stop preserve canonical NODES phase and cu
     const before = book.get(key) orelse return error.MissingActiveRequest;
     before.response.nodes.total_responses = 9;
     before.response.nodes.responses_received = 4;
-    const response_fingerprint = before.response;
-    const phase_fingerprint = before.phase;
     const permit_fingerprint = before.permitHandle();
     const canonical_address = @intFromPtr(before);
 
@@ -579,8 +609,14 @@ test "fresh retry failure and runtime stop preserve canonical NODES phase and cu
         try std.testing.expect(book.completeRetry(copied, .sent, &ingress) == null);
         const active = book.get(key) orelse return error.MissingActiveRequest;
         try std.testing.expectEqual(canonical_address, @intFromPtr(active));
-        try std.testing.expect(std.meta.eql(response_fingerprint, active.response));
-        try std.testing.expect(std.meta.eql(phase_fingerprint, active.phase));
+        try std.testing.expect(active.response == .nodes);
+        try std.testing.expectEqual(@as(u64, 9), active.response.nodes.total_responses.?);
+        try std.testing.expectEqual(@as(u64, 4), active.response.nodes.responses_received);
+        try std.testing.expectEqual(distances, active.response.nodes.requested_distances);
+        try std.testing.expectEqual(@as(usize, 0), active.response.nodes.validated_enrs.slice().len);
+        try std.testing.expect(active.phase == .awaiting_response);
+        try std.testing.expect(active.phase.awaiting_response.wait == .session_request);
+        try expectRecoveryUnchanged(&active.phase.awaiting_response.recovery, &original_probe.recovery);
         try std.testing.expectEqual(permit_fingerprint, active.permitHandle());
         try std.testing.expectEqualSlices(u8, &original_nonce, &active.phase.awaiting_response.recovery.nonce);
         try std.testing.expectEqual(@as(u32, @intCast(index + 1)), active.attempts);

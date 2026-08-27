@@ -444,7 +444,7 @@ pub const RequestBook = struct {
         if (establish) {
             if (self.lanes.get(key.endpoint)) |lane| if (lane.establishing != null) return error.EndpointEstablishing;
         }
-        const challenge_index = challengeForPhase(key.endpoint.addr, phase);
+        const challenge_index = challengeForPhase(key.endpoint.addr, &phase);
         if (challenge_index) |index| if (self.challenge_by_nonce.contains(index)) return error.DuplicateChallenge;
         const handle = if (assigned_generation) |generation|
             RequestHandle{ .key = key, .generation = generation }
@@ -495,7 +495,7 @@ pub const RequestBook = struct {
         const current = self.active.get(handle.key) orelse return null;
         if (current != .sending or current.sending.generation != handle.generation) return null;
         var removed = self.active.fetchRemove(handle.key).?.value;
-        self.clearIndexes(handle, removed.sending.phase);
+        self.clearIndexes(handle, &removed.sending.phase);
         const view = SendCompletionView{ .key = handle.key, .origin = removed.sending.origin, .kind = removed.sending.response.kind() };
         removed.sending.admission.release(admission);
         return view;
@@ -1045,11 +1045,11 @@ pub const RequestBook = struct {
         const removed = self.active.fetchRemove(key).?.value;
         switch (removed) {
             .sending => |request| {
-                self.clearIndexes(handle, request.phase);
+                self.clearIndexes(handle, &request.phase);
                 if (request.queued_intent) self.discardQueuedIntent(key);
             },
             .active => |request| {
-                self.clearIndexes(handle, request.phase);
+                self.clearIndexes(handle, &request.phase);
                 if (request.queued_intent) self.discardQueuedIntent(key);
             },
         }
@@ -1110,7 +1110,7 @@ pub const RequestBook = struct {
             const request = self.active.getPtr(handle.key) orelse unreachable;
             std.debug.assert(storedGeneration(request) == handle.generation);
             const phase = storedPhase(request);
-            const expected = challengeForPhase(handle.key.endpoint.addr, phase.*) orelse unreachable;
+            const expected = challengeForPhase(handle.key.endpoint.addr, phase) orelse unreachable;
             std.debug.assert(std.meta.eql(entry.key_ptr.*, expected));
         }
     }
@@ -1167,7 +1167,7 @@ pub const RequestBook = struct {
         self.removeEmptyLane(key.endpoint);
     }
 
-    fn clearIndexes(self: *RequestBook, handle: RequestHandle, phase: Phase) void {
+    fn clearIndexes(self: *RequestBook, handle: RequestHandle, phase: *const Phase) void {
         if (challengeForPhase(handle.key.endpoint.addr, phase)) |index| {
             if (self.challenge_by_nonce.get(index)) |indexed| if (handleEql(indexed, handle)) {
                 _ = self.challenge_by_nonce.remove(index);
@@ -1309,10 +1309,10 @@ fn handleEql(a: RequestHandle, b: RequestHandle) bool {
     return a.generation == b.generation and types.RequestKeyContext.eql(.{}, a.key, b.key);
 }
 
-fn challengeForPhase(address: types.Address, phase: Phase) ?types.ChallengeKey {
-    return switch (phase) {
-        .awaiting_whoareyou => |state| .init(address, &state.recovery.nonce),
-        .awaiting_response => |response| if (response.wait.canChallenge()) .init(address, &response.recovery.nonce) else null,
+fn challengeForPhase(address: types.Address, phase: *const Phase) ?types.ChallengeKey {
+    return switch (phase.*) {
+        .awaiting_whoareyou => |*state| .init(address, &state.recovery.nonce),
+        .awaiting_response => |*response| if (response.wait.canChallenge()) .init(address, &response.recovery.nonce) else null,
     };
 }
 

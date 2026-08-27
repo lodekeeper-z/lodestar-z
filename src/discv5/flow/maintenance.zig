@@ -13,13 +13,6 @@ const Actor = actor_mod.Actor;
 const Env = actor_mod.Env;
 const MAX_REDRAIN_LANES_PER_MAINTENANCE: usize = 16;
 
-const RetryState = struct {
-    handle: types.RequestHandle,
-    attempts: u32,
-    kind: types.RequestKind,
-    phase: request_book.Phase,
-};
-
 pub fn run(actor: *Actor, env: Env, now_ns: i64) void {
     // Stable-session expiry is maintenance-owned. Metrics report the stored
     // session state left by the most recent completed maintenance pass.
@@ -50,17 +43,16 @@ fn pruneActive(actor: *Actor, env: Env, now_ns: i64) void {
     while (!scan.done) {
         const count = actor.requests.collectTimedOutBatch(&keys, now_ns, &scan);
         for (keys[0..count]) |key| {
-            const retry: RetryState = blk: {
+            const retry = blk: {
                 const active = actor.requests.get(key) orelse continue;
                 break :blk .{
                     .handle = actor.requests.handleFor(key) orelse unreachable,
                     .attempts = active.attempts,
                     .kind = active.response.kind(),
-                    .phase = active.phase,
                 };
             };
             if (retry.attempts < actor.request_retries) {
-                retryTimedOut(actor, env, key, retry, now_ns);
+                retryTimedOut(actor, env, retry.handle, retry.kind, now_ns);
                 continue;
             }
             timeout(actor, env, key);
@@ -68,12 +60,15 @@ fn pruneActive(actor: *Actor, env: Env, now_ns: i64) void {
     }
 }
 
-fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetryState, now_ns: i64) void {
+fn retryTimedOut(actor: *Actor, env: Env, handle: types.RequestHandle, kind: types.RequestKind, now_ns: i64) void {
+    const key = handle.key;
+    const active = actor.requests.get(key) orelse return;
+    if (active.generation != handle.generation) return;
     const deadline_ns = outbound.deadlineNs(now_ns, actor.request_timeout_ms);
-    switch (retry.phase) {
-        .awaiting_whoareyou => |probe| {
+    switch (active.phase) {
+        .awaiting_whoareyou => |*probe| {
             _ = probe;
-            const prepared = actor.requests.prepareRetainedRetry(retry.handle, deadline_ns) catch return;
+            const prepared = actor.requests.prepareRetainedRetry(handle, deadline_ns) catch return;
             const effect = actor_mod.ActorEffect{ .retry = .{
                 .handle = prepared.handle,
                 .packet = prepared.packet,
@@ -84,25 +79,25 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
                 return;
             };
         },
-        .awaiting_response => |response| {
-            actor.requests.preflightFreshRetry(retry.handle) catch return;
+        .awaiting_response => |*response| {
+            actor.requests.preflightFreshRetry(handle) catch return;
             var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
             const pending_write_key = if (response.wait.pendingHandshake()) |pending| pending.keys.initiator_key else null;
             const stable = if (pending_write_key == null) actor.sessions.get(key.endpoint, now_ns) else null;
             const awaiting_whoareyou = pending_write_key == null and stable == null;
             const encoded = if (pending_write_key) |write_key|
                 encodeRetryMessage(actor, env, &buffer, key.endpoint.node_id, &write_key, response.recovery.plaintext.slice()) catch {
-                    _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
+                    _ = actor.requests.failRetryPreparation(handle, deadline_ns);
                     return;
                 }
             else if (stable) |session|
                 encodeRetryMessage(actor, env, &buffer, key.endpoint.node_id, &session.initiator_key, response.recovery.plaintext.slice()) catch {
-                    _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
+                    _ = actor.requests.failRetryPreparation(handle, deadline_ns);
                     return;
                 }
             else
                 outbound.encodeProbe(actor, env.io, &buffer, key.endpoint.node_id, response.recovery.plaintext.slice()) catch {
-                    _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
+                    _ = actor.requests.failRetryPreparation(handle, deadline_ns);
                     return;
                 };
             actor.responses.removeExpired(key.endpoint.addr, &encoded.nonce, now_ns, env.ingress);
@@ -110,13 +105,13 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
                 (awaiting_whoareyou and !actor.requests.canEstablish(key)) or
                 actor.responses.hasLive(key.endpoint.addr, &encoded.nonce, now_ns))
             {
-                _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
+                _ = actor.requests.failRetryPreparation(handle, deadline_ns);
                 return;
             }
             const transition: request_book.FreshRetryTransition = if (awaiting_whoareyou)
                 .{ .probe = .{
                     .retry_packet = types.PacketBytes.init(encoded.bytes) catch {
-                        _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
+                        _ = actor.requests.failRetryPreparation(handle, deadline_ns);
                         return;
                     },
                     .nonce = encoded.nonce,
@@ -124,18 +119,18 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
             else
                 .{ .response = encoded.nonce };
             const retry_packet = types.PacketBytes.init(encoded.bytes) catch {
-                _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
+                _ = actor.requests.failRetryPreparation(handle, deadline_ns);
                 return;
             };
             var next_admission = env.ingress.acquire(
                 key.endpoint.addr,
-                @import("../admission.zig").requestPacketBudget(retry.kind),
+                @import("../admission.zig").requestPacketBudget(kind),
             ) catch {
-                _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
+                _ = actor.requests.failRetryPreparation(handle, deadline_ns);
                 return;
             };
             const prepared = actor.requests.prepareFreshRetry(
-                retry.handle,
+                handle,
                 retry_packet,
                 transition,
                 deadline_ns,
