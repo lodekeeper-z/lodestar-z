@@ -183,7 +183,10 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
     };
     switch (source) {
         .request => |preparation| actor.requests.preflightHandshake(preparation) catch return,
-        .response => {},
+        .response => |view| actor.responses.preflightHandshake(view) catch {
+            _ = actor.responses.failRecovery(view, env.ingress);
+            return;
+        },
     }
     const target = switch (source) {
         .request => |preparation| preparation.permit,

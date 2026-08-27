@@ -229,15 +229,24 @@ pub const ResponseBook = struct {
         };
     }
 
+    /// Validates the exact recoverable owner and non-wrapping handshake
+    /// generation without changing recency, state, or admission ownership.
+    pub fn preflightHandshake(self: *const ResponseBook, view: ChallengeView) !void {
+        const current = self.phases.peekPtrRaw(handleKey(view.handle)) orelse return error.StaleResponse;
+        if (!matchesRecoverable(current, view)) return error.StaleResponse;
+        _ = std.math.add(u64, self.next_handshake_generation, 1) catch return error.GenerationExhausted;
+    }
+
     pub fn beginHandshake(
         self: *ResponseBook,
         view: ChallengeView,
         keys: CandidateKeys,
         prepared_at_ns: i64,
     ) !HandshakeHandle {
+        try self.preflightHandshake(view);
         const successor = std.math.add(u64, self.next_handshake_generation, 1) catch return error.GenerationExhausted;
         const current = self.phases.getPtrRaw(handleKey(view.handle)) orelse return error.StaleResponse;
-        if (!sameHandle(current.handle, view.handle) or current.phase != .recoverable) return error.StaleResponse;
+        if (!matchesRecoverable(current, view)) return error.StaleResponse;
         const handle = HandshakeHandle{
             .response = view.handle,
             .send_generation = self.next_handshake_generation,
@@ -437,6 +446,14 @@ fn sameHandle(a: ResponseHandle, b: ResponseHandle) bool {
     return a.generation == b.generation and
         std.mem.eql(u8, &a.nonce, &b.nonce) and
         types.EndpointContext.eql(.{}, a.endpoint, b.endpoint);
+}
+
+fn matchesRecoverable(stored: *const StoredResponse, view: ChallengeView) bool {
+    return sameHandle(stored.handle, view.handle) and
+        stored.phase == .recoverable and
+        std.meta.eql(stored.recovery.dest_pubkey, view.dest_pubkey) and
+        std.meta.eql(stored.recovery.plaintext, view.plaintext) and
+        std.meta.eql(stored.recovery.admission.handle(), view.permit);
 }
 
 fn cleanup(owned: StoredResponse, admission: *admission_mod.IngressAdmission) void {

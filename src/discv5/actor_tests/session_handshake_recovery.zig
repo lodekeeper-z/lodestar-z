@@ -2763,6 +2763,154 @@ test "initial response generation exhaustion preflights before every actor side 
     try std.testing.expectEqual(@as(u64, 1), actor.metrics.sent_message_count[metrics.MessageType.talkresp.index()]);
 }
 
+test "response WHOAREYOU handshake generation exhaustion preflights before credit and preparation" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xf1} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xf2} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 83 }, .port = 9283 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = .{
+            .global_quota = .{ .replenish_all_every_ms = 60_000, .max_tokens = 1 },
+            .by_ip_quota = .{ .replenish_all_every_ms = 60_000, .max_tokens = 1 },
+            .by_ip_state_capacity = 1,
+        },
+        .limits = .{
+            .max_active_requests = 1,
+            .max_queued_requests = 1,
+            .session_capacity = 1,
+            .response_recovery_capacity = 1,
+            .event_capacity = 1,
+            .command_capacity = 1,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const now_ns = outbound.nowNs(io);
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, now_ns));
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xf3} ** 16,
+        .recipient_key = [_]u8{0xf4} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, now_ns);
+
+    const exhausted_nonce = [_]u8{0xf5} ** packet.NONCE_SIZE;
+    var response_env = harness.env();
+    response_env.response_nonce = exhausted_nonce;
+    try actor.sendTalkResponse(response_env, endpoint, try message.ReqId.fromSlice(&.{0xf6}), "exhausted response");
+    const response_effect = harness.effects.pop() orelse return error.MissingResponseEffect;
+    const copied_response_effect = response_effect;
+    try std.testing.expect(response_effect == .response);
+    try harness.recording.sender().send(response_effect.destination(), response_effect.packetBytes());
+    actor.applyEffectCompletion(harness.env(), response_effect, .sent);
+    const recovery = actor.responses.challenge(endpoint.addr, &exhausted_nonce, now_ns, &harness.ingress) orelse return error.MissingRecovery;
+    try std.testing.expectEqual(response_effect.response.handle, recovery.handle);
+
+    var competitor = try harness.ingress.acquire(endpoint.addr, 1);
+    defer competitor.release(&harness.ingress);
+    const competitor_handle = competitor.handle();
+    try std.testing.expect(!std.meta.eql(competitor_handle, recovery.permit));
+    try std.testing.expect(harness.ingress.admit(endpoint.addr, 0) == .ordinary);
+    var credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |value| value,
+        else => return error.MissingCompetingExpectedCredit,
+    };
+    defer credit.rollback(&harness.ingress);
+    try std.testing.expectEqual(competitor_handle, credit.source());
+    try std.testing.expect(!std.meta.eql(credit.source(), recovery.permit));
+
+    var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const exhausted_challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
+        .masking_iv = &([_]u8{0xf7} ** packet.MASKING_IV_SIZE),
+        .recipient_node_id = &local_id,
+        .request_nonce = &exhausted_nonce,
+        .id_nonce = &([_]u8{0xf8} ** packet.ID_NONCE_SIZE),
+        .enr_seq = 0,
+    }, null);
+    response_book.ResponseBook.Testing.setNextHandshakeGeneration(&actor.responses, std.math.maxInt(u64));
+    const response_before = response_book.ResponseBook.Testing.fingerprint(&actor.responses);
+    const admission_before = admission.IngressAdmission.Testing.fingerprint(&harness.ingress);
+    const metrics_before = actor.metrics;
+    const sessions_before = actor.sessions.metricsSnapshot();
+    const peer_before = actor.peers.known(&remote_id) orelse return error.MissingPeer;
+    const effects_before = harness.effects.count();
+    const datagrams_before = harness.recording.datagrams.items.len;
+    var preparation_attempts: usize = 0;
+    var exhausted_env = harness.env();
+    exhausted_env.expected_credit = &credit;
+    exhausted_env.handshake_preparation_attempts = &preparation_attempts;
+    actor.handlePacket(exhausted_env, exhausted_challenge, endpoint.addr);
+
+    try std.testing.expectEqual(@as(usize, 0), preparation_attempts);
+    try std.testing.expect(credit.armed);
+    try std.testing.expectEqual(competitor_handle, credit.source());
+    try std.testing.expectEqual(effects_before, harness.effects.count());
+    try std.testing.expectEqual(datagrams_before, harness.recording.datagrams.items.len);
+    try std.testing.expect(std.meta.eql(metrics_before, actor.metrics));
+    try std.testing.expectEqual(sessions_before, actor.sessions.metricsSnapshot());
+    try std.testing.expectEqual(peer_before, actor.peers.known(&remote_id).?);
+    try std.testing.expectEqual(stable, actor.sessions.get(endpoint, now_ns).?);
+    try std.testing.expectEqual(@as(usize, 0), actor.responses.phaseCount());
+    try std.testing.expectEqual(@as(usize, 0), actor.responses.candidateCount());
+    try std.testing.expect(actor.responses.challenge(endpoint.addr, &exhausted_nonce, now_ns, &harness.ingress) == null);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    const admission_after = admission.IngressAdmission.Testing.fingerprint(&harness.ingress);
+    try std.testing.expectEqual(admission_before.active_receipts, admission_after.active_receipts);
+    try std.testing.expectEqual(admission_before.reserved_credits, admission_after.reserved_credits);
+    try std.testing.expectEqual(admission_before.permit_generations, admission_after.permit_generations);
+    try std.testing.expectEqual(admission_before.credit_generations, admission_after.credit_generations);
+    try std.testing.expectEqual(response_before.next_handshake_generation, response_book.ResponseBook.Testing.fingerprint(&actor.responses).next_handshake_generation);
+
+    try std.testing.expect(!actor.responses.failRecovery(recovery, &harness.ingress));
+    actor.applyEffectCompletion(harness.env(), copied_response_effect, .sent);
+    try std.testing.expectEqual(admission_after, admission.IngressAdmission.Testing.fingerprint(&harness.ingress));
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    credit.rollback(&harness.ingress);
+    try std.testing.expect(!credit.armed);
+    var reacquired = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |value| value,
+        else => return error.CompetingExpectedCreditNotRestored,
+    };
+    try std.testing.expectEqual(competitor_handle, reacquired.source());
+    reacquired.rollback(&harness.ingress);
+
+    response_book.ResponseBook.Testing.setNextHandshakeGeneration(&actor.responses, 100);
+    const viable_nonce = [_]u8{0xf9} ** packet.NONCE_SIZE;
+    response_env.response_nonce = viable_nonce;
+    try actor.sendTalkResponse(response_env, endpoint, try message.ReqId.fromSlice(&.{0xfa}), "viable response");
+    const viable_response = harness.effects.pop() orelse return error.MissingViableResponseEffect;
+    try std.testing.expect(viable_response == .response);
+    actor.applyEffectCompletion(harness.env(), viable_response, .sent);
+    const viable_recovery = actor.responses.challenge(endpoint.addr, &viable_nonce, now_ns, &harness.ingress) orelse return error.MissingViableRecovery;
+    var viable_challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const viable_challenge = try packet.encodeWhoareyouPacketInto(&viable_challenge_buffer, .{
+        .masking_iv = &([_]u8{0xfb} ** packet.MASKING_IV_SIZE),
+        .recipient_node_id = &local_id,
+        .request_nonce = &viable_nonce,
+        .id_nonce = &([_]u8{0xfc} ** packet.ID_NONCE_SIZE),
+        .enr_seq = 0,
+    }, null);
+    preparation_attempts = 0;
+    var viable_env = harness.env();
+    viable_env.handshake_preparation_attempts = &preparation_attempts;
+    actor.handlePacket(viable_env, viable_challenge, endpoint.addr);
+    try std.testing.expectEqual(@as(usize, 1), preparation_attempts);
+    const handshake_effect = harness.effects.pop() orelse return error.MissingResponseHandshakeEffect;
+    try std.testing.expect(handshake_effect == .handshake);
+    try std.testing.expectEqual(viable_recovery.handle, handshake_effect.handshake.handle.response.response);
+    actor.applyEffectCompletion(harness.env(), handshake_effect, .sent);
+    try std.testing.expect(actor.responses.candidate(endpoint, now_ns) != null);
+}
+
 test "transactional capacity-one response replacement send failure preserves original" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
