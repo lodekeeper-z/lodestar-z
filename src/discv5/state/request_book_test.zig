@@ -102,6 +102,11 @@ test "response waits preserve challenge and pending-key behavior across retries 
         3,
         &retry_permit,
     );
+    try std.testing.expect(book.pendingKeys(promoted_retry.endpoint) == null);
+    try std.testing.expect(!book.promotePending(book_mod.PendingKeysView{ .handle = .{
+        .request = promoted_handle,
+        .send_generation = 1,
+    }, .keys = keys }));
     _ = book.completeRetry(promoted_prepared.handle, .sent, &ingress) orelse return error.RetryCompletionRejected;
     const retry_pending = book.pendingKeys(promoted_retry.endpoint) orelse return error.MissingPendingKeys;
     try std.testing.expectEqual(keys, retry_pending.keys);
@@ -397,25 +402,89 @@ test "copied retained retry completion commits attempts and deadline once" {
     );
     _ = book.completeSending(handle) orelse return error.SendingCompletionRejected;
 
+    const canonical_address = @intFromPtr(book.get(key) orelse return error.MissingActiveRequest);
     const prepared = try book.prepareRetainedRetry(handle, 9);
+    const armed = book_mod.Testing.retryCanonicalActive(&book, prepared.handle) orelse return error.MissingCanonicalRetryRequest;
+    try std.testing.expectEqual(canonical_address, @intFromPtr(armed));
+    try std.testing.expect(armed.retry_send != null);
+    try std.testing.expect(armed.handshake_send == null);
     const copied = prepared.handle;
     try std.testing.expect((book.completeRetry(prepared.handle, .sent, &ingress) orelse return error.RetryCompletionRejected).kind == .ping);
     try std.testing.expect(book.completeRetry(copied, .sent, &ingress) == null);
-    try std.testing.expectEqual(@as(u32, 1), book.get(key).?.attempts);
-    try std.testing.expectEqual(@as(i64, 9), book.get(key).?.deadline_ns);
+    const completed = book.get(key) orelse return error.MissingActiveRequest;
+    try std.testing.expectEqual(canonical_address, @intFromPtr(completed));
+    try std.testing.expect(completed.retry_send == null);
+    try std.testing.expectEqual(@as(u32, 1), completed.attempts);
+    try std.testing.expectEqual(@as(i64, 9), completed.deadline_ns);
+
+    const current = try book.prepareRetainedRetry(handle, 10);
+    try std.testing.expect(book.completeRetry(copied, .sent, &ingress) == null);
+    _ = book.completeRetry(current.handle, .sent, &ingress) orelse return error.RetryCompletionRejected;
+    try std.testing.expectEqual(@as(u32, 2), book.get(key).?.attempts);
+    try std.testing.expectEqual(@as(i64, 10), book.get(key).?.deadline_ns);
 }
 
-test "copied fresh retry success swaps phase and permit once" {
+test "large multipart NODES accumulator stays canonical across retained retry outcomes" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(52), try message.ReqId.fromSlice(&.{ 5, 2 }));
+    const distances = requestedDistances(&.{ 1, 17, 256 });
+    const handle = try book.beginSending(&ingress, key, .api, .{ .nodes = distances }, .{
+        .awaiting_whoareyou = try probe(52),
+    }, 1, true, false);
+    _ = book.completeSending(handle) orelse return error.SendingCompletionRejected;
+    const active = book.get(key) orelse return error.MissingActiveRequest;
+    active.response.nodes.total_responses = 7;
+    active.response.nodes.responses_received = 2;
+    inline for (.{ @as(u8, 0x52), @as(u8, 0x53) }) |secret| {
+        const enr_key = try secp.keyPairFromSecret(&([_]u8{secret} ** 32));
+        var builder = enr.Builder.init(std.testing.allocator, enr_key, secret);
+        builder.ip = .{ 127, 0, 0, secret };
+        builder.udp = 9000 + @as(u16, secret);
+        const raw = try builder.encode();
+        defer std.testing.allocator.free(raw);
+        active.response.nodes.validated_enrs.append(try enr.ValidatedEnr.init(raw));
+    }
+    const canonical_address = @intFromPtr(active);
+    const response_fingerprint = active.response;
+    const phase_fingerprint = active.phase;
+    const permit_fingerprint = active.permitHandle();
+
+    const failed = try book.prepareRetainedRetry(handle, 9);
+    _ = book.completeRetry(failed.handle, .failed, &ingress) orelse return error.RetryCompletionRejected;
+    const after_failed = book.get(key) orelse return error.MissingActiveRequest;
+    try std.testing.expectEqual(canonical_address, @intFromPtr(after_failed));
+    try std.testing.expect(std.meta.eql(response_fingerprint, after_failed.response));
+    try std.testing.expect(std.meta.eql(phase_fingerprint, after_failed.phase));
+    try std.testing.expectEqual(permit_fingerprint, after_failed.permitHandle());
+    try std.testing.expectEqual(@as(u32, 1), after_failed.attempts);
+    try std.testing.expectEqual(@as(i64, 9), after_failed.deadline_ns);
+
+    const sent = try book.prepareRetainedRetry(handle, 10);
+    _ = book.completeRetry(sent.handle, .sent, &ingress) orelse return error.RetryCompletionRejected;
+    const after_sent = book.get(key) orelse return error.MissingActiveRequest;
+    try std.testing.expectEqual(canonical_address, @intFromPtr(after_sent));
+    try std.testing.expect(std.meta.eql(response_fingerprint, after_sent.response));
+    try std.testing.expect(std.meta.eql(phase_fingerprint, after_sent.phase));
+    try std.testing.expectEqual(permit_fingerprint, after_sent.permitHandle());
+    try std.testing.expectEqual(@as(u32, 2), after_sent.attempts);
+    try std.testing.expectEqual(@as(i64, 10), after_sent.deadline_ns);
+}
+
+test "copied fresh retry success swaps phase permit indexes lane and NODES generation once" {
     var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
     defer ingress.deinit();
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(41), try message.ReqId.fromSlice(&.{ 4, 1 }));
+    const distances = requestedDistances(&.{ 1, 41, 256 });
     const handle = try book.beginSending(
         &ingress,
         key,
         .api,
-        .pong,
+        .{ .nodes = distances },
         .{ .awaiting_response = .{
             .recovery = (try probe(41)).recovery,
             .wait = .session_request,
@@ -425,36 +494,60 @@ test "copied fresh retry success swaps phase and permit once" {
         false,
     );
     _ = book.completeSending(handle) orelse return error.SendingCompletionRejected;
-    var replacement = try ingress.acquire(key.endpoint.addr, admission.requestPacketBudget(.ping));
+    const before = book.get(key) orelse return error.MissingActiveRequest;
+    before.response.nodes.total_responses = 4;
+    before.response.nodes.responses_received = 3;
+    const canonical_address = @intFromPtr(before);
+    const old_permit = before.permitHandle();
+    var replacement = try ingress.acquire(key.endpoint.addr, admission.requestPacketBudget(.findnode));
+    const replacement_permit = replacement.handle();
     const prepared = try book.prepareFreshRetry(
         handle,
         try .init(&.{ 8, 9 }),
-        .{ .response = [_]u8{42} ** 12 },
+        .{ .probe = .{ .retry_packet = try .init(&.{ 6, 7 }), .nonce = [_]u8{42} ** 12 } },
         9,
         &replacement,
     );
+    const armed = book_mod.Testing.retryCanonicalActive(&book, prepared.handle) orelse return error.MissingCanonicalRetryRequest;
+    try std.testing.expectEqual(canonical_address, @intFromPtr(armed));
+    try std.testing.expect(armed.retry_send != null);
     const copied = prepared.handle;
 
     _ = book.completeRetry(prepared.handle, .sent, &ingress) orelse return error.RetryCompletionRejected;
     try std.testing.expect(book.completeRetry(copied, .sent, &ingress) == null);
     const active = book.get(key) orelse return error.MissingActiveRequest;
-    try std.testing.expectEqualSlices(u8, &([_]u8{42} ** 12), &active.phase.awaiting_response.recovery.nonce);
+    try std.testing.expectEqual(canonical_address, @intFromPtr(active));
+    try std.testing.expect(active.retry_send == null);
+    try std.testing.expect(active.phase == .awaiting_whoareyou);
+    try std.testing.expectEqualSlices(u8, &([_]u8{42} ** 12), &active.phase.awaiting_whoareyou.recovery.nonce);
+    try std.testing.expectEqualSlices(u8, &.{ 6, 7 }, active.phase.awaiting_whoareyou.retry_packet.slice());
+    try std.testing.expect(!book.hasChallenge(&([_]u8{41} ** 12), key.endpoint.addr));
+    try std.testing.expect(book.hasChallenge(&([_]u8{42} ** 12), key.endpoint.addr));
+    try std.testing.expect(book.shouldQueue(key.endpoint));
+    try std.testing.expect(!std.meta.eql(old_permit, active.permitHandle()));
+    try std.testing.expectEqual(replacement_permit, active.permitHandle());
+    try std.testing.expectEqual(@as(usize, 0), active.response.nodes.validated_enrs.slice().len);
+    try std.testing.expect(active.response.nodes.total_responses == null);
+    try std.testing.expectEqual(@as(u64, 0), active.response.nodes.responses_received);
+    try std.testing.expectEqual(distances, active.response.nodes.requested_distances);
     try std.testing.expectEqual(@as(u32, 1), active.attempts);
+    try std.testing.expectEqual(@as(i64, 9), active.deadline_ns);
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
 }
 
-test "fresh retry failure makes copied stale success harmless" {
+test "fresh retry failure and runtime stop preserve canonical NODES phase and current permit" {
     var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
     defer ingress.deinit();
     var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
     defer book.deinit(&ingress);
     const key = types.RequestKey.init(endpoint(42), try message.ReqId.fromSlice(&.{ 4, 2 }));
     const original_nonce = [_]u8{42} ** 12;
+    const distances = requestedDistances(&.{ 2, 42, 256 });
     const handle = try book.beginSending(
         &ingress,
         key,
         .api,
-        .pong,
+        .{ .nodes = distances },
         .{ .awaiting_response = .{
             .recovery = (try probe(42)).recovery,
             .wait = .session_request,
@@ -464,24 +557,36 @@ test "fresh retry failure makes copied stale success harmless" {
         false,
     );
     _ = book.completeSending(handle) orelse return error.SendingCompletionRejected;
-    var replacement = try ingress.acquire(key.endpoint.addr, admission.requestPacketBudget(.ping));
-    const prepared = try book.prepareFreshRetry(
-        handle,
-        try .init(&.{ 8, 9 }),
-        .{ .response = [_]u8{43} ** 12 },
-        9,
-        &replacement,
-    );
-    const copied = prepared.handle;
+    const before = book.get(key) orelse return error.MissingActiveRequest;
+    before.response.nodes.total_responses = 9;
+    before.response.nodes.responses_received = 4;
+    const response_fingerprint = before.response;
+    const phase_fingerprint = before.phase;
+    const permit_fingerprint = before.permitHandle();
+    const canonical_address = @intFromPtr(before);
 
-    _ = book.completeRetry(prepared.handle, .failed, &ingress) orelse return error.RetryCompletionRejected;
-    try std.testing.expect(book.completeRetry(copied, .sent, &ingress) == null);
-    const active = book.get(key) orelse return error.MissingActiveRequest;
-    try std.testing.expectEqualSlices(u8, &original_nonce, &active.phase.awaiting_response.recovery.nonce);
-    try std.testing.expectEqual(.session_request, active.phase.awaiting_response.wait);
-    try std.testing.expectEqual(@as(u32, 1), active.attempts);
-    try std.testing.expectEqual(@as(i64, 9), active.deadline_ns);
-    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    inline for (.{ book_mod.RetrySendCompletion.failed, book_mod.RetrySendCompletion.runtime_stopped }, 0..) |outcome, index| {
+        var replacement = try ingress.acquire(key.endpoint.addr, admission.requestPacketBudget(.findnode));
+        const prepared = try book.prepareFreshRetry(
+            handle,
+            try .init(&.{ 8, 9 }),
+            .{ .response = [_]u8{@intCast(43 + index)} ** 12 },
+            @intCast(9 + index),
+            &replacement,
+        );
+        const copied = prepared.handle;
+        _ = book.completeRetry(prepared.handle, outcome, &ingress) orelse return error.RetryCompletionRejected;
+        try std.testing.expect(book.completeRetry(copied, .sent, &ingress) == null);
+        const active = book.get(key) orelse return error.MissingActiveRequest;
+        try std.testing.expectEqual(canonical_address, @intFromPtr(active));
+        try std.testing.expect(std.meta.eql(response_fingerprint, active.response));
+        try std.testing.expect(std.meta.eql(phase_fingerprint, active.phase));
+        try std.testing.expectEqual(permit_fingerprint, active.permitHandle());
+        try std.testing.expectEqualSlices(u8, &original_nonce, &active.phase.awaiting_response.recovery.nonce);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 1)), active.attempts);
+        try std.testing.expectEqual(@as(i64, @intCast(9 + index)), active.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+    }
 }
 
 test "reused RequestKey rejects old retained and fresh retry generations" {
@@ -596,6 +701,50 @@ test "fresh retry preflight validates exact active awaiting-response generation"
     }, 2);
     try book.preflightFreshRetry(retained);
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+}
+
+test "retry send substate gates timeout response challenge handshake second retry and lane work" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const peer = endpoint(53);
+    const key = types.RequestKey.init(peer, try message.ReqId.fromSlice(&.{ 5, 3 }));
+    const distances = requestedDistances(&.{ 1, 53, 256 });
+    const recovery = (try probe(53)).recovery;
+    const handle = try book.beginSending(&ingress, key, .api, .{ .nodes = distances }, .{ .awaiting_response = .{
+        .recovery = recovery,
+        .wait = .session_request,
+    } }, 1, false, false);
+    _ = book.completeSending(handle) orelse return error.SendingCompletionRejected;
+    const challenge_preparation = try book.challenge(&recovery.nonce, peer.addr);
+    _ = try book.queue(try .init(.api, peer, &([_]u8{2} ** 33), try message.ReqId.fromSlice(&.{ 5, 4 }), .ping, &.{}, &.{1}, 100));
+    var replacement = try ingress.acquire(peer.addr, admission.requestPacketBudget(.findnode));
+    const prepared = try book.prepareFreshRetry(handle, try .init(&.{ 8, 9 }), .{ .response = [_]u8{54} ** 12 }, 9, &replacement);
+
+    try std.testing.expect(book.get(key) == null);
+    try std.testing.expectEqual(@as(usize, 0), book.activeCount());
+    try std.testing.expect(book.firstActive() == null);
+    try std.testing.expect(!book.hasActiveFindNode(&peer.node_id));
+    try std.testing.expectError(error.InvalidChallenge, book.challenge(&recovery.nonce, peer.addr));
+    try std.testing.expectError(error.StaleRequest, book.preflightHandshake(challenge_preparation));
+    try std.testing.expectError(error.StaleRequest, book.preflightFreshRetry(handle));
+    try std.testing.expectError(error.StaleRequest, book.prepareRetainedRetry(handle, 10));
+    var another = try ingress.acquire(peer.addr, admission.requestPacketBudget(.findnode));
+    defer another.release(&ingress);
+    try std.testing.expectError(error.StaleRequest, book.prepareFreshRetry(handle, try .init(&.{1}), .{ .response = [_]u8{55} ** 12 }, 10, &another));
+    try std.testing.expect(!book.failRetryPreparation(handle, 10));
+    var timeout_scan = book_mod.RequestBook.ActiveScan{};
+    var timed_out: [1]types.RequestKey = undefined;
+    try std.testing.expectEqual(@as(usize, 0), book.collectTimedOutBatch(&timed_out, 100, &timeout_scan));
+    try std.testing.expect(book.firstQueued(peer) == null);
+    try std.testing.expect(book.shouldQueue(peer));
+    var drainable: [1]types.Endpoint = undefined;
+    try std.testing.expectEqual(@as(usize, 0), book.collectDrainable(&drainable));
+
+    _ = book.completeRetry(prepared.handle, .failed, &ingress) orelse return error.RetryCompletionRejected;
+    try std.testing.expect(book.get(key) != null);
+    try std.testing.expect(book.firstQueued(peer) != null);
 }
 
 test "WHOAREYOU phase changes preserve the cumulative retry bound" {
