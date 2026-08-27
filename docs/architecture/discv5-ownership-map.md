@@ -118,7 +118,7 @@ Runtime delivers command | packet | maintenance | completion
 | Ordered Actor effect queues | request-only | 1 queue for every datagram effect |
 | Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
 | Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
-| DiscV5 tests after migration | 307 | 392 after response- and retry-ledger canonicalization |
+| DiscV5 tests after migration | 307 | 395 after response- and retry-ledger canonicalization |
 | Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 4,080 bytes; compact request/response/retry effects are packet plus semantic handle, with retry exactly 1,384 bytes; a final `<= 1,536` union ceiling is still required after the remaining legacy variants are compacted |
 
 ### Canonical completion ownership
