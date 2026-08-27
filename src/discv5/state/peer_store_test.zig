@@ -300,6 +300,151 @@ test "responsive exact incumbent rolls back pending generation without pin drift
     try std.testing.expect(!store.resolveEvictionSuccess(ticket));
 }
 
+test "no-key eviction completion rejects a stored request owned by another PeerRef" {
+    var store = try peer_store.PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    var active: [peer_store.K]peer_store.PeerRef = undefined;
+    for (&active, 0..) |*slot, index| {
+        slot.* = try store.remember(bucketNode(index), &([_]u8{0x21} ** 33), address(@intCast(10_100 + index)), false);
+        _ = try store.admitRoute(slot.*, false, @intCast(index));
+    }
+    const candidate = try store.remember(bucketNode(peer_store.K), &([_]u8{0x22} ** 33), address(10_200), false);
+    const ticket = (try store.admitRoute(candidate, true, 100)).eviction.?;
+    const other = try store.remember(bucketNode(peer_store.K + 1), &([_]u8{0x23} ** 33), address(10_201), false);
+    try std.testing.expect(peer_store.Testing.replaceEvictionRequestPeer(&store, ticket, other));
+
+    const before = store.stateHashForTest();
+    try std.testing.expect(!store.resolveEvictionSuccess(ticket));
+    try std.testing.expectEqual(before, store.stateHashForTest());
+    try std.testing.expect(!store.rollbackEviction(ticket));
+    try std.testing.expectEqual(before, store.stateHashForTest());
+    try std.testing.expect(!store.removeRoute(candidate));
+    try std.testing.expectEqual(before, store.stateHashForTest());
+    try std.testing.expect(store.pendingContains(candidate));
+    try std.testing.expect(store.routeContains(active[0]));
+}
+
+test "timeout and prune reject a stored eviction request owned by a stale reused PeerRef" {
+    var store = try peer_store.PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    var active: [peer_store.K]peer_store.PeerRef = undefined;
+    for (&active, 0..) |*slot, index| {
+        slot.* = try store.remember(bucketNode(index), &([_]u8{0x24} ** 33), address(@intCast(10_300 + index)), false);
+        _ = try store.admitRoute(slot.*, false, @intCast(index));
+    }
+    const candidate = try store.remember(bucketNode(peer_store.K), &([_]u8{0x25} ** 33), address(10_400), false);
+    const ticket = (try store.admitRoute(candidate, true, 100)).eviction.?;
+    const stale = try store.remember(bucketNode(peer_store.K + 1), &([_]u8{0x26} ** 33), address(10_401), false);
+    try std.testing.expect(store.remove(stale));
+    const current = try store.remember(bucketNode(peer_store.K + 2), &([_]u8{0x27} ** 33), address(10_402), false);
+    try std.testing.expectEqual(stale.index, current.index);
+    try std.testing.expect(stale.generation != current.generation);
+    try std.testing.expect(peer_store.Testing.replaceEvictionRequestPeer(&store, ticket, stale));
+
+    const before = store.stateHashForTest();
+    try std.testing.expect(store.completeEvictionTimeout(ticket) == null);
+    try std.testing.expectEqual(before, store.stateHashForTest());
+    var transitions: [1]peer_store.ConnectionEvent = undefined;
+    try std.testing.expectEqual(@as(usize, 0), store.prune(101, 0, &transitions));
+    try std.testing.expectEqual(before, store.stateHashForTest());
+    try std.testing.expect(store.pendingContains(candidate));
+    try std.testing.expect(store.routeContains(active[0]));
+}
+
+test "responsive eviction rollback releases only the pending candidate ENR" {
+    var store = try peer_store.PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    var active: [peer_store.K]peer_store.PeerRef = undefined;
+    for (&active, 0..) |*slot, index| {
+        slot.* = try store.remember(bucketNode(index), &([_]u8{0x31} ** 33), address(@intCast(10_500 + index)), false);
+        _ = try store.admitRoute(slot.*, false, @intCast(index));
+    }
+    const incumbent_id = bucketNode(0);
+    const candidate_id = bucketNode(peer_store.K);
+    const candidate = try store.remember(candidate_id, &([_]u8{0x32} ** 33), address(10_600), false);
+    const incumbent_raw = [_]u8{ 0xc1, 0x81 };
+    const candidate_raw = [_]u8{ 0xc1, 0x82 };
+    try store.putEnr(active[0], &incumbent_raw, 1);
+    try store.putEnr(candidate, &candidate_raw, 1);
+    const ticket = (try store.admitRoute(candidate, true, 100)).eviction.?;
+    const free_before = peer_store.Testing.enrFreeCount(&store);
+
+    try std.testing.expect(store.resolveEvictionSuccess(ticket));
+    try std.testing.expect(store.routeContains(active[0]));
+    try std.testing.expect(!store.pendingContains(candidate));
+    try std.testing.expect(store.known(&candidate_id) != null);
+    try std.testing.expectEqual(@as(usize, 1), store.fallbackCount());
+    try std.testing.expectEqualSlices(u8, &incumbent_raw, store.findEnr(&incumbent_id).?);
+    try std.testing.expect(store.findEnr(&candidate_id) == null);
+    try std.testing.expectEqual(free_before + 1, peer_store.Testing.enrFreeCount(&store));
+    const after = store.stateHashForTest();
+    try std.testing.expect(!store.resolveEvictionSuccess(ticket));
+    try std.testing.expectEqual(after, store.stateHashForTest());
+}
+
+test "explicit pending route removal releases only the cancelled candidate ENR" {
+    var store = try peer_store.PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    var active: [peer_store.K]peer_store.PeerRef = undefined;
+    for (&active, 0..) |*slot, index| {
+        slot.* = try store.remember(bucketNode(index), &([_]u8{0x33} ** 33), address(@intCast(10_700 + index)), false);
+        _ = try store.admitRoute(slot.*, false, @intCast(index));
+    }
+    const incumbent_id = bucketNode(0);
+    const candidate_id = bucketNode(peer_store.K);
+    const candidate = try store.remember(candidate_id, &([_]u8{0x34} ** 33), address(10_800), false);
+    const incumbent_raw = [_]u8{ 0xc1, 0x83 };
+    const candidate_raw = [_]u8{ 0xc1, 0x84 };
+    try store.putEnr(active[0], &incumbent_raw, 1);
+    try store.putEnr(candidate, &candidate_raw, 1);
+    _ = (try store.admitRoute(candidate, true, 100)).eviction.?;
+    const free_before = peer_store.Testing.enrFreeCount(&store);
+
+    try std.testing.expect(store.removeRoute(candidate));
+    try std.testing.expectEqual(peer_store.K, store.routeCount());
+    try std.testing.expectEqual(@as(usize, 0), store.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), store.fallbackCount());
+    try std.testing.expectEqual(@as(u8, 1), store.resolve(active[0]).?.activePins());
+    try std.testing.expectEqual(@as(u8, 0), store.resolve(candidate).?.pendingPins());
+    try std.testing.expectEqualSlices(u8, &incumbent_raw, store.findEnr(&incumbent_id).?);
+    try std.testing.expect(store.findEnr(&candidate_id) == null);
+    try std.testing.expectEqual(free_before + 1, peer_store.Testing.enrFreeCount(&store));
+    const after = store.stateHashForTest();
+    try std.testing.expect(!store.removeRoute(candidate));
+    try std.testing.expectEqual(after, store.stateHashForTest());
+}
+
+test "eviction timeout promotion releases only the demoted incumbent ENR" {
+    var store = try peer_store.PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    var active: [peer_store.K]peer_store.PeerRef = undefined;
+    for (&active, 0..) |*slot, index| {
+        slot.* = try store.remember(bucketNode(index), &([_]u8{0x35} ** 33), address(@intCast(10_900 + index)), false);
+        _ = try store.admitRoute(slot.*, false, @intCast(index));
+    }
+    const incumbent_id = bucketNode(0);
+    const candidate_id = bucketNode(peer_store.K);
+    const candidate = try store.remember(candidate_id, &([_]u8{0x36} ** 33), address(11_000), false);
+    const incumbent_raw = [_]u8{ 0xc1, 0x85 };
+    const candidate_raw = [_]u8{ 0xc1, 0x86 };
+    try store.putEnr(active[0], &incumbent_raw, 1);
+    try store.putEnr(candidate, &candidate_raw, 1);
+    const ticket = (try store.admitRoute(candidate, true, 100)).eviction.?;
+    const free_before = peer_store.Testing.enrFreeCount(&store);
+
+    try std.testing.expectEqual(candidate, store.completeEvictionTimeout(ticket).?);
+    try std.testing.expect(!store.routeContains(active[0]));
+    try std.testing.expect(store.routeContains(candidate));
+    try std.testing.expect(store.known(&incumbent_id) != null);
+    try std.testing.expectEqual(@as(usize, 1), store.fallbackCount());
+    try std.testing.expect(store.findEnr(&incumbent_id) == null);
+    try std.testing.expectEqualSlices(u8, &candidate_raw, store.findEnr(&candidate_id).?);
+    try std.testing.expectEqual(free_before + 1, peer_store.Testing.enrFreeCount(&store));
+    const after = store.stateHashForTest();
+    try std.testing.expect(store.completeEvictionTimeout(ticket) == null);
+    try std.testing.expectEqual(after, store.stateHashForTest());
+}
+
 test "PeerStore fallback replacement policy capacity and metrics match fallback storage" {
     const local_id = [_]u8{0} ** 32;
     var store = try peer_store.PeerStore.initWithFallbackCapacity(std.testing.allocator, local_id, true, false, 2);

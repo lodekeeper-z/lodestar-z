@@ -1,6 +1,7 @@
 //! Canonical bounded peer identity, contact, ENR, probe, and routing storage.
 //! The NodeId map key is an index key only: all peer facts live in PeerRecord.
 const std = @import("std");
+const builtin = @import("builtin");
 const enr = @import("../enr.zig");
 const types = @import("../types.zig");
 
@@ -893,8 +894,13 @@ pub const PeerStore = struct {
         const bucket = &self.backing.routing.buckets[distance];
         if (bucket.has_pending != 0 and peerRefEql(bucket.pending.newcomer, ref)) {
             const ticket = self.ticketForBucket(bucket) orelse return false;
+            _ = self.currentEvictionProbe(ticket) orelse return false;
             self.dropPending(bucket, ticket, false);
             return true;
+        }
+        if (bucket.has_pending != 0) {
+            const ticket = self.ticketForBucket(bucket) orelse return false;
+            _ = self.currentEvictionProbe(ticket) orelse return false;
         }
         const index = findRoute(bucket, ref) orelse return false;
         _ = removeRouteAt(bucket, index);
@@ -912,6 +918,7 @@ pub const PeerStore = struct {
 
     pub fn rollbackEviction(self: *PeerStore, ticket: EvictionTicket) bool {
         const bucket = self.bucketForTicket(ticket) orelse return false;
+        _ = self.currentEvictionProbe(ticket) orelse return false;
         self.dropPending(bucket, ticket, false);
         return true;
     }
@@ -1355,15 +1362,25 @@ pub const PeerStore = struct {
     }
 
     fn probeMatchesCurrentEndpoint(self: *const PeerStore, ticket: EvictionTicket) bool {
-        if (ticket.probe.index >= PROBE_CAPACITY) return false;
-        if (self.backing.probe_generations[ticket.probe.index] != ticket.probe.generation) return false;
-        const probe = switch (self.backing.probes[ticket.probe.index]) {
-            .eviction => |value| value,
-            else => return false,
-        };
-        if (!peerRefEql(probe.incumbent, ticket.incumbent) or probe.ticket_generation != ticket.generation) return false;
+        const probe = self.currentEvictionProbe(ticket) orelse return false;
         const incumbent = self.resolve(ticket.incumbent) orelse return false;
         return compactEndpointEql(probe.request.endpoint, incumbent.runtime);
+    }
+
+    fn currentEvictionProbe(self: *const PeerStore, ticket: EvictionTicket) ?CompactEvictionProbe {
+        if (ticket.probe.index >= PROBE_CAPACITY) return null;
+        if (self.backing.probe_generations[ticket.probe.index] != ticket.probe.generation) return null;
+        const probe = switch (self.backing.probes[ticket.probe.index]) {
+            .eviction => |value| value,
+            else => return null,
+        };
+        if (!peerRefEql(probe.incumbent, ticket.incumbent) or
+            !peerRefEql(probe.request.peer, ticket.incumbent) or
+            probe.ticket_generation != ticket.generation) return null;
+        const incumbent = self.resolve(ticket.incumbent) orelse return null;
+        const current = self.lookup(&incumbent.node_id) orelse return null;
+        if (!peerRefEql(current, ticket.incumbent)) return null;
+        return probe;
     }
 
     fn reserveProbe(self: *PeerStore) !ProbeRef {
@@ -1446,6 +1463,20 @@ pub const PeerStore = struct {
         self.backing.control.live_enrs -= 1;
     }
 };
+
+pub const Testing = if (builtin.is_test) struct {
+    pub fn replaceEvictionRequestPeer(store: *PeerStore, ticket: EvictionTicket, replacement: PeerRef) bool {
+        if (ticket.probe.index >= PROBE_CAPACITY) return false;
+        if (store.backing.probe_generations[ticket.probe.index] != ticket.probe.generation) return false;
+        if (store.backing.probes[ticket.probe.index] != .eviction) return false;
+        store.backing.probes[ticket.probe.index].eviction.request.peer = replacement;
+        return true;
+    }
+
+    pub fn enrFreeCount(store: *const PeerStore) usize {
+        return store.backing.control.enr_free_count;
+    }
+} else struct {};
 
 fn peerRefEql(a: PeerRef, b: PeerRef) bool {
     return a.index == b.index and a.generation == b.generation;
