@@ -198,20 +198,29 @@ pub const RequestHandshakeSendEffect = struct {
 
 pub const ResponseHandshakeSendEffect = CompactSendEffect(response_book.HandshakeHandle);
 
+const staged_response_send_effect_size = 1_376;
+const staged_response_handshake_send_effect_size = 1_384;
+// ActorEffect 4_080 is a temporary staged baseline dominated by legacy request handshake.
+// It MUST be updated/replaced by the final <= 1_536 assertion when request handshake is compacted.
+const staged_actor_effect_size = 4_080;
+
 comptime {
+    if (@sizeOf(ActorEffect) != staged_actor_effect_size) {
+        @compileError("ActorEffect must remain at the temporary staged 4080-byte layout");
+    }
     if (@typeInfo(ResponseSendEffect).@"struct".fields.len != 2 or
         !@hasField(ResponseSendEffect, "handle") or
         !@hasField(ResponseSendEffect, "packet") or
-        @sizeOf(ResponseSendEffect) > 1_384)
+        @sizeOf(ResponseSendEffect) != staged_response_send_effect_size)
     {
-        @compileError("response effect must remain handle plus packet bytes within 1384 bytes");
+        @compileError("response effect must remain handle plus packet bytes at the staged 1376-byte layout");
     }
     if (@typeInfo(ResponseHandshakeSendEffect).@"struct".fields.len != 2 or
         !@hasField(ResponseHandshakeSendEffect, "handle") or
         !@hasField(ResponseHandshakeSendEffect, "packet") or
-        @sizeOf(ResponseHandshakeSendEffect) > 1_400)
+        @sizeOf(ResponseHandshakeSendEffect) != staged_response_handshake_send_effect_size)
     {
-        @compileError("response-source handshake effect must remain handle plus packet bytes within 1400 bytes");
+        @compileError("response-source handshake effect must remain handle plus packet bytes at the staged 1384-byte layout");
     }
     for (.{ "admission", "plaintext", "key", "keys", "deadline_ns", "source", "dest_pubkey", "remote_enr" }) |field| {
         if (@hasField(ResponseSendEffect, field) or @hasField(ResponseHandshakeSendEffect, field)) {
@@ -1331,18 +1340,13 @@ fn isLookupBackpressure(err: anyerror) bool {
     };
 }
 
-test "discv5 actor: compact response effect layouts stay packet sized" {
-    try std.testing.expect(@sizeOf(ResponseSendEffect) <= 1_384);
-    try std.testing.expect(@sizeOf(ResponseHandshakeSendEffect) <= 1_400);
+test "discv5 actor: staged effect layouts remain exact" {
+    try std.testing.expectEqual(staged_response_send_effect_size, @sizeOf(ResponseSendEffect));
+    try std.testing.expectEqual(staged_response_handshake_send_effect_size, @sizeOf(ResponseHandshakeSendEffect));
+    // This is temporary and MUST become <= 1_536 when request handshake is compacted.
+    try std.testing.expectEqual(staged_actor_effect_size, @sizeOf(ActorEffect));
     try std.testing.expect(@hasField(RequestHandshakeSendEffect, "source"));
     try std.testing.expect(@hasField(RequestHandshakeSendEffect, "plaintext"));
-    std.debug.print("RESPONSE_EFFECT_LAYOUT response={d} response_handshake={d} request_handshake={d} handshake_union={d} actor_effect={d}\n", .{
-        @sizeOf(ResponseSendEffect),
-        @sizeOf(ResponseHandshakeSendEffect),
-        @sizeOf(RequestHandshakeSendEffect),
-        @sizeOf(HandshakeSendEffect),
-        @sizeOf(ActorEffect),
-    });
 }
 
 test "discv5 actor: local node ID is derived from the configured key pair" {
