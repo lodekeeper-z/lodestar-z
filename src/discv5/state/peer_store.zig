@@ -256,6 +256,13 @@ pub const HealthReservationPolicy = union(enum) {
     allow_eviction_candidate: EvictionTicket,
 };
 
+pub const RetentionFailure = enum {
+    map,
+    enr,
+    probe,
+    pending,
+};
+
 pub const ProbeSnapshot = struct {
     endpoint: types.Endpoint,
     pubkey: [33]u8,
@@ -495,7 +502,7 @@ pub const PeerStore = struct {
         if (pubkey) |expected| if (!std.mem.eql(u8, expected, &key)) return false;
         const advertised = self.addressForEnr(&validated.parsed) orelse return false;
         if (!advertised.eql(&address)) return false;
-        return self.retainValidated(validated, address, true, false, now_ns) != null;
+        return self.retainValidated(validated, address, true, false, now_ns, null) != null;
     }
 
     pub fn learnEnr(self: *PeerStore, raw: []const u8, now_ns: i64) ?types.NodeId {
@@ -505,7 +512,7 @@ pub const PeerStore = struct {
 
     pub fn learnValidatedEnr(self: *PeerStore, validated: *const enr.ValidatedEnr, now_ns: i64) ?types.NodeId {
         const address = self.addressForEnr(&validated.parsed) orelse return null;
-        return self.retainValidated(validated, address, false, false, now_ns);
+        return self.retainValidated(validated, address, false, false, now_ns, null);
     }
 
     pub fn acceptValidatedHandshake(
@@ -521,7 +528,7 @@ pub const PeerStore = struct {
             if (!std.mem.eql(u8, &value.node_id, &node_id) or !std.mem.eql(u8, &validated_key, pubkey))
                 return .{ .transition = .none, .eviction_candidate = null };
             const was_connected = self.routeIsConnected(&node_id) orelse false;
-            const admission = self.retainValidated(value, address, false, true, now_ns) orelse
+            const admission = self.retainValidated(value, address, false, true, now_ns, null) orelse
                 return .{ .transition = .none, .eviction_candidate = null };
             _ = admission;
             var responsive = self.markResponsive(node_id, address, now_ns, null);
@@ -639,7 +646,21 @@ pub const PeerStore = struct {
     }
 
     pub fn fallbackCount(self: *const PeerStore) usize {
-        return self.count() - self.routeCount();
+        return self.count() - self.activeCount() - self.pendingCount();
+    }
+
+    pub fn activeCount(self: *const PeerStore) usize {
+        // admitRoute rejects an already-active ref before pinning, so physical
+        // route entries are the unique active set.
+        return self.routeCount();
+    }
+
+    pub fn pendingCount(self: *const PeerStore) usize {
+        var total: usize = 0;
+        // There is at most one pending ref per bucket and admitRoute checks
+        // active membership first, making the active and pending sets disjoint.
+        for (&self.backing.routing.buckets) |*bucket| total += bucket.has_pending;
+        return total;
     }
 
     pub fn healthRequest(self: *const PeerStore, node_id: *const types.NodeId) ?types.RequestKey {
@@ -799,12 +820,14 @@ pub const PeerStore = struct {
 
         if (findRoute(bucket, ref)) |index| {
             _ = removeRouteAt(bucket, index);
-            setConnected(record, connected);
+            // Admission refresh is monotonic. Only an explicit protocol
+            // disconnect completion may downgrade authenticated liveness.
+            if (connected) setConnected(record, true);
             insertRouteOrdered(self, bucket, .{ .peer = ref, .routing_recency = now_ns });
             return .{ .inserted = true };
         }
         if (bucket.has_pending != 0 and peerRefEql(bucket.pending.newcomer, ref)) {
-            setConnected(record, connected);
+            if (connected) setConnected(record, true);
             return .{ .inserted = true };
         }
         setConnected(record, connected);
@@ -870,7 +893,7 @@ pub const PeerStore = struct {
         const bucket = &self.backing.routing.buckets[distance];
         if (bucket.has_pending != 0 and peerRefEql(bucket.pending.newcomer, ref)) {
             const ticket = self.ticketForBucket(bucket) orelse return false;
-            self.dropPending(bucket, ticket);
+            self.dropPending(bucket, ticket, false);
             return true;
         }
         const index = findRoute(bucket, ref) orelse return false;
@@ -879,16 +902,17 @@ pub const PeerStore = struct {
         if (bucket.has_pending != 0) {
             const ticket = self.ticketForBucket(bucket) orelse unreachable;
             const inserted_at = bucket.pending.inserted_at;
-            self.dropPending(bucket, ticket);
             std.debug.assert(self.pinActive(ticket.candidate));
             insertRouteOrdered(self, bucket, .{ .peer = ticket.candidate, .routing_recency = inserted_at });
+            self.dropPending(bucket, ticket, true);
         }
+        self.releaseEnrIfFallback(ref);
         return true;
     }
 
     pub fn rollbackEviction(self: *PeerStore, ticket: EvictionTicket) bool {
         const bucket = self.bucketForTicket(ticket) orelse return false;
-        self.dropPending(bucket, ticket);
+        self.dropPending(bucket, ticket, false);
         return true;
     }
 
@@ -897,7 +921,7 @@ pub const PeerStore = struct {
         if (!self.probeMatchesCurrentEndpoint(ticket)) return false;
         const incumbent = self.resolveMut(ticket.incumbent) orelse return false;
         setConnected(incumbent, true);
-        self.dropPending(bucket, ticket);
+        self.dropPending(bucket, ticket, false);
         return true;
     }
 
@@ -909,9 +933,10 @@ pub const PeerStore = struct {
         const inserted_at = bucket.pending.inserted_at;
         _ = removeRouteAt(bucket, incumbent_index);
         std.debug.assert(self.unpinActive(ticket.incumbent));
-        self.dropPending(bucket, ticket);
         std.debug.assert(self.pinActive(ticket.candidate));
         insertRouteOrdered(self, bucket, .{ .peer = ticket.candidate, .routing_recency = inserted_at });
+        self.dropPending(bucket, ticket, true);
+        self.releaseEnrIfFallback(ticket.incumbent);
         return ticket.candidate;
     }
 
@@ -983,7 +1008,7 @@ pub const PeerStore = struct {
             .health => |value| value,
             else => return false,
         };
-        if (!requestMatches(request, key)) return false;
+        if (!requestMatches(self, ref, request, key)) return false;
         record.probe_handle = NONE;
         self.releaseProbe(probe);
         return true;
@@ -1050,6 +1075,30 @@ pub const PeerStore = struct {
         return .{};
     }
 
+    pub fn retainValidatedForTest(
+        self: *PeerStore,
+        validated: *const enr.ValidatedEnr,
+        runtime_address: types.Address,
+        trusted: bool,
+        connected: bool,
+        now_ns: i64,
+        failure: RetentionFailure,
+    ) ?types.NodeId {
+        return self.retainValidated(validated, runtime_address, trusted, connected, now_ns, failure);
+    }
+
+    pub fn stateHashForTest(self: *const PeerStore) u64 {
+        var hash = std.hash.XxHash3.init(0x5045455253544f52);
+        hash.update(std.mem.asBytes(self.backing));
+        hash.update(std.mem.asBytes(&self.contact_inserted_total));
+        hash.update(std.mem.asBytes(&self.contact_updated_total));
+        hash.update(std.mem.asBytes(&self.contact_replaced_total));
+        hash.update(std.mem.asBytes(&self.contact_capacity_rejected_total));
+        hash.update(std.mem.asBytes(&self.contact_policy_rejected_total));
+        hash.update(std.mem.asBytes(&self.contact_removed_total));
+        return hash.final();
+    }
+
     fn retainValidated(
         self: *PeerStore,
         validated: *const enr.ValidatedEnr,
@@ -1057,13 +1106,34 @@ pub const PeerStore = struct {
         trusted: bool,
         connected: bool,
         now_ns: i64,
+        failure: ?RetentionFailure,
     ) ?types.NodeId {
         if (std.mem.eql(u8, &validated.node_id, &self.backing.routing.local_id)) return null;
         const key = validated.parsed.pubkey orelse return null;
-        const was_known = self.lookup(&validated.node_id) != null;
-        const ref = self.lookup(&validated.node_id) orelse self.remember(validated.node_id, &key, runtime_address, trusted) catch return null;
+        const existing = self.lookup(&validated.node_id);
+        const was_known = existing != null;
+        if (existing) |ref| {
+            const prior = self.resolve(ref) orelse return null;
+            if (!std.mem.eql(u8, &prior.pubkey, &key)) return null;
+        }
+        if (!was_known and (failure == .map or self.backing.control.free_slot_count == 0)) return null;
+
+        const distance = logDistance(&self.backing.routing.local_id, &validated.node_id) orelse return null;
+        const bucket = &self.backing.routing.buckets[distance];
+        const already_active = if (existing) |ref| findRoute(bucket, ref) != null else false;
+        const already_pending = if (existing) |ref| bucket.has_pending != 0 and peerRefEql(bucket.pending.newcomer, ref) else false;
+        const needs_pending = !already_active and !already_pending and bucket.count == K and connected and
+            bucket.first_connected != 0 and bucket.has_pending == 0;
+        const retains_raw = already_active or already_pending or bucket.count < K or needs_pending;
+        const has_raw = if (existing) |ref| self.resolve(ref).?.enr_index != NONE else false;
+        if (failure == .enr and retains_raw) return null;
+        if (retains_raw and !has_raw and self.backing.control.enr_free_count == 0) return null;
+        if (needs_pending and (failure == .probe or failure == .pending or self.backing.control.probe_free_count == 0)) return null;
+        const becomes_new_fallback = !was_known and !retains_raw;
+        if (becomes_new_fallback and self.fallbackCount() >= self.fallback_capacity and !self.hasEvictableFallback()) return null;
+
+        const ref = existing orelse self.remember(validated.node_id, &key, runtime_address, trusted) catch return null;
         var record = self.resolveMut(ref) orelse return null;
-        if (!std.mem.eql(u8, &record.pubkey, &key)) return null;
         if (record.enr_index != NONE and record.enr_seq >= validated.parsed.seq) {
             if (trusted) {
                 if (validated.parsed.udpAddress4()) |value| _ = self.setAdvertisedEvidence(ref, value, true);
@@ -1074,14 +1144,16 @@ pub const PeerStore = struct {
             }
             return validated.node_id;
         }
-        if (!(record.flags & FLAG_TRUSTED != 0 and !trusted and !record.address().eql(&runtime_address))) {
+        const may_migrate_runtime = !was_known or trusted or connected;
+        if (may_migrate_runtime) {
             record.runtime = .init(runtime_address);
         }
         if (trusted) record.flags |= FLAG_TRUSTED;
-        record.last_seen = now_ns;
-        if (connected) setConnected(record, true);
-        if (validated.parsed.udpAddress4()) |value| _ = self.setAdvertisedEvidence(ref, value, trusted);
-        if (validated.parsed.udpAddress6()) |value| _ = self.setAdvertisedEvidence(ref, value, trusted);
+        if (connected) {
+            record.last_seen = now_ns;
+            setConnected(record, true);
+        }
+        self.replaceAdvertisedEvidence(ref, &validated.parsed, trusted);
         const admission = self.admitRoute(ref, connected, now_ns) catch return null;
         if (!self.routeContains(ref) and self.fallbackCount() > self.fallback_capacity) {
             if (!self.evictUntrustedFallback(ref)) {
@@ -1102,8 +1174,28 @@ pub const PeerStore = struct {
         };
         record = self.resolveMut(ref) orelse return null;
         record.flags &= ~FLAG_RELAYABLE;
-        if (trusted or (connected and self.advertisesAddress(ref, runtime_address))) record.flags |= FLAG_RELAYABLE;
+        if (self.hasAdvertisedProof(ref)) record.flags |= FLAG_RELAYABLE;
         return validated.node_id;
+    }
+
+    fn replaceAdvertisedEvidence(self: *PeerStore, ref: PeerRef, parsed: *const enr.Enr, trusted: bool) void {
+        const previous = self.advertisedEvidence(ref) orelse return;
+        self.backing.evidence[ref.index] = std.mem.zeroes(EndpointEvidence);
+        if (parsed.udpAddress4()) |value| {
+            const preserve = previous.ip4.flags & 2 != 0 and previous.ip4.address().eql(&value);
+            _ = self.setAdvertisedEvidence(ref, value, trusted or preserve);
+        }
+        if (parsed.udpAddress6()) |value| {
+            const preserve = previous.ip6.flags & 2 != 0 and previous.ip6.address().eql(&value);
+            _ = self.setAdvertisedEvidence(ref, value, trusted or preserve);
+        }
+    }
+
+    fn hasAdvertisedProof(self: *const PeerStore, ref: PeerRef) bool {
+        const record = self.resolve(ref) orelse return false;
+        const evidence = self.advertisedEvidence(ref) orelse return false;
+        if (evidence.ip4.flags & 2 != 0 or evidence.ip6.flags & 2 != 0) return true;
+        return record.flags & FLAG_CONNECTED != 0 and self.advertisesAddress(ref, record.address());
     }
 
     fn evictUntrustedFallback(self: *PeerStore, protected: ?PeerRef) bool {
@@ -1116,6 +1208,16 @@ pub const PeerStore = struct {
             if (!self.remove(ref)) continue;
             self.contact_replaced_total +|= 1;
             return true;
+        }
+        return false;
+    }
+
+    fn hasEvictableFallback(self: *const PeerStore) bool {
+        for (0..PEER_CAPACITY) |index| {
+            const record = &self.backing.records[index];
+            if (!record.occupied() or record.flags & FLAG_TRUSTED != 0 or record.probe_handle != NONE) continue;
+            const ref = PeerRef{ .index = @intCast(index), .generation = self.backing.slot_generations[index] };
+            if (!self.routeContains(ref) and !self.pendingContains(ref)) return true;
         }
         return false;
     }
@@ -1168,8 +1270,8 @@ pub const PeerStore = struct {
         const index = record.probe_handle;
         const probe = ProbeRef{ .index = index, .generation = self.backing.probe_generations[index] };
         const matches = switch (self.backing.probes[index]) {
-            .health => |request| requestMatches(request, key),
-            .eviction => |value| requestMatches(value.request, key),
+            .health => |request| requestMatches(self, ref, request, key),
+            .eviction => |value| requestMatches(self, ref, value.request, key),
             .none => false,
         };
         if (!matches) return false;
@@ -1195,7 +1297,7 @@ pub const PeerStore = struct {
             .eviction => |value| value,
             else => return false,
         };
-        return requestMatches(probe.request, key);
+        return requestMatches(self, ticket.incumbent, probe.request, key);
     }
 
     fn bucketForTicketConst(self: *const PeerStore, ticket: EvictionTicket) ?*const CompactBucket {
@@ -1232,13 +1334,24 @@ pub const PeerStore = struct {
         return bucket;
     }
 
-    fn dropPending(self: *PeerStore, bucket: *CompactBucket, ticket: EvictionTicket) void {
+    fn dropPending(self: *PeerStore, bucket: *CompactBucket, ticket: EvictionTicket, promoted: bool) void {
         bucket.has_pending = 0;
         if (self.resolveMut(ticket.incumbent)) |incumbent| {
             if (incumbent.probe_handle == ticket.probe.index) incumbent.probe_handle = NONE;
         }
         std.debug.assert(self.unpinPending(ticket.candidate));
         self.releaseProbe(ticket.probe);
+        if (!promoted) self.releaseEnrIfFallback(ticket.candidate);
+    }
+
+    fn releaseEnrIfFallback(self: *PeerStore, ref: PeerRef) void {
+        if (self.routeContains(ref) or self.pendingContains(ref)) return;
+        const record = self.resolveMut(ref) orelse return;
+        if (record.enr_index == NONE) return;
+        const index = record.enr_index;
+        record.enr_index = NONE;
+        record.enr_seq = 0;
+        self.releaseEnr(index);
     }
 
     fn probeMatchesCurrentEndpoint(self: *const PeerStore, ticket: EvictionTicket) bool {
@@ -1294,6 +1407,14 @@ pub const PeerStore = struct {
             self.backing.map.count += 1;
             return;
         }
+        if (first_tombstone) |destination| {
+            self.backing.map.tombstones -= 1;
+            self.backing.map.controls[destination] = 1;
+            self.backing.map.keys[destination] = node_id;
+            self.backing.map.refs[destination] = ref;
+            self.backing.map.count += 1;
+            return;
+        }
         return error.MapCapacityExceeded;
     }
 
@@ -1343,13 +1464,15 @@ fn compactRequest(ref: PeerRef, key: types.RequestKey) CompactRequest {
     };
 }
 
-fn requestMatches(request: CompactRequest, key: types.RequestKey) bool {
-    return peerRefEndpointMatches(request, key.endpoint) and request.req_len == key.req_id.len and
+fn requestMatches(store: *const PeerStore, current: PeerRef, request: CompactRequest, key: types.RequestKey) bool {
+    return peerRefEndpointMatches(store, current, request, key.endpoint) and request.req_len == key.req_id.len and
         std.mem.eql(u8, request.req_id[0..request.req_len], key.req_id.bytes[0..key.req_id.len]);
 }
 
-fn peerRefEndpointMatches(request: CompactRequest, endpoint: types.Endpoint) bool {
-    return compactEndpointEql(request.endpoint, .init(endpoint.addr));
+fn peerRefEndpointMatches(store: *const PeerStore, current: PeerRef, request: CompactRequest, endpoint: types.Endpoint) bool {
+    const resolved = store.lookup(&endpoint.node_id) orelse return false;
+    return peerRefEql(resolved, current) and peerRefEql(request.peer, current) and
+        compactEndpointEql(request.endpoint, .init(endpoint.addr));
 }
 
 fn requestKeyFromCompact(node_id: types.NodeId, request: CompactRequest) types.RequestKey {
@@ -1444,6 +1567,24 @@ pub fn xorDistance(a: *const types.NodeId, b: *const types.NodeId) types.NodeId 
 
 fn mapHash(node_id: *const types.NodeId) usize {
     return @intCast(std.hash.Wyhash.hash(0, node_id) & (MAP_CAPACITY - 1));
+}
+
+test "request matcher rejects stale stored PeerRef after exact identity endpoint and request reuse" {
+    var store = try PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    const node_id = [_]u8{0x71} ** 32;
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 12_300 } };
+    const key = types.RequestKey{
+        .endpoint = .{ .node_id = node_id, .addr = address },
+        .req_id = .{ .bytes = .{1} ++ ([_]u8{0} ** 7), .len = 1 },
+    };
+    const stale = try store.remember(node_id, &([_]u8{0x72} ** 33), address, false);
+    const stale_request = compactRequest(stale, key);
+    try std.testing.expect(store.remove(stale));
+    const current = try store.remember(node_id, &([_]u8{0x72} ** 33), address, false);
+    try std.testing.expectEqual(stale.index, current.index);
+    try std.testing.expect(stale.generation != current.generation);
+    try std.testing.expect(!requestMatches(&store, current, stale_request, key));
 }
 
 comptime {

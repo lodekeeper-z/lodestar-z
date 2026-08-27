@@ -468,6 +468,180 @@ test "PeerStore fallback-only learned ENR retains contact facts without raw ENR 
     try std.testing.expect(store.knownEnrSeq(&node_id) == null);
 }
 
+test "newer discovered ENR preserves authenticated runtime and initializes unknown provisional contact" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x53} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const addr_a = address(11_600);
+    const addr_b = address(11_601);
+    const raw_a = try encodeEnr(alloc, key_pair, 1, addr_a);
+    defer alloc.free(raw_a);
+    const raw_b = try encodeEnr(alloc, key_pair, 2, addr_b);
+    defer alloc.free(raw_b);
+    var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+
+    try std.testing.expect(store.addTrusted(node_id, &pubkey, addr_a, raw_a, 10));
+    _ = store.markResponsive(node_id, addr_a, 20, null);
+    try std.testing.expect(store.setNextPing(&node_id, 777));
+    try std.testing.expect(store.learnEnr(raw_b, 30) != null);
+    const retained = store.activeRoute(&node_id).?;
+    try std.testing.expect(retained.connected);
+    try std.testing.expect(retained.addr.eql(&addr_a));
+    try std.testing.expectEqual(@as(i64, 777), retained.next_ping_at_ns);
+    try std.testing.expectEqual(@as(i64, 20), store.resolve(store.lookup(&node_id).?).?.last_seen);
+    try std.testing.expectEqualSlices(u8, raw_b, store.findEnr(&node_id).?);
+    try std.testing.expect(store.advertisedEvidence(store.lookup(&node_id).?).?.ip4.address().eql(&addr_b));
+
+    const unknown_pair = try secp.keyPairFromSecret(&([_]u8{0x54} ** 32));
+    const unknown_pubkey = secp.compressedPubkey(&unknown_pair);
+    const unknown_id = try enr.nodeIdFromCompressedPubkey(&unknown_pubkey);
+    const unknown_addr = address(11_602);
+    const unknown_raw = try encodeEnr(alloc, unknown_pair, 1, unknown_addr);
+    defer alloc.free(unknown_raw);
+    try std.testing.expect(store.learnEnr(unknown_raw, 40) != null);
+    const unknown = store.activeRoute(&unknown_id).?;
+    try std.testing.expect(!unknown.connected);
+    try std.testing.expect(unknown.addr.eql(&unknown_addr));
+}
+
+test "newer ENR exactly replaces advertised families and preserves proof only for unchanged endpoint" {
+    const alloc = std.testing.allocator;
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x55} ** 32));
+    const pubkey = secp.compressedPubkey(&key_pair);
+    const node_id = try enr.nodeIdFromCompressedPubkey(&pubkey);
+    const v4 = address(11_700);
+    const v6: types.Address = .{ .ip6 = .{ .bytes = [_]u8{0x66} ** 16, .port = 11_701 } };
+    const raw_dual = try encodeDualEnr(alloc, key_pair, 1, v4, v6);
+    defer alloc.free(raw_dual);
+    const raw_v4 = try encodeEnr(alloc, key_pair, 2, v4);
+    defer alloc.free(raw_v4);
+    var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, true);
+    defer store.deinit();
+
+    try std.testing.expect(store.addTrusted(node_id, &pubkey, v4, raw_dual, 1));
+    try std.testing.expect(store.learnEnr(raw_v4, 2) != null);
+    const evidence = store.advertisedEvidence(store.lookup(&node_id).?).?;
+    try std.testing.expect(evidence.ip4.flags & 1 != 0);
+    try std.testing.expect(evidence.ip4.flags & 2 != 0);
+    try std.testing.expect(evidence.ip4.address().eql(&v4));
+    try std.testing.expectEqual(@as(u8, 0), evidence.ip6.flags);
+    try std.testing.expect(store.routeIsRelayable(&node_id));
+
+    const untrusted_pair = try secp.keyPairFromSecret(&([_]u8{0x56} ** 32));
+    const untrusted_pubkey = secp.compressedPubkey(&untrusted_pair);
+    const untrusted_id = try enr.nodeIdFromCompressedPubkey(&untrusted_pubkey);
+    const untrusted_dual = try encodeDualEnr(alloc, untrusted_pair, 1, address(11_702), v6);
+    defer alloc.free(untrusted_dual);
+    const untrusted_v4 = try encodeEnr(alloc, untrusted_pair, 2, address(11_702));
+    defer alloc.free(untrusted_v4);
+    try std.testing.expect(store.learnEnr(untrusted_dual, 3) != null);
+    _ = store.markResponsive(untrusted_id, v6, 4, null);
+    try std.testing.expect(store.routeIsRelayable(&untrusted_id));
+    try std.testing.expect(store.learnEnr(untrusted_v4, 5) != null);
+    try std.testing.expect(!store.routeIsRelayable(&untrusted_id));
+    _ = store.markResponsive(untrusted_id, v6, 6, null);
+    try std.testing.expect(!store.routeIsRelayable(&untrusted_id));
+}
+
+test "route demotion releases ENR ownership and repeated churn conserves slab capacity" {
+    var store = try peer_store.PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    const node_id = bucketNode(170);
+    const ref = try store.remember(node_id, &([_]u8{0x61} ** 33), address(11_800), false);
+    const raw = [_]u8{ 0xc1, 0x80 };
+    for (0..peer_store.ENR_CAPACITY + 17) |iteration| {
+        try store.putEnr(ref, &raw, iteration + 1);
+        try std.testing.expect((try store.admitRoute(ref, false, @intCast(iteration))).inserted);
+        try std.testing.expect(store.findEnr(&node_id) != null);
+        try std.testing.expect(store.removeRoute(ref));
+        try std.testing.expect(store.findEnr(&node_id) == null);
+    }
+}
+
+test "active pending and fallback counts are disjoint and pending does not evict fallback" {
+    var store = try peer_store.PeerStore.initWithFallbackCapacity(std.testing.allocator, [_]u8{0} ** 32, true, false, 1);
+    defer store.deinit();
+    for (0..peer_store.K) |index| {
+        const ref = try store.remember(bucketNode(index), &([_]u8{0x62} ** 33), address(@intCast(12_000 + index)), false);
+        try std.testing.expect((try store.admitRoute(ref, false, @intCast(index))).inserted);
+    }
+    const fallback_id = [_]u8{0x31} ** 32;
+    store.rememberContact(fallback_id, &([_]u8{0x63} ** 33), address(12_100), false);
+    const pending = try store.remember(bucketNode(peer_store.K), &([_]u8{0x64} ** 33), address(12_101), false);
+    try std.testing.expect((try store.admitRoute(pending, true, 100)).eviction != null);
+    try std.testing.expectEqual(@as(usize, peer_store.K), store.activeCount());
+    try std.testing.expectEqual(@as(usize, 1), store.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), store.fallbackCount());
+    try std.testing.expectEqual(@as(usize, 1), store.contactMetricsSnapshot().count);
+    try std.testing.expect(store.known(&fallback_id) != null);
+}
+
+test "map tombstone churn remains insertable after a full bounded probe" {
+    var store = try peer_store.PeerStore.init(std.testing.allocator, [_]u8{0} ** 32, true, false);
+    defer store.deinit();
+    const key = [_]u8{0x65} ** 33;
+    for (0..100_001) |iteration| {
+        var node_id = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, node_id[24..32], iteration + 1, .big);
+        const ref = try store.remember(node_id, &key, address(12_200), false);
+        try std.testing.expect(store.remove(ref));
+    }
+    try std.testing.expectEqual(@as(usize, 0), store.count());
+}
+
+test "retainValidated capacity failures preserve exact canonical state" {
+    const alloc = std.testing.allocator;
+    const candidate_pair = try secp.keyPairFromSecret(&([_]u8{0x73} ** 32));
+    const candidate_pubkey = secp.compressedPubkey(&candidate_pair);
+    const candidate_id = try enr.nodeIdFromCompressedPubkey(&candidate_pubkey);
+    const candidate_addr = address(12_400);
+    const candidate_raw = try encodeEnr(alloc, candidate_pair, 1, candidate_addr);
+    defer alloc.free(candidate_raw);
+    const candidate = try enr.ValidatedEnr.init(candidate_raw);
+
+    for ([_]peer_store.RetentionFailure{ .map, .enr }) |failure| {
+        var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+        defer store.deinit();
+        const before = store.stateHashForTest();
+        try std.testing.expect(store.retainValidatedForTest(&candidate, candidate_addr, false, false, 10, failure) == null);
+        try std.testing.expectEqual(before, store.stateHashForTest());
+        try std.testing.expect(store.lookup(&candidate_id) == null);
+    }
+
+    const newer_addr = address(12_401);
+    const newer_raw = try encodeEnr(alloc, candidate_pair, 2, newer_addr);
+    defer alloc.free(newer_raw);
+    const newer = try enr.ValidatedEnr.init(newer_raw);
+    var established = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+    defer established.deinit();
+    try std.testing.expect(established.addTrusted(candidate_id, &candidate_pubkey, candidate_addr, candidate_raw, 1));
+    _ = established.markResponsive(candidate_id, candidate_addr, 2, null);
+    const established_before = established.stateHashForTest();
+    try std.testing.expect(established.retainValidatedForTest(&newer, newer_addr, false, false, 3, .enr) == null);
+    try std.testing.expectEqual(established_before, established.stateHashForTest());
+    try std.testing.expectEqualSlices(u8, candidate_raw, established.findEnr(&candidate_id).?);
+
+    for ([_]peer_store.RetentionFailure{ .probe, .pending }) |failure| {
+        var store = try peer_store.PeerStore.init(alloc, [_]u8{0} ** 32, true, false);
+        defer store.deinit();
+        const distance = peer_store.logDistance(&([_]u8{0} ** 32), &candidate_id).?;
+        for (0..peer_store.K) |index| {
+            var sibling = candidate_id;
+            sibling[31] +%= @intCast(index + 1);
+            if (peer_store.logDistance(&([_]u8{0} ** 32), &sibling).? != distance) sibling[30] +%= @intCast(index + 1);
+            const ref = try store.remember(sibling, &([_]u8{0x74} ** 33), address(@intCast(12_500 + index)), false);
+            try std.testing.expect((try store.admitRoute(ref, false, @intCast(index))).inserted);
+        }
+        const before = store.stateHashForTest();
+        try std.testing.expect(store.retainValidatedForTest(&candidate, candidate_addr, false, true, 20, failure) == null);
+        try std.testing.expectEqual(before, store.stateHashForTest());
+        try std.testing.expect(store.lookup(&candidate_id) == null);
+        try std.testing.expectEqual(@as(usize, 0), store.pendingCount());
+    }
+}
+
 fn encodeEnr(alloc: std.mem.Allocator, key_pair: secp.KeyPair, seq: u64, addr: types.Address) ![]u8 {
     var builder = enr.Builder.init(alloc, key_pair, seq);
     switch (addr) {
@@ -480,5 +654,14 @@ fn encodeEnr(alloc: std.mem.Allocator, key_pair: secp.KeyPair, seq: u64, addr: t
             builder.udp6 = value.port;
         },
     }
+    return builder.encode();
+}
+
+fn encodeDualEnr(alloc: std.mem.Allocator, key_pair: secp.KeyPair, seq: u64, v4: types.Address, v6: types.Address) ![]u8 {
+    var builder = enr.Builder.init(alloc, key_pair, seq);
+    builder.ip = v4.ip4.bytes;
+    builder.udp = v4.ip4.port;
+    builder.ip6 = v6.ip6.bytes;
+    builder.udp6 = v6.ip6.port;
     return builder.encode();
 }
