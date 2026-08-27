@@ -35,7 +35,20 @@ pub const LocalRecord = struct {
     seq: u64,
 };
 /// Ephemeral runtime capabilities; Actor never stores this context.
-pub const Env = struct {
+pub const Env = if (builtin.is_test) struct {
+    io: std.Io,
+    ingress: *admission.IngressAdmission,
+    outbox: *events.EventOutbox,
+    effects: ?*EffectQueue = null,
+    lookup_results: ?*lookup_results.LookupResultOutbox = null,
+    request_results: ?*request_results.RequestResultOutbox = null,
+    expected_credit: ?*admission.ExpectedCredit = null,
+    retry_nonce: ?[packet.NONCE_SIZE]u8 = null,
+
+    pub fn commitExpected(self: Env) void {
+        if (self.expected_credit) |credit| credit.commit(self.ingress);
+    }
+} else struct {
     io: std.Io,
     ingress: *admission.IngressAdmission,
     outbox: *events.EventOutbox,

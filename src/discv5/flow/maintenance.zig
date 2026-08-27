@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const actor_mod = @import("../actor.zig");
 const config = @import("../config.zig");
 const outbound = @import("outbound.zig");
@@ -90,12 +91,12 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
             const stable = if (pending_write_key == null) actor.sessions.get(key.endpoint, now_ns) else null;
             const awaiting_whoareyou = pending_write_key == null and stable == null;
             const encoded = if (pending_write_key) |write_key|
-                outbound.encodeMessage(actor, env.io, &buffer, key.endpoint.node_id, &write_key, response.recovery.plaintext.slice()) catch {
+                encodeRetryMessage(actor, env, &buffer, key.endpoint.node_id, &write_key, response.recovery.plaintext.slice()) catch {
                     _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                     return;
                 }
             else if (stable) |session|
-                outbound.encodeMessage(actor, env.io, &buffer, key.endpoint.node_id, &session.initiator_key, response.recovery.plaintext.slice()) catch {
+                encodeRetryMessage(actor, env, &buffer, key.endpoint.node_id, &session.initiator_key, response.recovery.plaintext.slice()) catch {
                     _ = actor.requests.failRetryPreparation(retry.handle, deadline_ns);
                     return;
                 }
@@ -154,6 +155,22 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
             };
         },
     }
+}
+
+fn encodeRetryMessage(
+    actor: *Actor,
+    env: Env,
+    out: []u8,
+    node_id: types.NodeId,
+    write_key: *const [16]u8,
+    plaintext: []const u8,
+) !outbound.Encoded {
+    if (builtin.is_test) {
+        if (env.retry_nonce) |nonce| {
+            return outbound.Testing.encodeMessageWithNonceForRetry(actor, env.io, out, node_id, write_key, plaintext, nonce);
+        }
+    }
+    return outbound.encodeMessage(actor, env.io, out, node_id, write_key, plaintext);
 }
 
 fn timeout(actor: *Actor, env: Env, key: types.RequestKey) void {

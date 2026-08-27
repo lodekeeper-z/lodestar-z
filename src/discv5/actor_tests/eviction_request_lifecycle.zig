@@ -11,6 +11,7 @@ const metrics = @import("../metrics.zig");
 const secp = @import("../secp256k1.zig");
 const peer_store = @import("../state/peer_store.zig");
 const request_book = @import("../state/request_book.zig");
+const request_results = @import("../request_results.zig");
 const response_book = @import("../state/response_book.zig");
 const session_book = @import("../state/session_book.zig");
 const types = @import("../types.zig");
@@ -889,15 +890,13 @@ test "fresh retry generation exhaustion preflights before actor side effects" {
         .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
         .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 73 }, .port = 9073 } },
     };
-    const sentinel_endpoint = types.Endpoint{
-        .node_id = [_]u8{0xb5} ** 32,
-        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 74 }, .port = 9074 } },
-    };
+    const retry_nonce = [_]u8{0xb5} ** packet.NONCE_SIZE;
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
         .request_timeout_ms = 1,
         .request_retries = 1,
+        .response_recovery_timeout_ms = 1,
         .rate_limiter = null,
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
     };
@@ -908,10 +907,26 @@ test "fresh retry generation exhaustion preflights before actor side effects" {
     const handle = try actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
     const deadline = actor.requests.get(handle.key).?.deadline_ns;
-    response_book.ResponseBook.Testing.putCandidate(&actor.responses, sentinel_endpoint, .{
-        .initiator_key = [_]u8{9} ** 16,
-        .recipient_key = [_]u8{10} ** 16,
-    }, deadline);
+    const blocker_endpoint = types.Endpoint{
+        .node_id = [_]u8{0xb6} ** 32,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 74 }, .port = 9074 } },
+    };
+    var blocker_permit = try harness.ingress.acquire(blocker_endpoint.addr, admission.RESPONSE_RECOVERY_PACKET_BUDGET);
+    errdefer blocker_permit.release(&harness.ingress);
+    const blocker_handle = try actor.responses.beginResponse(.{
+        .endpoint = blocker_endpoint,
+        .nonce = [_]u8{0xb6} ** packet.NONCE_SIZE,
+        .dest_pubkey = [_]u8{0xb6} ** 33,
+        .plaintext = try .init(&.{0xb6}),
+    }, &blocker_permit, deadline);
+    var matching_permit = try harness.ingress.acquire(endpoint.addr, admission.RESPONSE_RECOVERY_PACKET_BUDGET);
+    errdefer matching_permit.release(&harness.ingress);
+    const matching_handle = try actor.responses.beginResponse(.{
+        .endpoint = endpoint,
+        .nonce = retry_nonce,
+        .dest_pubkey = remote_pubkey,
+        .plaintext = try .init(&.{0xb5}),
+    }, &matching_permit, deadline - std.time.ns_per_ms);
     request_book.Testing.exhaustRetryGeneration(&actor.requests);
 
     const before = actor.requests.get(handle.key).?.*;
@@ -921,12 +936,16 @@ test "fresh retry generation exhaustion preflights before actor side effects" {
     const actor_metrics = actor.metrics;
     const effect_count = harness.effects.count();
 
-    actor.maintenanceAt(harness.env(), deadline);
+    var env = harness.env();
+    env.retry_nonce = retry_nonce;
+    actor.maintenanceAt(env, deadline);
 
     const after = actor.requests.get(handle.key) orelse return error.MissingActiveRequest;
     try std.testing.expect(std.meta.eql(before, after.*));
     try std.testing.expectEqual(response_count, actor.responses.count());
-    try std.testing.expect(response_book.ResponseBook.Testing.hasCandidate(&actor.responses, sentinel_endpoint));
+    try std.testing.expect(response_book.ResponseBook.Testing.hasPhase(&actor.responses, matching_handle));
+    try std.testing.expect(response_book.ResponseBook.Testing.hasPhase(&actor.responses, blocker_handle));
+    try std.testing.expectEqual(@as(usize, 2), actor.responses.phaseCount());
     try std.testing.expectEqual(permit_count, harness.ingress.permitCount());
     try std.testing.expectEqual(permit_fingerprint, admission.IngressAdmission.Testing.permitGenerationFingerprint(&harness.ingress));
     try std.testing.expect(std.meta.eql(actor_metrics, actor.metrics));
@@ -1058,30 +1077,44 @@ test "exact cancellation of prepared fresh retry releases both permits and inval
     };
     var harness = try ActorHarness.init(alloc, io, cfg);
     defer harness.deinit();
+    var result_outbox = try request_results.RequestResultOutbox.init(io, alloc, 1);
+    defer result_outbox.deinit();
+    try std.testing.expect(result_outbox.reserve());
+    try std.testing.expect(result_outbox.claim());
+    var env = harness.env();
+    env.request_results = &result_outbox;
     const actor = &harness.actor;
     actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{5} ** 16, .recipient_key = [_]u8{6} ** 16 }, outbound.nowNs(io));
-    const request = try actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .api);
+    const request = try actor_mod.Testing.sendPingResolvedForTest(&actor, env, endpoint, &remote_pubkey, .reliable_api);
     try harness.drainEffects();
     const nonce = actor.requests.get(request.key).?.phase.awaiting_response.recovery.nonce;
-    actor.maintenanceAt(harness.env(), actor.requests.get(request.key).?.deadline_ns);
+    actor.maintenanceAt(env, actor.requests.get(request.key).?.deadline_ns);
     const retry = harness.effects.pop() orelse return error.MissingRetryEffect;
     const copied = retry;
     const sent_before = actor.metrics.sent_message_count[metrics.MessageType.ping.index()];
     try std.testing.expect(actor.requests.hasChallenge(&nonce, endpoint.addr));
     try std.testing.expectEqual(@as(usize, 2), harness.ingress.permitCount());
 
-    try std.testing.expect(actor.cancelRequest(harness.env(), request));
-    try std.testing.expect(!actor.cancelRequest(harness.env(), request));
+    try std.testing.expect(actor.cancelRequest(env, request));
+    try std.testing.expect(!actor.cancelRequest(env, request));
     try std.testing.expect(actor.requests.get(request.key) == null);
     try std.testing.expect(!actor.requests.hasChallenge(&nonce, endpoint.addr));
     try std.testing.expect(actor.requests.lanes.get(endpoint) == null);
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
-    try std.testing.expect(harness.outbox.pop() == null);
+    const canceled = result_outbox.pop() orelse return error.MissingCanceledResult;
+    try std.testing.expectEqual(request.generation, canceled.handle.generation);
+    try std.testing.expectEqualSlices(u8, &request.key.endpoint.node_id, &canceled.handle.node_id);
+    try std.testing.expect(request.key.endpoint.addr.eql(&canceled.handle.address));
+    try std.testing.expectEqualSlices(u8, request.key.req_id.slice(), canceled.handle.request_id.slice());
+    try std.testing.expectEqual(types.RequestKind.ping, canceled.kind);
+    try std.testing.expectEqual(request_results.RequestTerminal.canceled, canceled.terminal);
+    try std.testing.expect(result_outbox.pop() == null);
 
-    actor.applyEffectCompletion(harness.env(), copied, .sent);
+    actor.applyEffectCompletion(env, copied, .sent);
     try std.testing.expect(actor.requests.get(request.key) == null);
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     try std.testing.expectEqual(sent_before, actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
+    try std.testing.expect(result_outbox.pop() == null);
     try std.testing.expect(harness.outbox.pop() == null);
 }
 

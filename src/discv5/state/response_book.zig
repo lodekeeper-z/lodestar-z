@@ -362,6 +362,11 @@ pub const ResponseBook = struct {
         pub fn hasCandidate(self: *const ResponseBook, endpoint: types.Endpoint) bool {
             return self.candidates.contains(endpoint);
         }
+
+        pub fn hasPhase(self: *const ResponseBook, handle: ResponseHandle) bool {
+            const current = self.phases.peekPtrRaw(handleKey(handle)) orelse return false;
+            return sameHandle(current.handle, handle);
+        }
     } else struct {};
 };
 

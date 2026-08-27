@@ -178,6 +178,18 @@ pub fn encodeMessage(
 ) !Encoded {
     var nonce: [packet.NONCE_SIZE]u8 = undefined;
     io.random(&nonce);
+    return encodeMessageWithNonce(actor, io, out, node_id, write_key, plaintext, nonce);
+}
+
+fn encodeMessageWithNonce(
+    actor: *Actor,
+    io: std.Io,
+    out: []u8,
+    node_id: types.NodeId,
+    write_key: *const [16]u8,
+    plaintext: []const u8,
+    nonce: [packet.NONCE_SIZE]u8,
+) !Encoded {
     var masking_iv: [packet.MASKING_IV_SIZE]u8 = undefined;
     io.random(&masking_iv);
     const encoded = try packet.encodeMessagePacketInto(out, .{
@@ -191,6 +203,20 @@ pub fn encodeMessage(
     });
     return .{ .bytes = encoded, .nonce = nonce };
 }
+
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn encodeMessageWithNonceForRetry(
+        actor: *Actor,
+        io: std.Io,
+        out: []u8,
+        node_id: types.NodeId,
+        write_key: *const [16]u8,
+        plaintext: []const u8,
+        nonce: [packet.NONCE_SIZE]u8,
+    ) !Encoded {
+        return encodeMessageWithNonce(actor, io, out, node_id, write_key, plaintext, nonce);
+    }
+} else struct {};
 
 pub fn noteSent(actor: *Actor, plaintext: []const u8) void {
     if (plaintext.len == 0) return;
