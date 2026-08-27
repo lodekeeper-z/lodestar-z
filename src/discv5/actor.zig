@@ -54,8 +54,9 @@ pub const Env = if (builtin.is_test) struct {
         run: *const fn (*anyopaque, *Actor, request_book.PendingKeysView) void,
     } = null,
 
-    pub fn commitExpected(self: Env) void {
-        if (self.expected_credit) |credit| credit.commit(self.ingress);
+    pub fn commitExpected(self: Env, target: admission.PermitHandle) bool {
+        const credit = self.expected_credit orelse return true;
+        return credit.commit(self.ingress, target);
     }
 } else struct {
     io: std.Io,
@@ -66,8 +67,9 @@ pub const Env = if (builtin.is_test) struct {
     request_results: ?*request_results.RequestResultOutbox = null,
     expected_credit: ?*admission.ExpectedCredit = null,
 
-    pub fn commitExpected(self: Env) void {
-        if (self.expected_credit) |credit| credit.commit(self.ingress);
+    pub fn commitExpected(self: Env, target: admission.PermitHandle) bool {
+        const credit = self.expected_credit orelse return true;
+        return credit.commit(self.ingress, target);
     }
 };
 
@@ -254,6 +256,10 @@ pub const EffectQueue = struct {
 
     pub fn count(self: *const EffectQueue) usize {
         return self.len;
+    }
+
+    pub fn hasCapacity(self: *const EffectQueue) bool {
+        return self.len < self.storage.len;
     }
 
     pub fn push(self: *EffectQueue, effect: ActorEffect) error{Full}!void {

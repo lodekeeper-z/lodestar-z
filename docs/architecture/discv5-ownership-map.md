@@ -118,7 +118,7 @@ Runtime delivers command | packet | maintenance | completion
 | Ordered Actor effect queues | request-only | 1 queue for every datagram effect |
 | Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
 | Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
-| DiscV5 tests after migration | 307 | 418 after request/response/retry/challenge ledger canonicalization, compact in-place handshake rollback, and runtime/auth race tracers |
+| DiscV5 tests after migration | 307 | 428 after request/response/retry/challenge ledger canonicalization, exact admission correlation, compact in-place handshake rollback, and runtime/auth race tracers |
 | Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 1,400 bytes; every variant is packet plus semantic handle, including unified handshake at 1,392 bytes, WHOAREYOU at 1,360 bytes, and retry at 1,384 bytes. The project-wide final `<= 1,536` ceiling is intentionally not yet promoted from the staged exact lock. |
 
 ### Canonical completion ownership
@@ -147,6 +147,18 @@ Runtime delivers command | packet | maintenance | completion
 - Runtime execution is deliberately synchronous in the actor-loop task, but copied, stale, delayed, or reordered completions remain harmless because each migrated family uses its canonical semantic handle: request key plus request generation, retry request generation plus retry-send generation, response endpoint plus nonce plus response generation and handshake send generation, or challenge endpoint plus challenge generation. Generations are checked, never wrapped, and exhausted rather than reused.
 - Cancellation during send maps to `runtime_stopped`; ordinary transport failure maps to `failed`; all remaining queued values are synthesized as `runtime_stopped` during terminalization. Runtime then sweeps residual canonical response and challenge phases, making copied post-shutdown completions no-ops.
 
+### Exact ingress-admission authority
+
+Ingress bypass is no longer an IP-level boolean or a count-only promise. Every request, response recovery, and live challenge owns one immutable `PermitHandle` consisting of a slot and non-wrapping permit generation. A permit has at most 17 packet credits, matching both `1 + MAX_NODES_RESPONSE` and `MAX_REQUEST_RETRIES + 1`. Each admitted packet receives one exact `ExpectedCredit` containing its source permit generation and a non-wrapping receipt generation from one of 17 fixed lanes.
+
+An authenticated packet commits only against the canonical owner captured from its correlation source: active request for PONG/NODES/TALKRESP, request challenge preparation, response recovery, or live session challenge. A same-IP receipt may be reassigned to that exact owner under the admission lock. Reassignment consumes the target allowance and restores the live source allowance; a released source is never resurrected. Wrong-IP, stale, released, exhausted, or replaced targets leave the receipt armed and the ledger unchanged so Runtime's unconditional rollback remains authoritative.
+
+Pending request and response candidate generations are revalidated after decrypt/decode and test replacement hooks, before exact credit commit. HANDSHAKE revalidates the captured challenge after signature, decrypt, and decode, then commits before challenge removal, session/peer mutation, event publication, or RPC dispatch. Request- and response-source WHOAREYOU similarly commit after exact source preflight and before recovery transfer or cryptographic work.
+
+Receipts and permits may be copied by bounded Runtime queues and cancellation paths. Local `armed` state prevents ordinary double use, while canonical generation/lane checks make stale copies harmless. Release always disarms its local permit copy. Queue rejection, oversized input, malformed preprocessing, command abort, and shutdown drain all roll back the canonical receipt exactly once; copied late rollbacks are no-ops. Permit and credit generations survive slot recycling and fail on exhaustion rather than wrapping. Acquire, reserve, commit/reassign, rollback, and release allocate no memory after initialization.
+
+Registered all-mode layout locks are: `PermitHandle` 16 bytes, `AdmissionPermit` 16, `ExpectedCredit` 24, `PermitSlot` 200, and `IngressAdmission` 440 in Debug/ReleaseSafe or 416 in ReleaseFast. Supported default capacity is 3,073 permit slots with 614,600 bytes of fixed slot backing. Test-only fingerprints independently lock active receipt lanes, list links, remaining/reserved allowance, free-list state, live counts, and both generation families.
+
 ### Challenge ledger layout gates
 
 The registered layout report runs in Debug, ReleaseSafe, and ReleaseFast and distinguishes transport effects from canonical state views:
@@ -156,7 +168,7 @@ The registered layout report runs in Debug, ReleaseSafe, and ReleaseFast and dis
 | `ChallengeHandle` | 72 |
 | `WhoareyouSendEffect` (`handle` plus `packet`, exactly two fields) | 1,360 |
 | `ChallengePublication` (pre-publication canonical input, not an effect) | 1,672 |
-| `ChallengeView` (canonical read view, not an effect) | 1,736 |
+| `ChallengeView` (canonical read view, not an effect) | 1,752 |
 | Stored challenge | 1,688 |
 | Challenge LRU node | 1,808 |
 | Configured fixture node backing (`C = 3`, physical `C + 1 = 4`) | 7,232 |
@@ -179,13 +191,4 @@ Compact effects are forbidden from regaining admission/permit, challenge/prepara
 
 ## Remaining ownership work
 
-The Runtime-only transport executor and single FIFO are complete. Canonical effect ownership is staged by effect family:
-
-- Retry effects are compact and complete: they carry only exact `RetryHandle` plus `PacketBytes`, while canonical retry future state lives in `RequestBook.sending_retry` and terminal cleanup releases both current and prepared permits.
-- Request- and response-source handshake effects are compact and complete: unified exact handle plus `PacketBytes`; canonical sending/candidate ownership lives in `RequestBook` or `ResponseBook`.
-- Fresh and replay WHOAREYOU effects are compact and complete: both carry only exact `ChallengeHandle` plus `PacketBytes`, while canonical sending/live state and permits remain in `SessionBook`.
-- Expected-credit/admission receipt ownership remains a separate admission-boundary concern; this request-handshake slice does not acquire a new rate or request permit.
-- Reliable result reservation is represented by Runtime outbox reservation state and `RequestOrigin.reliable_api`; a future consume-and-resolve result capability may consolidate that representation.
-- Peer/contact/routing canonicalization is independent of transport execution ownership.
-- The final project-wide `ActorEffect <= 1,536` ceiling is intentionally not yet promoted; the current staged exact union lock is 1,400 bytes and no legacy request-handshake effect remains.
-- If Runtime transport is later made concurrent or detached, every effect family must retain its exact canonical handle and exhaustion semantics; synchronous execution is not an ownership shortcut.
+Only final integration remains: promote the project-wide `ActorEffect <= 1,536` ceiling while retaining the observed 1,400-byte lock, then perform the final cross-slice integration review. Runtime transport, effect ledgers, and exact expected-credit/admission authority are complete.

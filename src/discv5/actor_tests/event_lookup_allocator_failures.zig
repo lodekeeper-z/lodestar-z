@@ -267,7 +267,11 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     const cfg = config.Config{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .rate_limiter = null,
+        .rate_limiter = .{
+            .global_quota = .{ .replenish_all_every_ms = 60_000, .max_tokens = 1 },
+            .by_ip_quota = .{ .replenish_all_every_ms = 60_000, .max_tokens = 1 },
+            .by_ip_state_capacity = 1,
+        },
         .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 1, .command_capacity = 2 },
     };
     var harness = try ActorHarness.init(alloc, io, cfg);
@@ -279,17 +283,35 @@ test "health PONG completion is independent of a full best-effort event outbox" 
     actor.sessions.put(endpoint, stable, outbound.nowNs(io));
     const req_id = try actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .{ .maintenance = .health });
     try harness.drainEffects();
+    var competing = try harness.ingress.acquire(endpoint.addr, 1);
+    defer competing.release(&harness.ingress);
+    try std.testing.expect(harness.ingress.admit(endpoint.addr, 0) == .ordinary);
+    var expected_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |value| value,
+        else => return error.MissingExpectedCredit,
+    };
+    defer expected_credit.rollback(&harness.ingress);
+    try std.testing.expectEqual(competing.handle(), expected_credit.source());
     const key = req_id.key;
     try std.testing.expect(actor.peers.armHealthRequest(key, .connected_only));
     harness.outbox.publish(.{ .local_enr_updated = .{ .seq = 1, .enr = try alloc.dupe(u8, "blocker") } });
     const pong = message.Pong{ .req_id = req_id.key.req_id, .enr_seq = 1, .recipient_ip = .{ .ip4 = .{ 127, 0, 0, 1 } }, .recipient_port = 9000 };
     var pong_buffer: [128]u8 = undefined;
-    try deliverEncrypted(actor, io, harness.recording.sender(), &harness.ingress, &harness.outbox, endpoint, &stable.recipient_key, try pong.encodeInto(&pong_buffer), 12);
+    var expected_env = harness.env();
+    expected_env.expected_credit = &expected_credit;
+    try deliverEncryptedWithEnv(actor, expected_env, endpoint, &stable.recipient_key, try pong.encodeInto(&pong_buffer), 12);
 
+    try std.testing.expect(!expected_credit.armed);
     try std.testing.expectEqual(@as(u64, 0), harness.outbox.droppedCount());
     try std.testing.expect(actor.peers.healthRequest(&remote_id) == null);
     try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
-    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    var restored = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |value| value,
+        else => return error.CompetingPermitWasNotRestored,
+    };
+    try std.testing.expectEqual(competing.handle(), restored.source());
+    restored.rollback(&harness.ingress);
 }
 
 test "LocalRecord update remains canonical when event publication allocation fails" {

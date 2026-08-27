@@ -14,16 +14,26 @@ pub const Stats = struct {
     rate_limit_hit_total: u64 = 0,
 };
 
-const SlotIndex = u32;
+pub const SlotIndex = u32;
+pub const MAX_EXPECTED_CREDITS_PER_PERMIT: u16 = 17;
+
+pub const PermitHandle = struct {
+    slot: SlotIndex,
+    generation: u64,
+};
 
 pub const AdmissionPermit = struct {
     slot: SlotIndex,
     generation: u64,
     armed: bool = true,
 
+    pub fn handle(self: *const AdmissionPermit) PermitHandle {
+        return .{ .slot = self.slot, .generation = self.generation };
+    }
+
     pub fn release(self: *AdmissionPermit, admission: *IngressAdmission) void {
         if (!self.armed) return;
-        admission.release(self.slot, self.generation);
+        admission.release(self.handle());
         self.armed = false;
     }
 
@@ -36,19 +46,25 @@ pub const AdmissionPermit = struct {
 };
 
 pub const ExpectedCredit = struct {
-    slot: SlotIndex,
-    generation: u64,
+    source_slot: SlotIndex,
+    source_permit_generation: u64,
+    credit_generation: u64,
     armed: bool = true,
 
-    pub fn commit(self: *ExpectedCredit, admission: *IngressAdmission) void {
-        if (!self.armed) return;
-        admission.resolveExpected(self.slot, self.generation, false);
+    pub fn source(self: *const ExpectedCredit) PermitHandle {
+        return .{ .slot = self.source_slot, .generation = self.source_permit_generation };
+    }
+
+    pub fn commit(self: *ExpectedCredit, admission: *IngressAdmission, target: PermitHandle) bool {
+        if (!self.armed) return false;
+        if (!admission.commitExpected(self.source(), self.credit_generation, target)) return false;
         self.armed = false;
+        return true;
     }
 
     pub fn rollback(self: *ExpectedCredit, admission: *IngressAdmission) void {
         if (!self.armed) return;
-        admission.resolveExpected(self.slot, self.generation, true);
+        admission.rollbackExpected(self.source(), self.credit_generation);
         self.armed = false;
     }
 
@@ -73,9 +89,11 @@ const ExpectedEntry = struct {
 
 const PermitSlot = struct {
     ip: IpKey = undefined,
+    credit_generations: [MAX_EXPECTED_CREDITS_PER_PERMIT]u64 = [_]u64{0} ** MAX_EXPECTED_CREDITS_PER_PERMIT,
+    permit_generation: u64 = 0,
+    next_credit_generation: u64 = 0,
     remaining: u16 = 0,
     reserved: u16 = 0,
-    generation: u64 = 0,
     in_use: bool = false,
     owner_live: bool = false,
     previous: ?SlotIndex = null,
@@ -148,7 +166,7 @@ pub const IngressAdmission = struct {
             .filtered => false,
             .ordinary => true,
             .expected => |*credit| blk: {
-                credit.commit(self);
+                if (!credit.commit(self, credit.source())) unreachable;
                 break :blk true;
             },
         };
@@ -161,22 +179,47 @@ pub const IngressAdmission = struct {
         address: types.Address,
         packet_budget: u16,
     ) error{ TooManyAdmissionPermits, InvalidPacketBudget, AdmissionBudgetOverflow, PermitGenerationExhausted }!AdmissionPermit {
-        if (packet_budget == 0) return error.InvalidPacketBudget;
+        if (packet_budget == 0 or packet_budget > MAX_EXPECTED_CREDITS_PER_PERMIT) return error.InvalidPacketBudget;
         self.lock();
         defer self.unlock();
-        const slot_index = self.free_head orelse return error.TooManyAdmissionPermits;
+
+        var cursor = self.free_head orelse return error.TooManyAdmissionPermits;
+        var previous: ?SlotIndex = null;
+        var selected: ?SlotIndex = null;
+        var selected_previous: ?SlotIndex = null;
+        var generation: u64 = undefined;
+        var scanned: usize = 0;
+        while (scanned < self.permit_slots.len) : (scanned += 1) {
+            const slot = &self.permit_slots[cursor];
+            if (slot.permit_generation < std.math.maxInt(u64)) {
+                selected = cursor;
+                selected_previous = previous;
+                generation = slot.permit_generation + 1;
+                break;
+            }
+            previous = cursor;
+            cursor = slot.free_next orelse break;
+        }
+        std.debug.assert(scanned < self.permit_slots.len);
+        const slot_index = selected orelse return error.PermitGenerationExhausted;
+        const slot = &self.permit_slots[slot_index];
         const ip = IpKey.fromAddress(address);
         const previous_budget = if (self.expected_by_ip.get(ip)) |entry| entry.remaining else 0;
         const next_budget = std.math.add(u32, previous_budget, packet_budget) catch return error.AdmissionBudgetOverflow;
-        const slot = &self.permit_slots[slot_index];
-        const generation = std.math.add(u64, slot.generation, 1) catch return error.PermitGenerationExhausted;
         const entry = self.expected_by_ip.getOrPutAssumeCapacity(ip);
         if (!entry.found_existing) entry.value_ptr.* = .{ .remaining = 0, .head = null };
-        self.free_head = slot.free_next;
+
+        if (selected_previous) |free_previous| {
+            self.permit_slots[free_previous].free_next = slot.free_next;
+        } else {
+            self.free_head = slot.free_next;
+        }
+        const next_credit_generation = slot.next_credit_generation;
         slot.* = .{
             .ip = ip,
             .remaining = packet_budget,
-            .generation = generation,
+            .permit_generation = generation,
+            .next_credit_generation = next_credit_generation,
             .in_use = true,
             .owner_live = true,
             .next = entry.value_ptr.head,
@@ -214,80 +257,218 @@ pub const IngressAdmission = struct {
     }
 
     pub const Testing = if (@import("builtin").is_test) struct {
+        pub const Fingerprint = struct {
+            active_receipts: u64,
+            list_links: u64,
+            remaining: u64,
+            free_slots: u64,
+            live_permits: usize,
+            reserved_credits: usize,
+            permit_generations: u64,
+            credit_generations: u64,
+        };
+
+        fn mix(value: u64, input: u64) u64 {
+            return std.math.rotl(u64, value ^ input, 17) *% 0x9e3779b97f4a7c15;
+        }
+
+        pub fn fingerprint(self: *IngressAdmission) Fingerprint {
+            self.lock();
+            defer self.unlock();
+            var result = Fingerprint{
+                .active_receipts = 0,
+                .list_links = 0,
+                .remaining = 0,
+                .free_slots = 0,
+                .live_permits = self.live_permits,
+                .reserved_credits = self.reserved_credits,
+                .permit_generations = 0,
+                .credit_generations = 0,
+            };
+            for (self.permit_slots, 0..) |slot, index| {
+                const tag: u64 = @intCast(index + 1);
+                result.permit_generations = mix(result.permit_generations, tag ^ slot.permit_generation);
+                result.credit_generations = mix(result.credit_generations, tag ^ slot.next_credit_generation);
+                result.remaining = mix(result.remaining, tag ^ slot.remaining ^ (@as(u64, slot.reserved) << 16));
+                result.list_links = mix(result.list_links, tag ^ (@as(u64, @intFromBool(slot.in_use)) << 63) ^
+                    (@as(u64, @intFromBool(slot.owner_live)) << 62) ^
+                    (@as(u64, if (slot.previous) |value| value + 1 else 0) << 31) ^
+                    @as(u64, if (slot.next) |value| value + 1 else 0));
+                result.free_slots = mix(result.free_slots, tag ^ @as(u64, if (slot.free_next) |value| value + 1 else 0));
+                for (slot.credit_generations, 0..) |generation, lane| {
+                    if (generation != 0) result.active_receipts = mix(
+                        result.active_receipts,
+                        (tag << 48) ^ (@as(u64, @intCast(lane + 1)) << 40) ^ generation,
+                    );
+                }
+            }
+            result.free_slots = mix(result.free_slots, @as(u64, if (self.free_head) |value| value + 1 else 0));
+            return result;
+        }
+
         pub fn permitGenerationFingerprint(self: *IngressAdmission) u64 {
-            var fingerprint: u64 = 0;
-            for (self.permit_slots) |slot| fingerprint +%= slot.generation;
-            return fingerprint;
+            return fingerprint(self).permit_generations;
         }
     } else struct {};
 
     fn reserveExpected(self: *IngressAdmission, ip: IpKey) ?ExpectedCredit {
         const entry = self.expected_by_ip.getPtr(ip) orelse return null;
-        const slot_index = entry.head orelse unreachable;
+        var cursor = entry.head orelse unreachable;
+        var selected: ?SlotIndex = null;
+        var selected_lane: usize = undefined;
+        var credit_generation: u64 = undefined;
+        var scanned: usize = 0;
+        while (scanned < self.permit_slots.len) : (scanned += 1) {
+            const slot = &self.permit_slots[cursor];
+            std.debug.assert(slot.in_use and slot.owner_live and slot.remaining > 0);
+            if (slot.next_credit_generation < std.math.maxInt(u64)) {
+                for (slot.credit_generations, 0..) |active_generation, lane| {
+                    if (active_generation == 0) {
+                        selected = cursor;
+                        selected_lane = lane;
+                        credit_generation = slot.next_credit_generation + 1;
+                        break;
+                    }
+                }
+                if (selected != null) break;
+            }
+            cursor = slot.next orelse break;
+        }
+        std.debug.assert(scanned < self.permit_slots.len);
+        const slot_index = selected orelse return null;
         const slot = &self.permit_slots[slot_index];
-        std.debug.assert(slot.in_use and slot.owner_live and slot.remaining > 0);
         std.debug.assert(entry.remaining > 0);
+        slot.credit_generations[selected_lane] = credit_generation;
+        slot.next_credit_generation = credit_generation;
         slot.remaining -= 1;
         slot.reserved = std.math.add(u16, slot.reserved, 1) catch unreachable;
         self.reserved_credits += 1;
         entry.remaining -= 1;
         if (slot.remaining == 0) self.unlinkExpected(entry, slot_index);
         if (entry.remaining == 0) std.debug.assert(self.expected_by_ip.remove(ip));
-        return .{ .slot = slot_index, .generation = slot.generation };
+        return .{
+            .source_slot = slot_index,
+            .source_permit_generation = slot.permit_generation,
+            .credit_generation = credit_generation,
+        };
     }
 
-    fn resolveExpected(self: *IngressAdmission, slot_index: SlotIndex, generation: u64, restore: bool) void {
+    fn activeCreditLane(slot: *const PermitSlot, credit_generation: u64) ?usize {
+        if (credit_generation == 0) return null;
+        for (slot.credit_generations, 0..) |active_generation, lane| {
+            if (active_generation == credit_generation) return lane;
+        }
+        return null;
+    }
+
+    fn commitExpected(
+        self: *IngressAdmission,
+        source: PermitHandle,
+        credit_generation: u64,
+        target: PermitHandle,
+    ) bool {
         self.lock();
         defer self.unlock();
-        std.debug.assert(slot_index < self.permit_slots.len);
-        const slot = &self.permit_slots[slot_index];
-        std.debug.assert(slot.in_use and slot.generation == generation and slot.reserved > 0);
-        std.debug.assert(self.reserved_credits > 0);
+        if (source.slot >= self.permit_slots.len) return false;
+        const source_slot = &self.permit_slots[source.slot];
+        if (!source_slot.in_use or source_slot.permit_generation != source.generation) return false;
+        const credit_lane = activeCreditLane(source_slot, credit_generation) orelse return false;
+        if (target.slot >= self.permit_slots.len) return false;
+        const target_slot = &self.permit_slots[target.slot];
+        if (!target_slot.in_use or !target_slot.owner_live or target_slot.permit_generation != target.generation) return false;
+        if (!std.meta.eql(source_slot.ip, target_slot.ip)) return false;
+
+        const same_permit = source.slot == target.slot and source.generation == target.generation;
+        if (same_permit) {
+            if (!source_slot.owner_live) return false;
+        } else {
+            if (target_slot.remaining == 0) return false;
+            const entry = self.expected_by_ip.getPtr(source_slot.ip) orelse unreachable;
+            target_slot.remaining -= 1;
+            std.debug.assert(entry.remaining > 0);
+            entry.remaining -= 1;
+            if (target_slot.remaining == 0) self.unlinkExpected(entry, target.slot);
+            if (source_slot.owner_live) {
+                const source_was_empty = source_slot.remaining == 0;
+                source_slot.remaining = std.math.add(u16, source_slot.remaining, 1) catch unreachable;
+                entry.remaining = std.math.add(u32, entry.remaining, 1) catch unreachable;
+                if (source_was_empty) self.linkExpected(entry, source.slot);
+            }
+            if (entry.remaining == 0) std.debug.assert(self.expected_by_ip.remove(source_slot.ip));
+        }
+
+        std.debug.assert(source_slot.reserved > 0 and self.reserved_credits > 0);
+        source_slot.credit_generations[credit_lane] = 0;
+        source_slot.reserved -= 1;
+        self.reserved_credits -= 1;
+        if (!source_slot.owner_live and source_slot.reserved == 0) self.recycleSlot(source.slot);
+        return true;
+    }
+
+    fn rollbackExpected(self: *IngressAdmission, source: PermitHandle, credit_generation: u64) void {
+        self.lock();
+        defer self.unlock();
+        if (source.slot >= self.permit_slots.len) return;
+        const slot = &self.permit_slots[source.slot];
+        if (!slot.in_use or slot.permit_generation != source.generation) return;
+        const credit_lane = activeCreditLane(slot, credit_generation) orelse return;
+        std.debug.assert(slot.reserved > 0 and self.reserved_credits > 0);
+        slot.credit_generations[credit_lane] = 0;
         slot.reserved -= 1;
         self.reserved_credits -= 1;
-        if (restore and slot.owner_live) {
+        if (slot.owner_live) {
             const was_empty = slot.remaining == 0;
             const entry = self.expected_by_ip.getOrPutAssumeCapacity(slot.ip);
             if (!entry.found_existing) entry.value_ptr.* = .{ .remaining = 0, .head = null };
             slot.remaining = std.math.add(u16, slot.remaining, 1) catch unreachable;
             entry.value_ptr.remaining = std.math.add(u32, entry.value_ptr.remaining, 1) catch unreachable;
-            if (was_empty) {
-                slot.previous = null;
-                slot.next = entry.value_ptr.head;
-                if (slot.next) |next| self.permit_slots[next].previous = slot_index;
-                entry.value_ptr.head = slot_index;
-            }
+            if (was_empty) self.linkExpected(entry.value_ptr, source.slot);
+        } else if (slot.reserved == 0) {
+            self.recycleSlot(source.slot);
         }
-        if (!slot.owner_live and slot.reserved == 0) self.recycleSlot(slot_index);
     }
 
-    fn release(self: *IngressAdmission, slot_index: SlotIndex, generation: u64) void {
+    fn release(self: *IngressAdmission, handle: PermitHandle) void {
         self.lock();
         defer self.unlock();
-        std.debug.assert(slot_index < self.permit_slots.len);
-        const slot = &self.permit_slots[slot_index];
-        std.debug.assert(slot.in_use and slot.owner_live and slot.generation == generation);
+        if (handle.slot >= self.permit_slots.len) return;
+        const slot = &self.permit_slots[handle.slot];
+        if (!slot.in_use or !slot.owner_live or slot.permit_generation != handle.generation) return;
         std.debug.assert(self.live_permits > 0);
         if (slot.remaining > 0) {
             const ip = slot.ip;
             const entry = self.expected_by_ip.getPtr(ip) orelse unreachable;
             std.debug.assert(entry.remaining >= slot.remaining);
             entry.remaining -= slot.remaining;
-            self.unlinkExpected(entry, slot_index);
+            self.unlinkExpected(entry, handle.slot);
             if (entry.remaining == 0) std.debug.assert(self.expected_by_ip.remove(ip));
             slot.remaining = 0;
         }
         slot.owner_live = false;
         self.live_permits -= 1;
-        if (slot.reserved == 0) self.recycleSlot(slot_index);
+        if (slot.reserved == 0) self.recycleSlot(handle.slot);
     }
 
     fn recycleSlot(self: *IngressAdmission, slot_index: SlotIndex) void {
         const slot = &self.permit_slots[slot_index];
         std.debug.assert(slot.in_use and !slot.owner_live and slot.remaining == 0 and slot.reserved == 0);
-        const generation = slot.generation;
-        slot.* = .{ .generation = generation, .free_next = self.free_head };
+        const permit_generation = slot.permit_generation;
+        const next_credit_generation = slot.next_credit_generation;
+        slot.* = .{
+            .permit_generation = permit_generation,
+            .next_credit_generation = next_credit_generation,
+            .free_next = self.free_head,
+        };
         self.free_head = slot_index;
+    }
+
+    fn linkExpected(self: *IngressAdmission, entry: *ExpectedEntry, slot_index: SlotIndex) void {
+        const slot = &self.permit_slots[slot_index];
+        std.debug.assert(slot.in_use and slot.owner_live and slot.remaining > 0);
+        std.debug.assert(slot.previous == null and slot.next == null);
+        slot.next = entry.head;
+        if (slot.next) |next| self.permit_slots[next].previous = slot_index;
+        entry.head = slot_index;
     }
 
     fn unlinkExpected(self: *IngressAdmission, entry: *ExpectedEntry, slot_index: SlotIndex) void {
@@ -336,6 +517,12 @@ pub fn challengePacketBudget(request_retries: u32) u16 {
 pub const RESPONSE_RECOVERY_PACKET_BUDGET: u16 = 1;
 pub const ADMISSION_PREPARATION_HEADROOM: usize = 1;
 
+comptime {
+    std.debug.assert(1 + config_mod.MAX_NODES_RESPONSE <= MAX_EXPECTED_CREDITS_PER_PERMIT);
+    std.debug.assert(config_mod.MAX_REQUEST_RETRIES + 1 <= MAX_EXPECTED_CREDITS_PER_PERMIT);
+    std.debug.assert(RESPONSE_RECOVERY_PACKET_BUDGET <= MAX_EXPECTED_CREDITS_PER_PERMIT);
+}
+
 fn initAdmissionFailure(alloc: Allocator) !void {
     var admission = try IngressAdmission.init(alloc, .{
         .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 4 },
@@ -346,6 +533,276 @@ fn initAdmissionFailure(alloc: Allocator) !void {
 
 test "admission initialization cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, initAdmissionFailure, .{});
+}
+
+test "packet budget above exact credit capacity is rejected without mutation" {
+    var admission = try IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 18 }, .port = 9_000 } };
+    const free_head_before = admission.free_head;
+    const map_count_before = admission.expected_by_ip.count();
+    const generation_before = IngressAdmission.Testing.permitGenerationFingerprint(&admission);
+
+    try std.testing.expectError(error.InvalidPacketBudget, admission.acquire(address, 18));
+    try std.testing.expectEqual(free_head_before, admission.free_head);
+    try std.testing.expectEqual(map_count_before, admission.expected_by_ip.count());
+    try std.testing.expectEqual(generation_before, IngressAdmission.Testing.permitGenerationFingerprint(&admission));
+    try std.testing.expectEqual(@as(usize, 0), admission.live_permits);
+    try std.testing.expectEqual(@as(usize, 0), admission.reserved_credits);
+}
+
+test "exact receipt generations resolve independently out of order" {
+    var admission = try IngressAdmission.init(std.testing.allocator, .{
+        .global_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 4 },
+        .by_ip_quota = .{ .replenish_all_every_ms = 1_000, .max_tokens = 1 },
+    }, 1);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 19 }, .port = 9_000 } };
+    try std.testing.expect(admission.admit(address, 0) == .ordinary);
+    var permit = try admission.acquire(address, 2);
+    defer permit.release(&admission);
+    var first = switch (admission.admit(address, 0)) {
+        .expected => |credit| credit,
+        else => return error.MissingFirstExpectedCredit,
+    };
+    var second = switch (admission.admit(address, 0)) {
+        .expected => |credit| credit,
+        else => return error.MissingSecondExpectedCredit,
+    };
+    var first_copy = first;
+    var second_copy = second;
+
+    try std.testing.expect(first.commit(&admission, permit.handle()));
+    try std.testing.expect(!first_copy.commit(&admission, permit.handle()));
+    second.rollback(&admission);
+    first_copy.rollback(&admission);
+    second_copy.rollback(&admission);
+    try std.testing.expectEqual(@as(usize, 0), admission.reserved_credits);
+
+    var restored = switch (admission.admit(address, 0)) {
+        .expected => |credit| credit,
+        else => return error.MissingRestoredSiblingCredit,
+    };
+    try std.testing.expect(restored.commit(&admission, permit.handle()));
+}
+
+test "copied and stale permit releases cannot release a reused slot" {
+    var admission = try IngressAdmission.init(std.testing.allocator, null, 1);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 20 }, .port = 9_000 } };
+    var first = try admission.acquire(address, 1);
+    var first_copy = first;
+    const old_generation = first.generation;
+    first.release(&admission);
+    first_copy.release(&admission);
+    try std.testing.expectEqual(@as(usize, 0), admission.permitCount());
+
+    var replacement = try admission.acquire(address, 1);
+    defer replacement.release(&admission);
+    try std.testing.expect(replacement.generation > old_generation);
+    var stale = AdmissionPermit{ .slot = replacement.slot, .generation = old_generation };
+    stale.release(&admission);
+    try std.testing.expectEqual(@as(usize, 1), admission.permitCount());
+}
+
+test "permit generation exhaustion skips viable free slots and all-exhausted is atomic" {
+    var admission = try IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 21 }, .port = 9_000 } };
+    admission.permit_slots[0].permit_generation = std.math.maxInt(u64);
+    var alternate = try admission.acquire(address, 1);
+    try std.testing.expectEqual(@as(SlotIndex, 1), alternate.slot);
+    alternate.release(&admission);
+    admission.permit_slots[1].permit_generation = std.math.maxInt(u64);
+    const free_head_before = admission.free_head;
+    const fingerprint_before = IngressAdmission.Testing.permitGenerationFingerprint(&admission);
+    try std.testing.expectError(error.PermitGenerationExhausted, admission.acquire(address, 1));
+    try std.testing.expectEqual(free_head_before, admission.free_head);
+    try std.testing.expectEqual(fingerprint_before, IngressAdmission.Testing.permitGenerationFingerprint(&admission));
+    try std.testing.expectEqual(@as(usize, 0), admission.expected_by_ip.count());
+}
+
+test "credit generation exhaustion skips same-IP permit and all-exhausted reserve is atomic" {
+    var admission = try IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 22 }, .port = 9_000 } };
+    var first = try admission.acquire(address, 1);
+    defer first.release(&admission);
+    var exhausted_head = try admission.acquire(address, 1);
+    defer exhausted_head.release(&admission);
+    admission.permit_slots[exhausted_head.slot].next_credit_generation = std.math.maxInt(u64);
+    const ip = IpKey.fromAddress(address);
+    admission.lock();
+    var credit = admission.reserveExpected(ip) orelse {
+        admission.unlock();
+        return error.MissingAlternateExpectedCredit;
+    };
+    admission.unlock();
+    try std.testing.expectEqual(first.handle(), credit.source());
+    credit.rollback(&admission);
+
+    admission.permit_slots[first.slot].next_credit_generation = std.math.maxInt(u64);
+    const remaining_before = admission.expected_by_ip.get(ip).?.remaining;
+    const reserved_before = admission.reserved_credits;
+    admission.lock();
+    const unavailable = admission.reserveExpected(ip);
+    admission.unlock();
+    try std.testing.expect(unavailable == null);
+    try std.testing.expectEqual(remaining_before, admission.expected_by_ip.get(ip).?.remaining);
+    try std.testing.expectEqual(reserved_before, admission.reserved_credits);
+}
+
+test "same-IP exact reassignment relinks source and unlinks exhausted target" {
+    var admission = try IngressAdmission.init(std.testing.allocator, null, 2);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 23 }, .port = 9_000 } };
+    var target = try admission.acquire(address, 1);
+    defer target.release(&admission);
+    var source = try admission.acquire(address, 1);
+    defer source.release(&admission);
+    const ip = IpKey.fromAddress(address);
+    admission.lock();
+    var credit = admission.reserveExpected(ip).?;
+    admission.unlock();
+    try std.testing.expectEqual(source.handle(), credit.source());
+    try std.testing.expectEqual(@as(u16, 0), admission.permit_slots[source.slot].remaining);
+    try std.testing.expectEqual(@as(u16, 1), admission.permit_slots[target.slot].remaining);
+
+    try std.testing.expect(credit.commit(&admission, target.handle()));
+    try std.testing.expectEqual(@as(u16, 1), admission.permit_slots[source.slot].remaining);
+    try std.testing.expectEqual(@as(u16, 0), admission.permit_slots[target.slot].remaining);
+    const entry = admission.expected_by_ip.get(ip).?;
+    try std.testing.expectEqual(@as(u32, 1), entry.remaining);
+    try std.testing.expectEqual(source.slot, entry.head.?);
+    try std.testing.expectEqual(@as(usize, 0), admission.reserved_credits);
+}
+
+test "invalid exact commit targets are atomic and rollback restores the source" {
+    var admission = try IngressAdmission.init(std.testing.allocator, null, 4);
+    defer admission.deinit();
+    const same_ip: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 24 }, .port = 9_000 } };
+    const other_ip: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 25 }, .port = 9_000 } };
+    var target = try admission.acquire(same_ip, 1);
+    var source = try admission.acquire(same_ip, 4);
+    defer source.release(&admission);
+    var foreign = try admission.acquire(other_ip, 1);
+    defer foreign.release(&admission);
+    admission.lock();
+    var credit = admission.reserveExpected(IpKey.fromAddress(same_ip)).?;
+    admission.unlock();
+    const source_remaining = admission.permit_slots[source.slot].remaining;
+
+    var before = IngressAdmission.Testing.fingerprint(&admission);
+    try std.testing.expect(!credit.commit(&admission, foreign.handle()));
+    try std.testing.expectEqual(before, IngressAdmission.Testing.fingerprint(&admission));
+    try std.testing.expect(credit.armed);
+
+    const stale_target = PermitHandle{ .slot = target.slot, .generation = target.generation + 1 };
+    before = IngressAdmission.Testing.fingerprint(&admission);
+    try std.testing.expect(!credit.commit(&admission, stale_target));
+    try std.testing.expectEqual(before, IngressAdmission.Testing.fingerprint(&admission));
+
+    const released_target = target.handle();
+    target.release(&admission);
+    before = IngressAdmission.Testing.fingerprint(&admission);
+    try std.testing.expect(!credit.commit(&admission, released_target));
+    try std.testing.expectEqual(before, IngressAdmission.Testing.fingerprint(&admission));
+
+    var exhausted_target = try admission.acquire(same_ip, 1);
+    defer exhausted_target.release(&admission);
+    admission.lock();
+    var target_receipt = admission.reserveExpected(IpKey.fromAddress(same_ip)).?;
+    admission.unlock();
+    try std.testing.expectEqual(exhausted_target.handle(), target_receipt.source());
+    try std.testing.expectEqual(@as(u16, 0), admission.permit_slots[exhausted_target.slot].remaining);
+    before = IngressAdmission.Testing.fingerprint(&admission);
+    try std.testing.expect(!credit.commit(&admission, exhausted_target.handle()));
+    try std.testing.expectEqual(before, IngressAdmission.Testing.fingerprint(&admission));
+
+    target_receipt.rollback(&admission);
+    credit.rollback(&admission);
+    try std.testing.expectEqual(source_remaining + 1, admission.permit_slots[source.slot].remaining);
+    var late_copy = credit;
+    late_copy.rollback(&admission);
+    try std.testing.expectEqual(@as(usize, 0), admission.reserved_credits);
+}
+
+test "dead receipt sources recycle only after their exact final callback" {
+    var admission = try IngressAdmission.init(std.testing.allocator, null, 3);
+    defer admission.deinit();
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 26 }, .port = 9_000 } };
+
+    var rollback_source = try admission.acquire(address, 1);
+    admission.lock();
+    var rollback_credit = admission.reserveExpected(IpKey.fromAddress(address)).?;
+    admission.unlock();
+    const rollback_slot = rollback_source.slot;
+    rollback_source.release(&admission);
+    try std.testing.expect(admission.permit_slots[rollback_slot].in_use);
+    rollback_credit.rollback(&admission);
+    try std.testing.expect(!admission.permit_slots[rollback_slot].in_use);
+
+    var target = try admission.acquire(address, 2);
+    defer target.release(&admission);
+    var source = try admission.acquire(address, 2);
+    admission.lock();
+    var first = admission.reserveExpected(IpKey.fromAddress(address)).?;
+    var second = admission.reserveExpected(IpKey.fromAddress(address)).?;
+    admission.unlock();
+    var first_copy = first;
+    var second_copy = second;
+    const dead_slot = source.slot;
+    source.release(&admission);
+    first.rollback(&admission);
+    try std.testing.expect(admission.permit_slots[dead_slot].in_use);
+    try std.testing.expect(!admission.permit_slots[dead_slot].owner_live);
+    try std.testing.expectEqual(@as(u16, 0), admission.permit_slots[dead_slot].remaining);
+    const target_before = admission.permit_slots[target.slot].remaining;
+    try std.testing.expect(second.commit(&admission, target.handle()));
+    try std.testing.expectEqual(target_before - 1, admission.permit_slots[target.slot].remaining);
+    try std.testing.expect(!admission.permit_slots[dead_slot].in_use);
+    first_copy.rollback(&admission);
+    try std.testing.expect(!second_copy.commit(&admission, target.handle()));
+    second_copy.rollback(&admission);
+    try std.testing.expectEqual(@as(usize, 0), admission.reserved_credits);
+}
+
+test "post-init exact admission ledger transitions allocate no memory" {
+    var backing: [32 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var admission = try IngressAdmission.init(fixed.allocator(), null, 3);
+    defer admission.deinit();
+    const used_after_init = fixed.end_index;
+    const address: types.Address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 27 }, .port = 9_000 } };
+    var target = try admission.acquire(address, 2);
+    var source = try admission.acquire(address, 2);
+    admission.lock();
+    var committed = admission.reserveExpected(IpKey.fromAddress(address)).?;
+    var rolled_back = admission.reserveExpected(IpKey.fromAddress(address)).?;
+    admission.unlock();
+    try std.testing.expect(committed.commit(&admission, target.handle()));
+    rolled_back.rollback(&admission);
+    source.release(&admission);
+    target.release(&admission);
+    try std.testing.expectEqual(used_after_init, fixed.end_index);
+}
+
+test "admission exact ledger registered layouts lock default backing" {
+    const default_slots = try permitCapacity(.{});
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(PermitHandle));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(AdmissionPermit));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(ExpectedCredit));
+    try std.testing.expectEqual(@as(usize, 200), @sizeOf(PermitSlot));
+    try std.testing.expectEqual(
+        @as(usize, if (@import("builtin").mode == .ReleaseFast) 416 else 440),
+        @sizeOf(IngressAdmission),
+    );
+    try std.testing.expectEqual(@as(usize, 3_073), default_slots);
+    try std.testing.expectEqual(@as(usize, 614_600), default_slots * @sizeOf(PermitSlot));
+    std.debug.print(
+        "ADMISSION_LEDGER_LAYOUT permit_handle={} permit={} credit={} slot={} admission={} default_slots={} backing={}\n",
+        .{ @sizeOf(PermitHandle), @sizeOf(AdmissionPermit), @sizeOf(ExpectedCredit), @sizeOf(PermitSlot), @sizeOf(IngressAdmission), default_slots, default_slots * @sizeOf(PermitSlot) },
+    );
 }
 
 test "admission permits conserve exact per-IP ownership" {
@@ -537,7 +994,7 @@ test "expected admission reservation is bounded and rollback restores credit" {
         .expected => |value| value,
         else => return error.MissingRestoredCredit,
     };
-    committed.commit(&admission);
+    try std.testing.expect(committed.commit(&admission, permit.handle()));
     try std.testing.expect(admission.admit(address, 1) == .filtered);
 }
 
@@ -661,7 +1118,9 @@ const AdmissionStress = struct {
                     return;
                 },
             };
-            if (iteration % 2 == 0) credit.commit(self.admission) else credit.rollback(self.admission);
+            if (iteration % 2 == 0) {
+                if (!credit.commit(self.admission, permit.handle())) self.failed.store(true, .release);
+            } else credit.rollback(self.admission);
             self.admission.noteProcessed();
             if (self.occupied_slots.fetchAnd(~slot_bit, .acq_rel) & slot_bit == 0) self.failed.store(true, .release);
             permit.release(self.admission);
@@ -720,7 +1179,7 @@ test "concurrent public admission methods conserve stats permits and expected cr
             .expected => |value| value,
             else => return error.ExpectedCreditCorrupted,
         };
-        credit.commit(&admission);
+        try std.testing.expect(credit.commit(&admission, permit.handle()));
         permit.release(&admission);
         try std.testing.expect(admission.admit(address, 0) == .filtered);
     }

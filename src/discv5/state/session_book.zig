@@ -76,6 +76,7 @@ pub const ChallengeView = struct {
     triggering_nonce: [packet.NONCE_SIZE]u8,
     datagram: types.PacketBytes,
     remote_enr: ?enr.RawEnr,
+    permit: admission_mod.PermitHandle,
 };
 
 const ChallengePhase = enum { sending_whoareyou, live };
@@ -352,6 +353,13 @@ pub const SessionBook = struct {
         return challengeView(endpoint, stored.*);
     }
 
+    pub fn matchesChallenge(self: *const SessionBook, view: ChallengeView) bool {
+        const stored = self.challenges.peekPtrRaw(view.handle.endpoint) orelse return false;
+        return stored.phase == .live and
+            stored.generation == view.handle.generation and
+            std.meta.eql(stored.admission.handle(), view.permit);
+    }
+
     pub fn pruneChallenges(self: *SessionBook, now_ns: i64, admission: *admission_mod.IngressAdmission) void {
         var pruned: usize = 0;
         while (pruned < self.challenges.capacity()) : (pruned += 1) {
@@ -420,6 +428,7 @@ fn challengeView(endpoint: types.Endpoint, stored: StoredChallenge) ChallengeVie
         .triggering_nonce = stored.triggering_nonce,
         .datagram = stored.datagram,
         .remote_enr = stored.remote_enr,
+        .permit = stored.admission.handle(),
     };
 }
 
@@ -929,7 +938,7 @@ test "challenge ledger registered layout report locks physical backing" {
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(ChallengeHandle));
     try std.testing.expectEqual(@as(usize, 1_360), @sizeOf(actor_mod.WhoareyouSendEffect));
     try std.testing.expectEqual(@as(usize, 1_672), @sizeOf(ChallengePublication));
-    try std.testing.expectEqual(@as(usize, 1_736), @sizeOf(ChallengeView));
+    try std.testing.expectEqual(@as(usize, 1_752), @sizeOf(ChallengeView));
     try std.testing.expectEqual(@as(usize, if (builtin.mode == .ReleaseFast) 360 else 384), @sizeOf(SessionBook));
     try std.testing.expectEqual(@as(usize, 1_688), layout.stored);
     try std.testing.expectEqual(@as(usize, 1_808), layout.node);

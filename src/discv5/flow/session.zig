@@ -99,10 +99,11 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket, a
         if (decryptParsedMessage(parsed, &pending.keys.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
             var authenticated_message: AuthenticatedMessage = undefined;
             if (!decodeAuthenticated(&authenticated_message, endpoint, plaintext, null)) return;
-            if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
             if (@import("builtin").is_test) if (env.pending_promotion_hook) |hook| {
                 hook.run(hook.context, actor, pending);
             };
+            if (!actor.requests.matchesPending(pending)) return;
+            if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
             var accepted = session_book.StableSession{
                 .initiator_key = pending.keys.initiator_key,
                 .recipient_key = pending.keys.recipient_key,
@@ -120,6 +121,7 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket, a
         if (decryptParsedMessage(parsed, &candidate.keys.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
             var authenticated_message: AuthenticatedMessage = undefined;
             if (!decodeAuthenticated(&authenticated_message, endpoint, plaintext, null)) return;
+            if (!actor.responses.matchesCandidate(candidate)) return;
             if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
             var accepted = session_book.StableSession{
                 .initiator_key = candidate.keys.initiator_key,
@@ -149,9 +151,8 @@ fn decodeAuthenticated(
 
 fn acceptExpectedMessage(actor: *Actor, env: Env, authenticated_message: *const AuthenticatedMessage) bool {
     if (env.expected_credit == null) return true;
-    if (!rpc.isExpectedResponse(actor, &authenticated_message.decoded, authenticated_message.endpoint)) return false;
-    env.commitExpected();
-    return true;
+    const target = rpc.expectedPermit(actor, &authenticated_message.decoded, authenticated_message.endpoint) orelse return false;
+    return env.commitExpected(target);
 }
 
 fn authenticated(actor: *Actor, env: Env, authenticated_message: *const AuthenticatedMessage) void {
@@ -181,7 +182,11 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
         .request => |preparation| actor.requests.preflightHandshake(preparation) catch return,
         .response => {},
     }
-    env.commitExpected();
+    const target = switch (source) {
+        .request => |preparation| preparation.permit,
+        .response => |view| view.permit,
+    };
+    if (!env.commitExpected(target)) return;
     var response_recovery_transferred = false;
     defer if (!response_recovery_transferred) switch (source) {
         .request => {},
@@ -381,7 +386,8 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
         plaintext,
         if (validated_enr) |*validated| validated else null,
     )) return;
-    env.commitExpected();
+    if (!actor.sessions.matchesChallenge(challenge)) return;
+    if (!env.commitExpected(challenge.permit)) return;
     var stable = session_book.StableSession{
         .initiator_key = keys.recipient_key,
         .recipient_key = keys.initiator_key,
@@ -415,7 +421,12 @@ fn sendWhoareyou(actor: *Actor, env: Env, endpoint: types.Endpoint, request_nonc
             .packet = challenge.datagram,
         } };
         const effects = env.effects orelse unreachable;
-        effects.push(effect) catch return false;
+        // Reserve queue capacity before consuming the retry probe's exact
+        // admission credit. Actor execution is single-writer, so publication
+        // is infallible after the credit commits.
+        if (!effects.hasCapacity()) return false;
+        if (!env.commitExpected(challenge.permit)) return false;
+        effects.push(effect) catch unreachable;
         return true;
     }
     if (!actor.sessions.allowWhoareyou(endpoint.addr, now_ns)) return false;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const admission = @import("../admission.zig");
 const actor_mod = @import("../actor.zig");
 const config = @import("../config.zig");
 const enr = @import("../enr.zig");
@@ -31,24 +32,26 @@ pub fn dispatch(actor: *Actor, env: Env, decoded: *const message.DecodedMessage,
     }
 }
 
-pub fn isExpectedResponse(actor: *Actor, decoded: *const message.DecodedMessage, endpoint: types.Endpoint) bool {
+pub fn expectedPermit(actor: *Actor, decoded: *const message.DecodedMessage, endpoint: types.Endpoint) ?admission.PermitHandle {
     switch (decoded.*) {
         .pong => |pong| {
-            const active = actor.requests.get(.init(endpoint, pong.req_id)) orelse return false;
-            return active.response == .pong;
+            const active = actor.requests.get(.init(endpoint, pong.req_id)) orelse return null;
+            if (active.response != .pong) return null;
+            return active.permitHandle();
         },
         .nodes => |nodes| {
-            if (nodes.total == 0 or nodes.total > MAX_NODES_RESPONSE) return false;
-            const active = actor.requests.get(.init(endpoint, nodes.req_id)) orelse return false;
-            if (active.response != .nodes) return false;
-            if (active.response.nodes.total_responses) |expected| return expected == nodes.total;
-            return true;
+            if (nodes.total == 0 or nodes.total > MAX_NODES_RESPONSE) return null;
+            const active = actor.requests.get(.init(endpoint, nodes.req_id)) orelse return null;
+            if (active.response != .nodes) return null;
+            if (active.response.nodes.total_responses) |expected| if (expected != nodes.total) return null;
+            return active.permitHandle();
         },
         .talkresp => |response| {
-            const active = actor.requests.get(.init(endpoint, response.req_id)) orelse return false;
-            return active.response == .talkresp;
+            const active = actor.requests.get(.init(endpoint, response.req_id)) orelse return null;
+            if (active.response != .talkresp) return null;
+            return active.permitHandle();
         },
-        else => return false,
+        else => return null,
     }
 }
 

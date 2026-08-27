@@ -61,6 +61,7 @@ pub const ChallengeView = struct {
     handle: ResponseHandle,
     dest_pubkey: [33]u8,
     plaintext: types.RecoverablePlaintext,
+    permit: admission_mod.PermitHandle,
 };
 
 const Candidate = struct {
@@ -218,6 +219,7 @@ pub const ResponseBook = struct {
             .handle = stored.handle,
             .dest_pubkey = stored.recovery.dest_pubkey,
             .plaintext = stored.recovery.plaintext,
+            .permit = stored.recovery.admission.handle(),
         };
     }
 
@@ -300,6 +302,11 @@ pub const ResponseBook = struct {
         if (!sameHandle(current.handle, view.handle)) return false;
         _ = self.candidates.takeMove(view.handle.endpoint) orelse unreachable;
         return true;
+    }
+
+    pub fn matchesCandidate(self: *const ResponseBook, view: CandidateView) bool {
+        const current = self.candidates.peekPtrRaw(view.handle.endpoint) orelse return false;
+        return sameHandle(current.handle, view.handle) and std.meta.eql(current.keys, view.keys);
     }
 
     pub fn remove(

@@ -240,6 +240,8 @@ test "expected NODES response accepts the 16-entry decode boundary" {
     env.request_results = &results;
     const req_id = try actor_mod.Testing.sendFindNodeResolvedForTest(&actor, env, endpoint, &responder_pubkey, &.{1}, .reliable_api);
     try harness.drainEffects();
+    var competing = try harness.ingress.acquire(endpoint.addr, 1);
+    defer competing.release(&harness.ingress);
     switch (harness.ingress.admit(endpoint.addr, 0)) {
         .ordinary => {},
         else => return error.MissingOrdinaryAdmission,
@@ -249,6 +251,7 @@ test "expected NODES response accepts the 16-entry decode boundary" {
         else => return error.MissingExpectedCredit,
     };
     defer expected_credit.rollback(&harness.ingress);
+    try std.testing.expectEqual(competing.handle(), expected_credit.source());
     env.expected_credit = &expected_credit;
 
     const invalid_enr = [_]u8{0x80};
@@ -269,6 +272,12 @@ test "expected NODES response accepts the 16-entry decode boundary" {
     try std.testing.expectEqual(types.RequestKind.findnode, result.kind);
     try std.testing.expect(result.terminal == .nodes);
     try std.testing.expectEqual(@as(usize, 0), result.terminal.nodes.slice().len);
+    var restored = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |value| value,
+        else => return error.CompetingPermitWasNotRestored,
+    };
+    try std.testing.expectEqual(competing.handle(), restored.source());
+    restored.rollback(&harness.ingress);
 }
 
 test "validated NODES multipart values survive as lookup closer IDs" {

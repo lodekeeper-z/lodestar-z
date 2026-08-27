@@ -203,6 +203,10 @@ pub const ActiveRequest = struct {
     attempts: u32 = 0,
     queued_intent: bool,
     handshake_send: ?HandshakeSendState = null,
+
+    pub fn permitHandle(self: *const ActiveRequest) admission_mod.PermitHandle {
+        return self.admission.handle();
+    }
 };
 
 const SendingRequest = struct {
@@ -309,6 +313,7 @@ pub const SendCompletionView = struct {
 pub const ChallengePreparation = struct {
     handle: RequestHandle,
     recovery: RecoveryState,
+    permit: admission_mod.PermitHandle,
 };
 
 pub const PendingKeysView = struct {
@@ -660,7 +665,7 @@ pub const RequestBook = struct {
             if (lane.establishing) |existing| if (!handleEql(existing, handle))
                 return error.EndpointEstablishing;
         }
-        return .{ .handle = handle, .recovery = recovery };
+        return .{ .handle = handle, .recovery = recovery, .permit = active.permitHandle() };
     }
 
     pub fn hasChallenge(self: *const RequestBook, nonce: *const [12]u8, from: types.Address) bool {
@@ -669,6 +674,7 @@ pub const RequestBook = struct {
 
     pub fn preflightHandshake(self: *RequestBook, preparation: ChallengePreparation) !void {
         const active = self.getActivePtr(preparation.handle) orelse return error.StaleRequest;
+        if (!std.meta.eql(active.permitHandle(), preparation.permit)) return error.StaleRequest;
         const recovery = challengeableRecoveryPtr(&active.phase) orelse return error.InvalidChallenge;
         if (!std.meta.eql(recovery.*, preparation.recovery)) return error.InvalidChallenge;
         const indexed = self.challenge_by_nonce.get(.init(preparation.handle.key.endpoint.addr, &recovery.nonce)) orelse return error.InvalidChallenge;
@@ -776,6 +782,16 @@ pub const RequestBook = struct {
         }
         self.removeEmptyLane(view.handle.request.key.endpoint);
         return true;
+    }
+
+    pub fn matchesPending(self: *RequestBook, view: PendingKeysView) bool {
+        const active = self.getActivePtr(view.handle.request) orelse return false;
+        const response = switch (active.phase) {
+            .awaiting_whoareyou => return false,
+            .awaiting_response => |value| value,
+        };
+        const pending = response.wait.pendingHandshake() orelse return false;
+        return pending.send_generation == view.handle.send_generation and std.meta.eql(pending.keys, view.keys);
     }
 
     pub fn get(self: *RequestBook, key: types.RequestKey) ?*ActiveRequest {

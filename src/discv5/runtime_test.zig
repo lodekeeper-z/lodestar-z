@@ -1,4 +1,5 @@
 const std = @import("std");
+const admission = @import("admission.zig");
 const config = @import("config.zig");
 const enr = @import("enr.zig");
 const metrics = @import("metrics.zig");
@@ -2244,10 +2245,18 @@ test "malformed inbound packet rolls back tentative expected credit" {
         else => return error.MissingExpectedCredit,
     };
     defer queue_credit.rollback(runtime_mod.Testing.admissionState(runtime));
+    var queue_credit_copy = queue_credit;
     try runtime_mod.Testing.enqueueStaleMaintenance(runtime);
     try std.testing.expectError(
         error.CommandQueueFull,
         runtime_mod.Testing.enqueueInbound(runtime, address, &.{0xff}, queue_credit.move()),
+    );
+    const queue_rollback = admission.IngressAdmission.Testing.fingerprint(runtime_mod.Testing.admissionState(runtime));
+    try std.testing.expectEqual(@as(usize, 0), queue_rollback.reserved_credits);
+    queue_credit_copy.rollback(runtime_mod.Testing.admissionState(runtime));
+    try std.testing.expectEqual(
+        queue_rollback,
+        admission.IngressAdmission.Testing.fingerprint(runtime_mod.Testing.admissionState(runtime)),
     );
 
     const after_queue_full = runtime_mod.Testing.admit(runtime, address, 0);
@@ -2256,11 +2265,13 @@ test "malformed inbound packet rolls back tentative expected credit" {
         else => return error.QueueFullDidNotRestoreCredit,
     };
     defer oversized_credit.rollback(runtime_mod.Testing.admissionState(runtime));
+    var oversized_credit_copy = oversized_credit;
     const oversized = [_]u8{0xff} ** (packet.MAX_PACKET_SIZE + 1);
     try std.testing.expectError(
         error.PacketTooLarge,
         runtime_mod.Testing.handleInbound(runtime, address, &oversized, oversized_credit.move()),
     );
+    oversized_credit_copy.rollback(runtime_mod.Testing.admissionState(runtime));
 
     const after_oversized = runtime_mod.Testing.admit(runtime, address, 0);
     var malformed_credit = switch (after_oversized) {
@@ -2268,7 +2279,9 @@ test "malformed inbound packet rolls back tentative expected credit" {
         else => return error.OversizedPacketDidNotRestoreCredit,
     };
     defer malformed_credit.rollback(runtime_mod.Testing.admissionState(runtime));
+    var malformed_credit_copy = malformed_credit;
     try runtime_mod.Testing.handleInbound(runtime, address, &.{0xff}, malformed_credit.move());
+    malformed_credit_copy.rollback(runtime_mod.Testing.admissionState(runtime));
 
     const retried = runtime_mod.Testing.admit(runtime, address, 0);
     var restored = switch (retried) {
@@ -2304,9 +2317,11 @@ test "shutdown drain rolls back queued expected credit without processing packet
         else => return error.MissingExpectedCredit,
     };
     defer credit.rollback(runtime_mod.Testing.admissionState(runtime));
+    var copied_credit = credit;
     try runtime_mod.Testing.enqueueInbound(runtime, address, &.{0xff}, credit.move());
 
     runtime_mod.Testing.closeCommandsAndDrain(runtime);
+    copied_credit.rollback(runtime_mod.Testing.admissionState(runtime));
     try std.testing.expectEqual(
         @as(u64, 0),
         runtime_mod.Testing.admissionState(runtime).snapshot().processed_total,
