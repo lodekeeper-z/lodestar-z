@@ -243,8 +243,11 @@ test "copied request handshake sent completion publishes metric and candidate on
     }, null);
     harness.actor.handlePacket(harness.env(), challenge, endpoint.addr);
     const effect = harness.effects.pop() orelse return error.MissingHandshakeEffect;
-    const copied = effect;
     try std.testing.expect(effect == .handshake);
+    const copied = actor_mod.ActorEffect{ .handshake = .{
+        .handle = effect.handshake.handle,
+        .packet = try .init(effect.handshake.packet.slice()),
+    } };
     const handle = effect.handshake.handle.request;
     try std.testing.expectEqual(@as(u64, 1), harness.actor.metrics.sent_message_count[metrics.MessageType.talkreq.index()]);
 
@@ -2808,8 +2811,11 @@ test "response WHOAREYOU handshake generation exhaustion preflights before credi
     response_env.response_nonce = exhausted_nonce;
     try actor.sendTalkResponse(response_env, endpoint, try message.ReqId.fromSlice(&.{0xf6}), "exhausted response");
     const response_effect = harness.effects.pop() orelse return error.MissingResponseEffect;
-    const copied_response_effect = response_effect;
     try std.testing.expect(response_effect == .response);
+    const copied_response_effect = actor_mod.ActorEffect{ .response = .{
+        .handle = response_effect.response.handle,
+        .packet = try .init(response_effect.response.packet.slice()),
+    } };
     try harness.recording.sender().send(response_effect.destination(), response_effect.packetBytes());
     actor.applyEffectCompletion(harness.env(), response_effect, .sent);
     const recovery = actor.responses.challenge(endpoint.addr, &exhausted_nonce, now_ns, &harness.ingress) orelse return error.MissingRecovery;
