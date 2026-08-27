@@ -102,9 +102,9 @@ Runtime delivers command | packet | maintenance | completion
 `ActorEffect` has five canonical variants:
 
 - `request`: request handle plus packet for PING, FINDNODE, TALKREQ, health, eviction, lookup, ENR refresh, and queued-redrain requests;
-- `response`: PONG, NODES, and TALKRESP plus the moved response-recovery permit;
+- `response`: an exact response handle plus packet for PONG, NODES, and TALKRESP; `ResponseBook` already owns the response permit and recovery material before this effect is published;
 - `retry`: retained probes and fresh retry transitions plus any replacement permit;
-- `handshake`: request/response challenge source, candidate keys, packet, and completion clocks;
+- `handshake`: request-source handshakes still carry their prepared source, candidate keys, clocks, plaintext, and packet; response-source handshakes carry only an exact response/handshake handle plus packet while `ResponseBook` owns their keys, plaintext, permit, and candidate transition;
 - `whoareyou`: replay-only or fresh challenge state plus its moved challenge permit.
 
 ### Final measured ownership delta
@@ -118,18 +118,19 @@ Runtime delivers command | packet | maintenance | completion
 | Ordered Actor effect queues | request-only | 1 queue for every datagram effect |
 | Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
 | Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
-| DiscV5 tests after migration | 307 | 313 |
-| Bounded effect size | request effect within four packet budgets | full `ActorEffect` union within four packet budgets |
+| DiscV5 tests after migration | 307 | 383 after response-ledger canonicalization |
+| Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 4,080 bytes; compact response effects are 1,376 and 1,384 bytes, with a final `<= 1,536` union ceiling required after the remaining legacy variants are compacted |
 
 ### Canonical completion ownership
 
 - **Request `.sent`:** activate the exact `RequestBook` sending generation, record metrics, schedule health work, and emit at most one stable-session FIFO continuation.
 - **Request `.failed`:** abort the exact sending generation, release its permit and indexes, and resolve health, eviction, or lookup ownership exactly once.
-- **Response `.sent`:** move the recovery permit into `ResponseBook`; failure releases it.
+- **Response `.sent`:** advance only the exact `ResponseBook` generation from `.sending_response` to `.recoverable`; failure or `runtime_stopped` removes that exact generation and releases its canonical permit.
 - **Retry `.sent`:** commit retry deadline/state/permit swap; failure preserves old active state, releases any replacement permit, and advances the retry deadline.
-- **Handshake `.sent`:** commit request pending keys or response candidate keys; failure leaves the challenged state unchanged.
+- **Request-source handshake `.sent`:** commit the prepared request challenge and candidate keys; failure leaves the challenged request state unchanged.
+- **Response-source handshake `.sent`:** advance only the exact response and handshake generations to a candidate and release the canonical response permit; failure or `runtime_stopped` removes that exact sending phase and releases the permit without creating a candidate.
 - **Fresh WHOAREYOU `.sent`:** install challenge state and moved permit; failure releases it. Replay has no domain mutation.
-- **`runtime_stopped`:** Runtime synthesizes completion for every queued effect before Actor terminalization; lookup work terminates as `runtime_stopped` rather than ordinary failure/repump.
+- **`runtime_stopped`:** Runtime first synthesizes exact completion for every queued effect, then sweeps residual response phases, lookups, and requests before closing result/event planes; lookup work terminates as `runtime_stopped` rather than ordinary failure/repump.
 
 ### Ordering, bounds, and late completion policy
 
@@ -138,13 +139,16 @@ Runtime delivers command | packet | maintenance | completion
 - Request effects are bounded by canonical sending entries, which share the active-request capacity `A`. An atomic authenticated FINDNODE turn is bounded by `M` response chunks plus one eviction probe, while all permit-bearing effects are also bounded by `P`.
 - Runtime pops before applying completion and drains before the next command, so the request and atomic-ingress bounds are alternatives rather than additive queue residents. No per-effect allocation occurs.
 - Queue redrain emits one head. `.sent` removes that head and may emit exactly the next head only under a stable session.
-- Runtime execution is deliberately synchronous in the actor-loop task, but copied, stale, delayed, or reordered completions remain harmless because the `RequestHandle` key and generation jointly identify ownership. Generations are checked, never wrapped, and exhausted rather than reused.
-- Cancellation during send maps to `runtime_stopped`; ordinary transport failure maps to `failed`; all remaining queued values are synthesized as `runtime_stopped` during terminalization.
+- Runtime execution is deliberately synchronous in the actor-loop task, but copied, stale, delayed, or reordered completions remain harmless because each migrated family uses its canonical semantic handle: request key plus request generation, or response endpoint plus nonce plus response generation and handshake send generation. Generations are checked, never wrapped, and exhausted rather than reused.
+- Cancellation during send maps to `runtime_stopped`; ordinary transport failure maps to `failed`; all remaining queued values are synthesized as `runtime_stopped` during terminalization. Runtime then sweeps residual canonical response phases, making copied post-shutdown response completions no-ops.
 
 ## Remaining ownership work
 
-The outbound transport redesign is complete. Remaining concerns are separate domains rather than compatibility-executor debt:
+The Runtime-only transport executor and single FIFO are complete. Canonical effect ownership is staged by effect family:
 
+- Retry effects still carry retained/fresh transition state and a replacement permit; they need generation-addressed retry send state before the final compact-union gate.
+- Request-source handshake effects still carry prepared request source, candidate keys, clocks, plaintext, and packet; response-source handshakes are already compact and canonical in `ResponseBook`.
+- Fresh WHOAREYOU effects still carry challenge state and a permit; replay remains mutation-free.
 - Reliable result reservation is represented by Runtime outbox reservation state and `RequestOrigin.reliable_api`; a future consume-and-resolve result capability may consolidate that representation.
 - Peer/contact/routing canonicalization is independent of transport execution ownership.
-- If Runtime transport is later made concurrent or detached, the existing request generation identity remains the ownership boundary; any additional registry must preserve exact-handle completion and exhaustion semantics.
+- If Runtime transport is later made concurrent or detached, every effect family must retain its exact canonical handle and exhaustion semantics; synchronous execution is not an ownership shortcut.
