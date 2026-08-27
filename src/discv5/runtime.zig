@@ -372,6 +372,10 @@ const RuntimeImpl = struct {
         if (self.terminalized.swap(true, .acq_rel)) return;
         self.abortEffects();
         const env = self.actorEnv();
+        // Effect aborts consume exact queued response generations first. Sweep
+        // residual phases only afterward so permits are released exactly once
+        // and any copied late completion is stale.
+        self.actor.finishAllResponses(&self.admission);
         self.actor.finishAllLookups(env, .runtime_stopped);
         self.actor.finishAllRequests(env);
         self.request_result_outbox.close();
@@ -929,11 +933,13 @@ fn sendTalkResponseResult(actor: *actor_mod.Actor, env: actor_mod.Env, endpoint:
         // beyond its packet-sized scratch buffer before the packet preflight.
         error.BufferTooSmall => error.MessageTooLarge,
         error.EndpointMismatch => error.EndpointMismatch,
+        error.GenerationExhausted => error.GenerationExhausted,
         error.MessageTooLarge => error.MessageTooLarge,
         error.NoSession => error.NoSession,
         error.NonceGenerationExhausted => error.NonceGenerationExhausted,
         error.OutOfMemory => error.OutOfMemory,
         error.PermitGenerationExhausted => error.PermitGenerationExhausted,
+        error.TooManyActiveRequests, error.TooManyResponseRecoveries => error.TooManyActiveRequests,
         error.UnknownPeer => error.UnknownPeer,
         else => unreachable,
     };

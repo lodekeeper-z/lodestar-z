@@ -114,16 +114,16 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket, a
     }
 
     if (actor.responses.candidate(endpoint, now_ns)) |candidate| {
-        if (decryptParsedMessage(parsed, &candidate.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
+        if (decryptParsedMessage(parsed, &candidate.keys.recipient_key, &plaintext_buffer, &ad_buffer)) |plaintext| {
             var authenticated_message: AuthenticatedMessage = undefined;
             if (!decodeAuthenticated(&authenticated_message, endpoint, plaintext, null)) return;
             if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
             var accepted = session_book.StableSession{
-                .initiator_key = candidate.initiator_key,
-                .recipient_key = candidate.recipient_key,
+                .initiator_key = candidate.keys.initiator_key,
+                .recipient_key = candidate.keys.recipient_key,
             };
             std.debug.assert(accepted.seen_nonces.insert(&parsed.static_header.nonce));
-            std.debug.assert(actor.responses.removeCandidate(endpoint));
+            if (!actor.responses.acceptCandidate(candidate)) return;
             actor.sessions.put(endpoint, accepted, now_ns);
             authenticated(actor, env, &authenticated_message);
             return;
@@ -187,7 +187,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
             .plaintext = preparation.recovery.plaintext,
         },
         .response => |view| .{
-            .endpoint = view.endpoint,
+            .endpoint = view.handle.endpoint,
             .dest_pubkey = view.dest_pubkey,
             .plaintext = types.PacketBytes.init(view.plaintext.slice()) catch unreachable,
         },
@@ -239,18 +239,35 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
         failRequestRecovery(actor, env, source, .packet_too_large);
         return;
     };
-    const effect = actor_mod.ActorEffect{ .handshake = .{
-        .destination = from,
-        .packet = types.PacketBytes.init(datagram) catch return,
-        .source = source,
-        .initiator_key = keys.initiator_key,
-        .recipient_key = keys.recipient_key,
-        .deadline_ns = outbound.deadlineNs(now_ns, actor.request_timeout_ms),
-        .prepared_at_ns = now_ns,
-        .plaintext = recovery.plaintext,
-    } };
+    const retained_datagram = types.PacketBytes.init(datagram) catch return;
+    const effect: actor_mod.ActorEffect = switch (source) {
+        .request => |preparation| .{ .handshake = .{ .request = .{
+            .destination = from,
+            .packet = retained_datagram,
+            .source = preparation,
+            .initiator_key = keys.initiator_key,
+            .recipient_key = keys.recipient_key,
+            .deadline_ns = outbound.deadlineNs(now_ns, actor.request_timeout_ms),
+            .prepared_at_ns = now_ns,
+            .plaintext = recovery.plaintext,
+        } } },
+        .response => |view| blk: {
+            const handle = actor.responses.beginHandshake(view, .{
+                .initiator_key = keys.initiator_key,
+                .recipient_key = keys.recipient_key,
+            }, now_ns) catch return;
+            response_recovery_transferred = true;
+            break :blk .{ .handshake = .{ .response = .{
+                .handle = handle,
+                .packet = retained_datagram,
+            } } };
+        },
+    };
     const effects = env.effects orelse unreachable;
-    effects.push(effect) catch return;
+    effects.push(effect) catch {
+        actor.applyEffectCompletion(env, effect, .failed);
+        return;
+    };
     response_recovery_transferred = true;
 }
 

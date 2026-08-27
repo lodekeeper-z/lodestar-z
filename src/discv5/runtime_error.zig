@@ -87,6 +87,7 @@ pub const TalkRequestError = RequestError || error{MessageTooLarge};
 
 pub const TalkResponseError = CommandError || error{
     EndpointMismatch,
+    GenerationExhausted,
     InvalidRequestId,
     MessageTooLarge,
     NoSession,
@@ -94,6 +95,7 @@ pub const TalkResponseError = CommandError || error{
     NonceGenerationExhausted,
     OutOfMemory,
     PermitGenerationExhausted,
+    TooManyActiveRequests,
     TransportSendFailed,
     UnknownPeer,
 };

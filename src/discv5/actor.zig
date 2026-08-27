@@ -105,9 +105,9 @@ pub const ActorEffect = union(enum) {
     pub fn destination(self: *const ActorEffect) types.Address {
         return switch (self.*) {
             .request => |*effect| effect.destination(),
-            .response => |*effect| effect.endpoint.addr,
+            .response => |*effect| effect.handle.endpoint.addr,
             .retry => |*effect| effect.destination(),
-            .handshake => |*effect| effect.destination,
+            .handshake => |*effect| effect.destination(),
             .whoareyou => |*effect| effect.destination(),
         };
     }
@@ -117,7 +117,7 @@ pub const ActorEffect = union(enum) {
             .request => |*effect| effect.packetBytes(),
             .response => |*effect| effect.packet.slice(),
             .retry => |*effect| effect.packetBytes(),
-            .handshake => |*effect| effect.packet.slice(),
+            .handshake => |*effect| effect.packetBytes(),
             .whoareyou => |*effect| effect.packetBytes(),
         };
     }
@@ -128,30 +128,16 @@ pub const ActorEffect = union(enum) {
             .response, .retry, .handshake, .whoareyou => unreachable,
         };
     }
-
-    pub fn abortPreparation(self: ActorEffect, requests: *request_book.RequestBook, ingress: *admission.IngressAdmission) void {
-        switch (self) {
-            .request => |effect| _ = requests.abortSending(effect.handle, ingress),
-            .response => |effect| {
-                var permit = effect.admission;
-                permit.release(ingress);
-            },
-            .retry => |effect| effect.abortPreparation(ingress),
-            .handshake => {},
-            .whoareyou => |effect| effect.abortPreparation(ingress),
-        }
-    }
 };
 
-pub const ResponseSendEffect = struct {
-    endpoint: types.Endpoint,
-    nonce: [packet.NONCE_SIZE]u8,
-    dest_pubkey: [33]u8,
-    plaintext: types.RecoverablePlaintext,
-    packet: types.PacketBytes,
-    admission: admission.AdmissionPermit,
-    prepared_at_ns: i64,
-};
+pub fn CompactSendEffect(comptime Handle: type) type {
+    return struct {
+        handle: Handle,
+        packet: types.PacketBytes,
+    };
+}
+
+pub const ResponseSendEffect = CompactSendEffect(response_book.ResponseHandle);
 
 pub const RetrySendEffect = union(enum) {
     retained: struct {
@@ -199,15 +185,58 @@ pub const WhoareyouSource = union(enum) {
     response: response_book.ChallengeView,
 };
 
-pub const HandshakeSendEffect = struct {
+pub const RequestHandshakeSendEffect = struct {
     destination: types.Address,
     packet: types.PacketBytes,
-    source: WhoareyouSource,
+    source: request_book.ChallengePreparation,
     initiator_key: [16]u8,
     recipient_key: [16]u8,
     deadline_ns: i64,
     prepared_at_ns: i64,
     plaintext: types.PacketBytes,
+};
+
+pub const ResponseHandshakeSendEffect = CompactSendEffect(response_book.HandshakeHandle);
+
+comptime {
+    if (@typeInfo(ResponseSendEffect).@"struct".fields.len != 2 or
+        !@hasField(ResponseSendEffect, "handle") or
+        !@hasField(ResponseSendEffect, "packet") or
+        @sizeOf(ResponseSendEffect) > 1_384)
+    {
+        @compileError("response effect must remain handle plus packet bytes within 1384 bytes");
+    }
+    if (@typeInfo(ResponseHandshakeSendEffect).@"struct".fields.len != 2 or
+        !@hasField(ResponseHandshakeSendEffect, "handle") or
+        !@hasField(ResponseHandshakeSendEffect, "packet") or
+        @sizeOf(ResponseHandshakeSendEffect) > 1_400)
+    {
+        @compileError("response-source handshake effect must remain handle plus packet bytes within 1400 bytes");
+    }
+    for (.{ "admission", "plaintext", "key", "keys", "deadline_ns", "source", "dest_pubkey", "remote_enr" }) |field| {
+        if (@hasField(ResponseSendEffect, field) or @hasField(ResponseHandshakeSendEffect, field)) {
+            @compileError("compact response effects may not regain canonical response ownership");
+        }
+    }
+}
+
+pub const HandshakeSendEffect = union(enum) {
+    request: RequestHandshakeSendEffect,
+    response: ResponseHandshakeSendEffect,
+
+    pub fn destination(self: *const HandshakeSendEffect) types.Address {
+        return switch (self.*) {
+            .request => |*value| value.destination,
+            .response => |*value| value.handle.response.endpoint.addr,
+        };
+    }
+
+    pub fn packetBytes(self: *const HandshakeSendEffect) []const u8 {
+        return switch (self.*) {
+            .request => |*value| value.packet.slice(),
+            .response => |*value| value.packet.slice(),
+        };
+    }
 };
 
 pub const WhoareyouSendEffect = union(enum) {
@@ -415,18 +444,15 @@ pub const Actor = struct {
         switch (effect) {
             .request => |request| self.applySendCompletion(env, request, completion_event),
             .response => |response| {
-                var permit = response.admission;
+                if (!self.responses.completeResponseSend(response.handle, switch (completion_event) {
+                    .sent => .sent,
+                    .failed => .failed,
+                    .runtime_stopped => .runtime_stopped,
+                }, env.ingress)) return;
                 if (completion_event == .sent) {
-                    self.responses.put(.{
-                        .endpoint = response.endpoint,
-                        .nonce = response.nonce,
-                        .dest_pubkey = response.dest_pubkey,
-                        .plaintext = response.plaintext,
-                        .admission = permit.move(),
-                    }, response.prepared_at_ns, env.ingress);
-                    outbound.noteSent(self, response.plaintext.slice());
-                } else {
-                    permit.release(env.ingress);
+                    const nonce = response.handle.nonce;
+                    const view = self.responses.challenge(response.handle.endpoint.addr, &nonce, outbound.nowNs(env.io), env.ingress) orelse return;
+                    outbound.noteSent(self, view.plaintext.slice());
                 }
             },
             .retry => |retry| switch (retry) {
@@ -451,25 +477,24 @@ pub const Actor = struct {
                     }
                 },
             },
-            .handshake => |handshake_effect| {
-                if (completion_event != .sent) {
-                    switch (handshake_effect.source) {
-                        .request => {},
-                        .response => |view| _ = self.responses.failRecovery(view, env.ingress),
-                    }
-                    return;
-                }
-                switch (handshake_effect.source) {
-                    .request => |preparation| self.requests.commitChallenge(preparation, .{
-                        .initiator_key = handshake_effect.initiator_key,
-                        .recipient_key = handshake_effect.recipient_key,
-                    }, handshake_effect.deadline_ns),
-                    .response => |view| if (!self.responses.commitCandidate(view, .{
-                        .initiator_key = handshake_effect.initiator_key,
-                        .recipient_key = handshake_effect.recipient_key,
-                    }, handshake_effect.prepared_at_ns, env.ingress)) return,
-                }
-                outbound.noteSent(self, handshake_effect.plaintext.slice());
+            .handshake => |handshake_effect| switch (handshake_effect) {
+                .request => |value| {
+                    if (completion_event != .sent) return;
+                    self.requests.commitChallenge(value.source, .{
+                        .initiator_key = value.initiator_key,
+                        .recipient_key = value.recipient_key,
+                    }, value.deadline_ns);
+                    outbound.noteSent(self, value.plaintext.slice());
+                },
+                .response => |value| {
+                    const plaintext = self.responses.handshakePlaintext(value.handle) orelse return;
+                    if (!self.responses.completeHandshake(value.handle, switch (completion_event) {
+                        .sent => .sent,
+                        .failed => .failed,
+                        .runtime_stopped => .runtime_stopped,
+                    }, env.ingress)) return;
+                    if (completion_event == .sent) outbound.noteSent(self, plaintext.slice());
+                },
             },
             .whoareyou => |whoareyou| switch (whoareyou) {
                 .replay => {},
@@ -864,6 +889,10 @@ pub const Actor = struct {
             .kind = kind,
             .terminal = terminal,
         });
+    }
+
+    pub fn finishAllResponses(self: *Actor, ingress: *admission.IngressAdmission) void {
+        self.responses.clear(ingress);
     }
 
     pub fn finishAllRequests(self: *Actor, env: Env) void {
@@ -1300,6 +1329,20 @@ fn isLookupBackpressure(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "discv5 actor: compact response effect layouts stay packet sized" {
+    try std.testing.expect(@sizeOf(ResponseSendEffect) <= 1_384);
+    try std.testing.expect(@sizeOf(ResponseHandshakeSendEffect) <= 1_400);
+    try std.testing.expect(@hasField(RequestHandshakeSendEffect, "source"));
+    try std.testing.expect(@hasField(RequestHandshakeSendEffect, "plaintext"));
+    std.debug.print("RESPONSE_EFFECT_LAYOUT response={d} response_handshake={d} request_handshake={d} handshake_union={d} actor_effect={d}\n", .{
+        @sizeOf(ResponseSendEffect),
+        @sizeOf(ResponseHandshakeSendEffect),
+        @sizeOf(RequestHandshakeSendEffect),
+        @sizeOf(HandshakeSendEffect),
+        @sizeOf(ActorEffect),
+    });
 }
 
 test "discv5 actor: local node ID is derived from the configured key pair" {

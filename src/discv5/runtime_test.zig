@@ -208,6 +208,37 @@ test "Runtime effect FIFO follows the bounded production burst" {
     try std.testing.expectEqual(@as(usize, 8), runtime_mod.Testing.effectCapacity(request_limited));
 }
 
+test "Runtime shutdown drains queued response completion then sweeps every residual response phase" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const runtime = try initTestRuntime(io, alloc, 0xd1, .{
+        .response_recovery_capacity = 3,
+        .event_capacity = 1,
+        .command_capacity = 1,
+    }, .{});
+    defer runtime.deinit();
+
+    const fixture = try runtime_mod.Testing.seedResponseShutdownFixture(runtime);
+    const before = runtime_mod.Testing.responseShutdownState(runtime, &fixture);
+    try std.testing.expectEqual(@as(usize, 4), before.responses);
+    try std.testing.expectEqual(@as(usize, 3), before.permits);
+    try std.testing.expectEqual(@as(usize, 1), before.effects);
+    try std.testing.expect(before.stable_unchanged);
+
+    runtime.stop();
+    const stopped = runtime_mod.Testing.responseShutdownState(runtime, &fixture);
+    try std.testing.expectEqual(@as(usize, 0), stopped.responses);
+    try std.testing.expectEqual(@as(usize, 0), stopped.permits);
+    try std.testing.expectEqual(@as(usize, 0), stopped.effects);
+    try std.testing.expect(stopped.stable_unchanged);
+
+    runtime_mod.Testing.applyCopiedResponseCompletion(runtime, &fixture);
+    const stale = runtime_mod.Testing.responseShutdownState(runtime, &fixture);
+    try std.testing.expectEqual(@as(usize, 0), stale.responses);
+    try std.testing.expectEqual(@as(usize, 0), stale.permits);
+    try std.testing.expect(stale.stable_unchanged);
+}
+
 fn awaitRequestResult(io: std.Io, runtime: *runtime_mod.Runtime) !runtime_mod.RequestResult {
     for (0..2_000) |_| {
         if (runtime.popRequestResult()) |result| return result;

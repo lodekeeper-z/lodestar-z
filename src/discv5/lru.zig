@@ -67,6 +67,20 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             return self.nodes.len;
         }
 
+        pub const Testing = if (@import("builtin").is_test) struct {
+            pub fn nodeSize() usize {
+                return @sizeOf(Node);
+            }
+
+            pub fn nodeBackingBytes(self: *const Self) usize {
+                return self.nodes.len * @sizeOf(Node);
+            }
+
+            pub fn mapCapacity(self: *const Self) usize {
+                return self.map.capacity();
+            }
+        } else struct {};
+
         /// Test whether storage contains a key without changing TTL or recency.
         pub fn contains(self: *const Self, key: K) bool {
             return self.map.contains(key);
@@ -106,6 +120,13 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
         /// Read a value without applying TTL policy. Exact terminal cleanup uses
         /// this only to compare ownership before removing an already-matched entry.
         pub fn peekPtrRaw(self: *const Self, key: K) ?*const V {
+            const index = self.map.get(key) orelse return null;
+            return &self.nodes[index].value;
+        }
+
+        /// Mutate a value without applying TTL or recency policy. Callers must
+        /// preserve the key and ownership invariants encoded by the cache.
+        pub fn getPtrRaw(self: *Self, key: K) ?*V {
             const index = self.map.get(key) orelse return null;
             return &self.nodes[index].value;
         }
@@ -206,6 +227,23 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             const index = self.tail orelse return null;
             if (!self.isExpired(index, now_ns)) return null;
             return self.popLruMove();
+        }
+
+        /// Remove the least-recent value accepted by `predicate`. The scan is
+        /// bounded by physical cache capacity.
+        pub fn popLruWhereMove(self: *Self, predicate: anytype) ?Entry {
+            var current = self.tail;
+            var scanned: usize = 0;
+            while (current) |index| : (scanned += 1) {
+                std.debug.assert(scanned < self.nodes.len);
+                if (predicate.accepts(&self.nodes[index].value)) {
+                    const entry = Entry{ .key = self.nodes[index].key, .value = self.nodes[index].value };
+                    self.removeIndex(index);
+                    return entry;
+                }
+                current = self.nodes[index].prev;
+            }
+            return null;
         }
 
         pub fn pruneExpired(self: *Self, now_ns: i64) void {

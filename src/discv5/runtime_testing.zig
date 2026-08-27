@@ -3,6 +3,8 @@ const admission = @import("admission.zig");
 const actor_mod = @import("actor.zig");
 const message = @import("protocol/message.zig");
 const public_api = @import("public_api.zig");
+const response_book = @import("state/response_book.zig");
+const session_book = @import("state/session_book.zig");
 const runtime_error = @import("runtime_error.zig");
 const transport = @import("transport.zig");
 const types = @import("types.zig");
@@ -159,6 +161,79 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
             return impl(runtime).effects.count();
         }
 
+        pub const ResponseShutdownFixture = struct {
+            copied_effect: actor_mod.ActorEffect,
+            stable_endpoint: types.Endpoint,
+            stable: session_book.StableSession,
+        };
+
+        pub fn seedResponseShutdownFixture(runtime: *Runtime) !ResponseShutdownFixture {
+            const storage = impl(runtime);
+            const stable_endpoint = testEndpoint(0xe0);
+            const stable = session_book.StableSession{
+                .initiator_key = [_]u8{0xa1} ** 16,
+                .recipient_key = [_]u8{0xa2} ** 16,
+            };
+            storage.actor.sessions.put(stable_endpoint, stable, 0);
+
+            const sending = try beginResponse(storage, 0xe1);
+            const copied_effect = actor_mod.ActorEffect{ .response = .{
+                .handle = sending,
+                .packet = try .init(&.{}),
+            } };
+            try storage.effects.push(copied_effect);
+
+            const recoverable = try beginResponse(storage, 0xe2);
+            std.debug.assert(storage.actor.responses.completeResponseSend(recoverable, .sent, &storage.admission));
+
+            const handshaking = try beginResponse(storage, 0xe3);
+            std.debug.assert(storage.actor.responses.completeResponseSend(handshaking, .sent, &storage.admission));
+            const handshake_nonce = handshaking.nonce;
+            const challenge = storage.actor.responses.challenge(handshaking.endpoint.addr, &handshake_nonce, 0, &storage.admission) orelse unreachable;
+            _ = try storage.actor.responses.beginHandshake(challenge, .{
+                .initiator_key = [_]u8{0xb1} ** 16,
+                .recipient_key = [_]u8{0xb2} ** 16,
+            }, 0);
+
+            response_book.ResponseBook.Testing.putCandidate(&storage.actor.responses, testEndpoint(0xe4), .{
+                .initiator_key = [_]u8{0xc1} ** 16,
+                .recipient_key = [_]u8{0xc2} ** 16,
+            }, 0);
+            return .{ .copied_effect = copied_effect, .stable_endpoint = stable_endpoint, .stable = stable };
+        }
+
+        pub fn responseShutdownState(runtime: *Runtime, fixture: *const ResponseShutdownFixture) struct {
+            responses: usize,
+            permits: usize,
+            effects: usize,
+            stable_unchanged: bool,
+        } {
+            const storage = impl(runtime);
+            const stable = storage.actor.sessions.get(fixture.stable_endpoint, 0);
+            return .{
+                .responses = storage.actor.responses.count(),
+                .permits = storage.admission.permitCount(),
+                .effects = storage.effects.count(),
+                .stable_unchanged = if (stable) |value|
+                    std.meta.eql(value.initiator_key, fixture.stable.initiator_key) and
+                        std.meta.eql(value.recipient_key, fixture.stable.recipient_key)
+                else
+                    false,
+            };
+        }
+
+        pub fn applyCopiedResponseCompletion(runtime: *Runtime, fixture: *const ResponseShutdownFixture) void {
+            const storage = impl(runtime);
+            storage.actor.applyEffectCompletion(.{
+                .io = storage.io,
+                .ingress = &storage.admission,
+                .outbox = &storage.outbox,
+                .effects = &storage.effects,
+                .lookup_results = &storage.lookup_result_outbox,
+                .request_results = &storage.request_result_outbox,
+            }, fixture.copied_effect, .sent);
+        }
+
         pub const ActiveRequestEvidence = struct {
             endpoint: types.Endpoint,
             dest_pubkey: [33]u8,
@@ -240,6 +315,25 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
 
         pub fn receiveBackoff(consecutive_errors: u8) u64 {
             return receive_backoff(consecutive_errors);
+        }
+
+        fn beginResponse(storage: *RuntimeImpl, byte: u8) !response_book.ResponseHandle {
+            const endpoint = testEndpoint(byte);
+            var permit = try storage.admission.acquire(endpoint.addr, admission.RESPONSE_RECOVERY_PACKET_BUDGET);
+            errdefer permit.release(&storage.admission);
+            return storage.actor.responses.beginResponse(.{
+                .endpoint = endpoint,
+                .nonce = [_]u8{byte} ** 12,
+                .dest_pubkey = [_]u8{byte} ** 33,
+                .plaintext = try .init(&.{message.MSG_TALKRESP}),
+            }, &permit, 0);
+        }
+
+        fn testEndpoint(byte: u8) types.Endpoint {
+            return .{
+                .node_id = [_]u8{byte} ** 32,
+                .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 1, byte }, .port = 9_000 + @as(u16, byte) } },
+            };
         }
 
         fn impl(runtime: *Runtime) *RuntimeImpl {

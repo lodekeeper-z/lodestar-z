@@ -137,19 +137,22 @@ pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext
         if (!actor.requests.hasChallenge(&encoded.nonce, endpoint.addr) and
             !actor.responses.hasLive(endpoint.addr, &encoded.nonce, now_ns)) break;
     } else return error.NonceGenerationExhausted;
+    const send_packet = try types.PacketBytes.init(encoded.bytes);
     var permit = try env.ingress.acquire(endpoint.addr, @import("../admission.zig").RESPONSE_RECOVERY_PACKET_BUDGET);
-    const effect = actor_mod.ActorEffect{ .response = .{
+    errdefer permit.release(env.ingress);
+    const handle = try actor.responses.beginResponse(.{
         .endpoint = endpoint,
         .nonce = encoded.nonce,
         .dest_pubkey = known.pubkey,
         .plaintext = retained_plaintext,
-        .packet = try .init(encoded.bytes),
-        .admission = permit.move(),
-        .prepared_at_ns = now_ns,
+    }, &permit, now_ns);
+    const effect = actor_mod.ActorEffect{ .response = .{
+        .handle = handle,
+        .packet = send_packet,
     } };
     const effects = env.effects orelse unreachable;
     effects.push(effect) catch {
-        effect.abortPreparation(&actor.requests, env.ingress);
+        actor.applyEffectCompletion(env, effect, .failed);
         return error.TooManyActiveRequests;
     };
 }
