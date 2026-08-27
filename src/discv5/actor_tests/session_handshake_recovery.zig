@@ -12,6 +12,7 @@ const request_results = @import("../request_results.zig");
 const metrics = @import("../metrics.zig");
 const secp = @import("../secp256k1.zig");
 const peer_store = @import("../state/peer_store.zig");
+const request_book = @import("../state/request_book.zig");
 const session_book = @import("../state/session_book.zig");
 const types = @import("../types.zig");
 const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
@@ -202,6 +203,107 @@ test "smaller sessionless TALKREQ still recovers with one handshake packet" {
     try std.testing.expect(harness.actor.cancelRequest(harness.env(), req_id));
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
     harness.actor.requests.assertInvariants();
+}
+
+test "copied request handshake sent completion publishes metric and candidate once" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xb1} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xb2} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 52 }, .port = 9252 } },
+    };
+    var harness = try ActorHarness.init(alloc, io, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 1, .command_capacity = 1 },
+    });
+    defer harness.deinit();
+    const request = try actor_mod.Testing.sendTalkRequestResolvedForTest(&harness.actor, harness.env(), endpoint, &remote_pubkey, "utp", "copied completion");
+    try harness.drainEffects();
+    var initial = harness.recording.datagrams.items[0].bytes;
+    const request_nonce = (try packet.decode(initial.bytes[0..initial.len], &remote_id)).static_header.nonce;
+    var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
+        .masking_iv = &([_]u8{0xb3} ** 16),
+        .recipient_node_id = &local_id,
+        .request_nonce = &request_nonce,
+        .id_nonce = &([_]u8{0xb4} ** 16),
+        .enr_seq = 0,
+    }, null);
+    harness.actor.handlePacket(harness.env(), challenge, endpoint.addr);
+    const effect = harness.effects.pop() orelse return error.MissingHandshakeEffect;
+    const copied = effect;
+    try std.testing.expect(effect == .handshake);
+    const handle = effect.handshake.handle.request;
+    try std.testing.expectEqual(@as(u64, 1), harness.actor.metrics.sent_message_count[metrics.MessageType.talkreq.index()]);
+
+    harness.actor.applyEffectCompletion(harness.env(), effect, .sent);
+    const candidate = harness.actor.requests.pendingKeys(endpoint) orelse return error.MissingPendingKeys;
+    try std.testing.expectEqual(handle, candidate.handle);
+    try std.testing.expectEqual(@as(u64, 2), harness.actor.metrics.sent_message_count[metrics.MessageType.talkreq.index()]);
+    harness.actor.applyEffectCompletion(harness.env(), copied, .sent);
+    try std.testing.expectEqual(handle, (harness.actor.requests.pendingKeys(endpoint) orelse return error.CandidateReplaced).handle);
+    try std.testing.expectEqual(@as(u64, 2), harness.actor.metrics.sent_message_count[metrics.MessageType.talkreq.index()]);
+    try std.testing.expect(harness.actor.cancelRequest(harness.env(), request));
+
+    const rejected_request = try actor_mod.Testing.sendTalkRequestResolvedForTest(&harness.actor, harness.env(), endpoint, &remote_pubkey, "utp", "fifo rejection");
+    try harness.drainEffects();
+    var rejected_initial = harness.recording.datagrams.items[harness.recording.datagrams.items.len - 1].bytes;
+    const rejected_nonce = (try packet.decode(rejected_initial.bytes[0..rejected_initial.len], &remote_id)).static_header.nonce;
+    var rejected_challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const rejected_challenge = try packet.encodeWhoareyouPacketInto(&rejected_challenge_buffer, .{
+        .masking_iv = &([_]u8{0xb5} ** 16),
+        .recipient_node_id = &local_id,
+        .request_nonce = &rejected_nonce,
+        .id_nonce = &([_]u8{0xb6} ** 16),
+        .enr_seq = 0,
+    }, null);
+    var single_storage: [1]actor_mod.ActorEffect = undefined;
+    var full_effects = actor_mod.EffectQueue.init(&single_storage);
+    try full_effects.push(copied);
+    var rejection_env = harness.env();
+    rejection_env.effects = &full_effects;
+    harness.actor.handlePacket(rejection_env, rejected_challenge, endpoint.addr);
+
+    try std.testing.expectEqual(@as(usize, 1), full_effects.count());
+    try std.testing.expect(harness.actor.requests.pendingKeys(endpoint) == null);
+    try std.testing.expect(harness.actor.requests.hasChallenge(&rejected_nonce, endpoint.addr));
+    try std.testing.expect(harness.actor.sessions.get(endpoint, outbound.nowNs(io)) == null);
+    try std.testing.expectEqual(@as(u64, 3), harness.actor.metrics.sent_message_count[metrics.MessageType.talkreq.index()]);
+    const filler = full_effects.pop() orelse return error.MissingFiller;
+    harness.actor.applyEffectCompletion(harness.env(), filler, .sent);
+    try std.testing.expectEqual(@as(u64, 3), harness.actor.metrics.sent_message_count[metrics.MessageType.talkreq.index()]);
+    try std.testing.expect(harness.actor.cancelRequest(harness.env(), rejected_request));
+
+    const exhausted_request = try actor_mod.Testing.sendTalkRequestResolvedForTest(&harness.actor, harness.env(), endpoint, &remote_pubkey, "utp", "generation exhaustion");
+    try harness.drainEffects();
+    var exhausted_initial = harness.recording.datagrams.items[harness.recording.datagrams.items.len - 1].bytes;
+    const exhausted_nonce = (try packet.decode(exhausted_initial.bytes[0..exhausted_initial.len], &remote_id)).static_header.nonce;
+    var exhausted_challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const exhausted_challenge = try packet.encodeWhoareyouPacketInto(&exhausted_challenge_buffer, .{
+        .masking_iv = &([_]u8{0xb7} ** 16),
+        .recipient_node_id = &local_id,
+        .request_nonce = &exhausted_nonce,
+        .id_nonce = &([_]u8{0xb8} ** 16),
+        .enr_seq = 0,
+    }, null);
+    request_book.Testing.exhaustHandshakeGeneration(&harness.actor.requests);
+    const packets_before = harness.recording.datagrams.items.len;
+    const metrics_before = harness.actor.metrics;
+    harness.actor.handlePacket(harness.env(), exhausted_challenge, endpoint.addr);
+    try std.testing.expectEqual(@as(usize, 0), harness.effects.count());
+    try std.testing.expectEqual(packets_before, harness.recording.datagrams.items.len);
+    try std.testing.expect(std.meta.eql(metrics_before, harness.actor.metrics));
+    try std.testing.expect(harness.actor.requests.hasChallenge(&exhausted_nonce, endpoint.addr));
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expect(harness.actor.cancelRequest(harness.env(), exhausted_request));
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 }
 
 test "paired Actors retry an established PING with a fresh nonce and complete on the second PONG" {
@@ -1474,6 +1576,86 @@ fn encodeEncryptedPacket(actor: *const actor_mod.Actor, source_id: types.NodeId,
     return types.PacketBytes.init(encoded);
 }
 
+const PendingPromotionReplacement = struct {
+    replacement_keys: request_book.PendingSessionKeys,
+    replacement: ?request_book.PendingKeysView = null,
+
+    fn run(context: *anyopaque, actor: *actor_mod.Actor, stale: request_book.PendingKeysView) void {
+        const self: *PendingPromotionReplacement = @ptrCast(@alignCast(context));
+        self.replacement = request_book.Testing.replacePendingHandshake(&actor.requests, stale, self.replacement_keys) catch unreachable;
+    }
+};
+
+test "authenticated stale request candidate cannot replace stable session or promote newer generation" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0x91} ** 32));
+    const local_id = try enr.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&local_key));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0x92} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 53 }, .port = 9253 } },
+    };
+    var harness = try ActorHarness.init(alloc, io, .{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 4, .command_capacity = 1 },
+    });
+    defer harness.deinit();
+    const actor = &harness.actor;
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, outbound.nowNs(io)));
+    const stable = session_book.StableSession{ .initiator_key = [_]u8{0x93} ** 16, .recipient_key = [_]u8{0x94} ** 16 };
+    actor.sessions.put(endpoint, stable, outbound.nowNs(io));
+    const request = try actor_mod.Testing.sendPingResolvedForTest(actor, harness.env(), endpoint, &remote_pubkey, .api);
+    try harness.drainEffects();
+    var sent = harness.recording.datagrams.items[0].bytes;
+    const request_nonce = (try packet.decode(sent.bytes[0..sent.len], &remote_id)).static_header.nonce;
+    var challenge_buffer: [packet.WHOAREYOU_CHALLENGE_DATA_SIZE]u8 = undefined;
+    const challenge = try packet.encodeWhoareyouPacketInto(&challenge_buffer, .{
+        .masking_iv = &([_]u8{0x95} ** 16),
+        .recipient_node_id = &local_id,
+        .request_nonce = &request_nonce,
+        .id_nonce = &([_]u8{0x96} ** 16),
+        .enr_seq = 0,
+    }, null);
+    actor.handlePacket(harness.env(), challenge, endpoint.addr);
+    harness.drainEffectsIgnoringFailures();
+    const stale = actor.requests.pendingKeys(endpoint) orelse return error.MissingPendingRekey;
+    var replacement = PendingPromotionReplacement{ .replacement_keys = .{
+        .initiator_key = [_]u8{0x97} ** 16,
+        .recipient_key = [_]u8{0x98} ** 16,
+    } };
+    const proof_ping = message.Ping{ .req_id = try message.ReqId.fromSlice(&.{0x99}), .enr_seq = 0 };
+    var proof_buffer: [128]u8 = undefined;
+    var stale_packet = try encodeEncryptedPacket(actor, remote_id, &stale.keys.recipient_key, try proof_ping.encodeInto(&proof_buffer), 0x9a);
+    var stale_env = harness.env();
+    stale_env.pending_promotion_hook = .{ .context = &replacement, .run = PendingPromotionReplacement.run };
+    actor.handlePacket(stale_env, stale_packet.bytes[0..stale_packet.len], endpoint.addr);
+
+    const newer = actor.requests.pendingKeys(endpoint) orelse return error.NewCandidateRemoved;
+    try std.testing.expectEqual(replacement.replacement.?.handle, newer.handle);
+    try std.testing.expect(newer.handle.send_generation != stale.handle.send_generation);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(@as(u64, 0), actor.metrics.rcvd_message_count[metrics.MessageType.ping.index()]);
+    const retained = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.StableSessionRemoved;
+    try std.testing.expectEqual(stable.initiator_key, retained.initiator_key);
+    try std.testing.expectEqual(stable.recipient_key, retained.recipient_key);
+
+    var exact_packet = try encodeEncryptedPacket(actor, remote_id, &newer.keys.recipient_key, try proof_ping.encodeInto(&proof_buffer), 0x9b);
+    actor.handlePacket(harness.env(), exact_packet.bytes[0..exact_packet.len], endpoint.addr);
+    try std.testing.expect(actor.requests.pendingKeys(endpoint) == null);
+    try std.testing.expectEqual(@as(u64, 1), actor.metrics.rcvd_message_count[metrics.MessageType.ping.index()]);
+    const promoted = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingPromotedSession;
+    try std.testing.expectEqual(newer.keys.initiator_key, promoted.initiator_key);
+    try std.testing.expectEqual(newer.keys.recipient_key, promoted.recipient_key);
+    try std.testing.expect(actor.cancelRequest(harness.env(), request));
+    actor.responses.prune(std.math.maxInt(i64), &harness.ingress);
+    try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+}
+
 test "stable session wins a same-read-key candidate collision" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -1578,7 +1760,7 @@ test "old key remains accepted without promotion until candidate response" {
     actor.handlePacket(harness.env(), old_response.bytes[0..old_response.len], endpoint.addr);
     harness.drainEffectsIgnoringFailures();
     const still_pending = actor.requests.pendingKeys(endpoint) orelse return error.PendingRekeyWasPromotedByOldKey;
-    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.handle.key, still_pending.handle.key));
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.handle.request.key, still_pending.handle.request.key));
     try std.testing.expect(actor.requests.shouldQueue(endpoint));
     try std.testing.expectEqual(@as(usize, 1), actor.requests.activeCount());
     const still_old = actor.sessions.get(endpoint, outbound.nowNs(io)) orelse return error.MissingOldSession;
@@ -2090,10 +2272,10 @@ fn retainResponseHandshake(harness: *ActorHarness, endpoint: types.Endpoint, non
         .initiator_key = [_]u8{key_byte} ** 16,
         .recipient_key = [_]u8{key_byte + 1} ** 16,
     }, 0);
-    return .{ .handshake = .{ .response = .{
-        .handle = handle,
+    return .{ .handshake = .{
+        .handle = .{ .response = handle },
         .packet = try .init(&.{}),
-    } } };
+    } };
 }
 
 fn expectResponseCompletionState(

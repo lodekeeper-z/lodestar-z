@@ -1,11 +1,14 @@
 const std = @import("std");
 const admission = @import("admission.zig");
 const actor_mod = @import("actor.zig");
+const enr = @import("enr.zig");
 const message = @import("protocol/message.zig");
 const packet = @import("protocol/packet.zig");
 const public_api = @import("public_api.zig");
+const request_book = @import("state/request_book.zig");
 const response_book = @import("state/response_book.zig");
 const session_book = @import("state/session_book.zig");
+const secp = @import("secp256k1.zig");
 const runtime_error = @import("runtime_error.zig");
 const transport = @import("transport.zig");
 const types = @import("types.zig");
@@ -271,6 +274,117 @@ pub fn Hooks(comptime Runtime: type, comptime RuntimeImpl: type, comptime shutdo
                 .lookup_results = &storage.lookup_result_outbox,
                 .request_results = &storage.request_result_outbox,
             }, fixture.copied_challenge_effect, .sent);
+        }
+
+        pub const RequestHandshakeShutdownFixture = struct {
+            copied_effect: actor_mod.ActorEffect,
+            handle: request_book.HandshakeHandle,
+            public_handle: public_api.RequestHandle,
+            challenge_nonce: [packet.NONCE_SIZE]u8,
+            stable_endpoint: types.Endpoint,
+            stable: session_book.StableSession,
+        };
+
+        pub fn seedRequestHandshakeShutdownFixture(runtime: *Runtime) !RequestHandshakeShutdownFixture {
+            const storage = impl(runtime);
+            const remote_key = try secp.keyPairFromSecret(&([_]u8{0xd7} ** 32));
+            const remote_pubkey = secp.compressedPubkey(&remote_key);
+            const endpoint = types.Endpoint{
+                .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+                .addr = testEndpoint(0xd7).addr,
+            };
+            const stable_endpoint = testEndpoint(0xd8);
+            const stable = session_book.StableSession{
+                .initiator_key = [_]u8{0xd9} ** 16,
+                .recipient_key = [_]u8{0xda} ** 16,
+            };
+            storage.actor.sessions.put(stable_endpoint, stable, 0);
+            if (!storage.request_result_outbox.reserve()) return error.RequestResultCapacityExceeded;
+            var reservation_unclaimed = true;
+            errdefer if (reservation_unclaimed) storage.request_result_outbox.cancelUnclaimed();
+            if (!storage.request_result_outbox.claim()) unreachable;
+            reservation_unclaimed = false;
+            var claimed = true;
+            errdefer if (claimed) storage.request_result_outbox.release();
+            const action = try actor_mod.Testing.preparePingResolvedForTest(
+                &storage.actor,
+                .{ .io = storage.io, .ingress = &storage.admission },
+                endpoint,
+                &remote_pubkey,
+                .reliable_api,
+            );
+            const request_effect = switch (action) {
+                .send => |effect| effect,
+                .queued => unreachable,
+            };
+            const initial_effect = actor_mod.ActorEffect{ .request = request_effect };
+            storage.actor.applyEffectCompletion(.{
+                .io = storage.io,
+                .ingress = &storage.admission,
+                .outbox = &storage.outbox,
+                .effects = &storage.effects,
+                .request_results = &storage.request_result_outbox,
+            }, initial_effect, .sent);
+            var encoded = request_effect.packet;
+            const challenge_nonce = (try packet.decode(encoded.bytes[0..encoded.len], &endpoint.node_id)).static_header.nonce;
+            const preparation = try storage.actor.requests.challenge(&challenge_nonce, endpoint.addr);
+            const handle = try storage.actor.requests.beginHandshake(preparation, .{
+                .initiator_key = [_]u8{0xdb} ** 16,
+                .recipient_key = [_]u8{0xdc} ** 16,
+            }, 1);
+            const copied_effect = actor_mod.ActorEffect{ .handshake = .{
+                .handle = .{ .request = handle },
+                .packet = try .init(&.{0xdd}),
+            } };
+            try storage.effects.push(copied_effect);
+            claimed = false;
+            return .{
+                .copied_effect = copied_effect,
+                .handle = handle,
+                .public_handle = public_api.handleFromInternal(handle.request),
+                .challenge_nonce = challenge_nonce,
+                .stable_endpoint = stable_endpoint,
+                .stable = stable,
+            };
+        }
+
+        pub fn requestHandshakeShutdownState(runtime: *Runtime, fixture: *const RequestHandshakeShutdownFixture) struct {
+            active: usize,
+            permits: usize,
+            effects: usize,
+            sending_handshake: bool,
+            lane_establishing: bool,
+            challenge_indexed: bool,
+            stable_unchanged: bool,
+        } {
+            const storage = impl(runtime);
+            const request_state = request_book.Testing.handshakeShutdownState(&storage.actor.requests, fixture.handle, &fixture.challenge_nonce);
+            const stable = storage.actor.sessions.get(fixture.stable_endpoint, 0);
+            return .{
+                .active = @intFromBool(request_state.active),
+                .permits = storage.admission.permitCount(),
+                .effects = storage.effects.count(),
+                .sending_handshake = request_state.sending,
+                .lane_establishing = request_state.lane,
+                .challenge_indexed = request_state.challenge,
+                .stable_unchanged = if (stable) |value|
+                    std.meta.eql(value.initiator_key, fixture.stable.initiator_key) and
+                        std.meta.eql(value.recipient_key, fixture.stable.recipient_key)
+                else
+                    false,
+            };
+        }
+
+        pub fn applyCopiedRequestHandshakeCompletion(runtime: *Runtime, fixture: *const RequestHandshakeShutdownFixture) void {
+            const storage = impl(runtime);
+            storage.actor.applyEffectCompletion(.{
+                .io = storage.io,
+                .ingress = &storage.admission,
+                .outbox = &storage.outbox,
+                .effects = &storage.effects,
+                .lookup_results = &storage.lookup_result_outbox,
+                .request_results = &storage.request_result_outbox,
+            }, fixture.copied_effect, .sent);
         }
 
         pub const ActiveRequestEvidence = struct {

@@ -10,7 +10,7 @@ Each logical fact has one canonical owner. Indexes may reference that fact, but 
 | --- | --- |
 | A reliable result will eventually be published | `Runtime.sendPing()` reserves the request-result outbox; `RuntimeImpl.handleSendPing()` claims or releases it; `RequestOrigin.reliable_api` marks the request; `Actor.publishRequestTerminal()` selects and publishes to the outbox. |
 | A request is accepted but not yet active | `RequestBook` owns a generation-tagged `.sending` entry with the compact `ResponseExpectation`, admission permit, recovery state, and indexes. `SendDatagramEffect` carries only its exact `RequestHandle` and packet bytes. |
-| An endpoint is establishing a session | `RequestBook.EndpointLane.establishing` stores the exact request handle; the canonical sending or active request owns `awaiting_whoareyou`; the challenge nonce index stores the same handle. |
+| An endpoint is establishing a session | `RequestBook.EndpointLane.establishing` stores the exact request handle; the canonical request owns `awaiting_whoareyou`, `sending_handshake`, or the generation-tagged pending candidate; the challenge nonce index stores the same request handle whenever the prior phase remains challengeable. |
 | A datagram corresponds to a future request | `SendDatagramEffect.handle` identifies the canonical sending entry by request key and generation; `SendDatagramEffect.packet` owns the bounded encoded datagram. |
 | Send completion | Runtime reports `.sent`, `.failed`, or `.runtime_stopped` to `Actor.applySendCompletion()`. Actor applies the completion only when the handle still names the exact `.sending` generation. |
 | Cancellation ownership | Runtime maps canceled execution to `.runtime_stopped`; `RequestBook.abortSending()` removes only the exact generation, clears matching indexes, and releases its permit. Runtime shutdown synthesizes completion for other accepted effects. |
@@ -104,7 +104,7 @@ Runtime delivers command | packet | maintenance | completion
 - `request`: request handle plus packet for PING, FINDNODE, TALKREQ, health, eviction, lookup, ENR refresh, and queued-redrain requests;
 - `response`: an exact response handle plus packet for PONG, NODES, and TALKRESP; `ResponseBook` already owns the response permit and recovery material before this effect is published;
 - `retry`: exact `RetryHandle` (`RequestHandle` plus non-wrapping retry-send generation) and packet bytes only; `RequestBook.sending_retry` owns the prior phase, prepared future transition, current and replacement permits, next deadline, and retry policy until exact completion;
-- `handshake`: request-source handshakes still carry their prepared source, candidate keys, clocks, plaintext, and packet; response-source handshakes carry only an exact response/handshake handle plus packet while `ResponseBook` owns their keys, plaintext, permit, and candidate transition;
+- `handshake`: unified `HandshakeHandle` plus immutable packet bytes, exactly two fields. The request arm binds request lifetime plus non-wrapping handshake-send generation; the response arm binds response lifetime plus handshake-send generation. `RequestBook.sending_handshake` or `ResponseBook` owns keys, plaintext/recovery material, deadlines, permits, and future transitions.
 - `whoareyou`: exact `ChallengeHandle` (endpoint plus non-wrapping generation) and immutable packet bytes only. `SessionBook` owns challenge data, triggering nonce, retained datagram, optional remote ENR, permit, TTL, and the canonical `sending_whoareyou` or `live` phase.
 
 ### Final measured ownership delta
@@ -118,8 +118,8 @@ Runtime delivers command | packet | maintenance | completion
 | Ordered Actor effect queues | request-only | 1 queue for every datagram effect |
 | Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
 | Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
-| DiscV5 tests after migration | 307 | 409 after response-, retry-, and challenge-ledger canonicalization |
-| Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 4,080 bytes; compact request/response/retry/WHOAREYOU effects are packet plus semantic handle, with WHOAREYOU exactly 1,360 bytes and retry exactly 1,384 bytes; a final `<= 1,536` union ceiling is still required after the remaining legacy request-source handshake is compacted |
+| DiscV5 tests after migration | 307 | 417 after request/response/retry/challenge ledger canonicalization and runtime/auth race tracers |
+| Bounded effect size | request effect within four packet budgets | staged `ActorEffect` exactly 1,400 bytes; every variant is packet plus semantic handle, including unified handshake at 1,392 bytes, WHOAREYOU at 1,360 bytes, and retry at 1,384 bytes. The project-wide final `<= 1,536` ceiling is intentionally not yet promoted from the staged exact lock. |
 
 ### Canonical completion ownership
 
@@ -127,13 +127,15 @@ Runtime delivers command | packet | maintenance | completion
 - **Request `.failed`:** abort the exact sending generation, release its permit and indexes, and resolve health, eviction, or lookup ownership exactly once.
 - **Response `.sent`:** advance only the exact `ResponseBook` generation from `.sending_response` to `.recoverable`; failure or `runtime_stopped` removes that exact generation and releases its canonical permit.
 - **Retry `.sent`:** only the exact request generation and retry-send generation may restore `.active`; retained success consumes one attempt/deadline, while fresh success installs the prepared phase and nonce, resets multipart state, swaps the exact permit, and consumes one attempt/deadline. Exact `.failed` or `.runtime_stopped` releases the prepared permit, preserves the prior phase and current permit, and consumes the same one-attempt/deadline policy. Duplicate, stale, canceled, timed-out, key-reused, or post-shutdown completions are no-ops.
-- **Request-source handshake `.sent`:** commit the prepared request challenge and candidate keys; failure leaves the challenged request state unchanged.
+- **Request-source handshake publication:** exact preflight checks the request generation, challenge/recovery identity, current phase, and checked handshake successor before crypto, randomness, expected-credit commit, or FIFO publication. `beginHandshake` repeats those checks, removes the challenge index, and makes `RequestBook.sending_handshake` canonical before publishing the compact effect.
+- **Request-source handshake completion:** exact `.sent` advances only matching request and handshake generations to a generation-tagged pending candidate, then records the request metric once. Exact `.failed` or `.runtime_stopped` restores the complete prior phase, challenge index, deadline, attempts, accumulator, permit, queued intent, and prior lane-establishing state. FIFO rejection uses the same exact failure transition. Duplicate, stale, reordered, canceled, timed-out, key-reused, or post-shutdown completions are no-ops.
+- **Request candidate promotion:** authenticated candidate-key decryption captures an exact pending view. Promotion must consume that exact request and handshake generation before stable-session installation, authenticated publication, metrics, or lane draining. A stale valid packet cannot promote or erase a newer same-endpoint candidate or replace an existing stable session; the exact newer candidate still promotes once.
 - **Response-source handshake `.sent`:** advance only the exact response and handshake generations to a candidate and release the canonical response permit; failure or `runtime_stopped` removes that exact sending phase and releases the permit without creating a candidate.
 - **Fresh WHOAREYOU `.sent`:** advance only the exact challenge generation from `sending_whoareyou` to `live`. If the configured live capacity is full, evict only the least-recent live challenge and release its permit. Exact `.failed` or `.runtime_stopped` removes that sending generation and releases its permit. Duplicate, stale, wrong-phase, expired-and-removed, authenticated-removed, or endpoint-reused completions are no-ops. A matching sending entry whose TTL has elapsed but has not yet been pruned remains exact, may transition to `live`, and is removed by subsequent expiry maintenance.
 - **WHOAREYOU replay:** publish the existing exact handle and retained packet without changing challenge phase, TTL, recency, permit, generation, or metrics. Sent and failed replay completions are both mutation-free because the canonical challenge is already `live`.
 - **Authenticated HANDSHAKE:** look up the live challenge by the full endpoint, retain its exact generation-bearing handle through identity verification and decryption, then remove only that handle before installing stable keys. An old handle cannot remove a newer generation at the same endpoint.
 - **Challenge expiry:** bounded maintenance removes every expired sending or live phase and releases each canonical permit exactly once. Late completions are stale.
-- **`runtime_stopped`:** Runtime first synthesizes exact completion for every queued effect, then sweeps residual response and challenge phases, lookups, and requests before closing result/event planes. Copied post-shutdown completions are no-ops, and unrelated stable sessions remain intact. Lookup work terminates as `runtime_stopped` rather than ordinary failure/repump.
+- **`runtime_stopped`:** Runtime first synthesizes exact completion for every queued effect, including request-source `sending_handshake`, then sweeps residual response/challenge phases, lookups, and all request phases before closing result/event planes. A queued request handshake is rolled back before its restored request is terminalized, so challenge/lane indexes and its permit are consumed once and a reliable origin receives exactly one `runtime_stopped` result. Copied post-shutdown completions are no-ops, and unrelated stable sessions remain intact. Lookup work terminates as `runtime_stopped` rather than ordinary failure/repump.
 
 ### Ordering, bounds, and late completion policy
 
@@ -160,20 +162,30 @@ The registered layout report runs in Debug, ReleaseSafe, and ReleaseFast and dis
 | Configured fixture node backing (`C = 3`, physical `C + 1 = 4`) | 7,232 |
 | Configured fixture map capacity | 8 |
 | `SessionBook` | 384 Debug/ReleaseSafe, 360 ReleaseFast |
-| `ActorEffect` staged union | 4,080 |
+| Request `HandshakeHandle` | 96 |
+| Unified `HandshakeHandle` | 104 |
+| Unified `HandshakeSendEffect` (exactly `handle` plus `packet`) | 1,392 |
+| `PendingHandshake` | 40 |
+| `ResponseWait` | 48 |
+| Request `Phase` | 2,616 |
+| `SendingHandshake` | 10,488 |
+| `ActiveRequest` | 10,432 |
+| `StoredRequest` | 11,776 |
+| `RequestBook` | 272 Debug/ReleaseSafe, 248 ReleaseFast |
+| `ActorEffect` staged union | 1,400 |
 | Runtime effect FIFO capacity at supported defaults | 1,024 entries |
 
-The compact WHOAREYOU effect is forbidden from regaining admission, challenge data, nonce, ENR, deadline, destination, or other future-ownership fields. The canonical challenge backing is checked as `C + 1`; configuration rejects `C = 0`, and checked addition rejects overflow before allocation.
+Compact effects are forbidden from regaining admission/permit, challenge/preparation source, keys, deadline, plaintext, destination, ENR, or transition ownership. The canonical challenge backing is checked as `C + 1`; configuration rejects `C = 0`, and checked addition rejects overflow before allocation. Request storage remains bounded by `max_active_requests`; this migration adds no map, cache, or allocation.
 
 ## Remaining ownership work
 
 The Runtime-only transport executor and single FIFO are complete. Canonical effect ownership is staged by effect family:
 
 - Retry effects are compact and complete: they carry only exact `RetryHandle` plus `PacketBytes`, while canonical retry future state lives in `RequestBook.sending_retry` and terminal cleanup releases both current and prepared permits.
-- Request-source handshake effects still carry prepared request source, candidate keys, clocks, plaintext, and packet; response-source handshakes are already compact and canonical in `ResponseBook`.
+- Request- and response-source handshake effects are compact and complete: unified exact handle plus `PacketBytes`; canonical sending/candidate ownership lives in `RequestBook` or `ResponseBook`.
 - Fresh and replay WHOAREYOU effects are compact and complete: both carry only exact `ChallengeHandle` plus `PacketBytes`, while canonical sending/live state and permits remain in `SessionBook`.
-- Request-source handshake send generations and exact admission receipt ownership remain pending staged work.
+- Expected-credit/admission receipt ownership remains a separate admission-boundary concern; this request-handshake slice does not acquire a new rate or request permit.
 - Reliable result reservation is represented by Runtime outbox reservation state and `RequestOrigin.reliable_api`; a future consume-and-resolve result capability may consolidate that representation.
 - Peer/contact/routing canonicalization is independent of transport execution ownership.
-- The final `ActorEffect <= 1,536` compact-union gate is not complete; the exact 4,080-byte staged union remains dominated by the legacy request-source handshake.
+- The final project-wide `ActorEffect <= 1,536` ceiling is intentionally not yet promoted; the current staged exact union lock is 1,400 bytes and no legacy request-handshake effect remains.
 - If Runtime transport is later made concurrent or detached, every effect family must retain its exact canonical handle and exhaustion semantics; synchronous execution is not an ownership shortcut.

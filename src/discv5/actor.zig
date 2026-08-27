@@ -48,6 +48,10 @@ pub const Env = if (builtin.is_test) struct {
         context: *anyopaque,
         run: *const fn (*anyopaque, *Actor, *admission.IngressAdmission, session_book.ChallengeView) void,
     } = null,
+    pending_promotion_hook: ?struct {
+        context: *anyopaque,
+        run: *const fn (*anyopaque, *Actor, request_book.PendingKeysView) void,
+    } = null,
 
     pub fn commitExpected(self: Env) void {
         if (self.expected_credit) |credit| credit.commit(self.ingress);
@@ -124,7 +128,10 @@ pub const ActorEffect = union(enum) {
             .request => |*effect| effect.destination(),
             .response => |*effect| effect.handle.endpoint.addr,
             .retry => |*effect| effect.handle.request.key.endpoint.addr,
-            .handshake => |*effect| effect.destination(),
+            .handshake => |*effect| switch (effect.handle) {
+                .request => |handle| handle.request.key.endpoint.addr,
+                .response => |handle| handle.response.endpoint.addr,
+            },
             .whoareyou => |*effect| effect.handle.endpoint.addr,
         };
     }
@@ -134,7 +141,7 @@ pub const ActorEffect = union(enum) {
             .request => |*effect| effect.packetBytes(),
             .response => |*effect| effect.packet.slice(),
             .retry => |*effect| effect.packet.slice(),
-            .handshake => |*effect| effect.packetBytes(),
+            .handshake => |*effect| effect.packet.slice(),
             .whoareyou => |*effect| effect.packet.slice(),
         };
     }
@@ -165,31 +172,34 @@ pub const WhoareyouSource = union(enum) {
     response: response_book.ChallengeView,
 };
 
-pub const RequestHandshakeSendEffect = struct {
-    destination: types.Address,
-    packet: types.PacketBytes,
-    source: request_book.ChallengePreparation,
-    initiator_key: [16]u8,
-    recipient_key: [16]u8,
-    deadline_ns: i64,
-    prepared_at_ns: i64,
-    plaintext: types.PacketBytes,
+pub const HandshakeHandle = union(enum) {
+    request: request_book.HandshakeHandle,
+    response: response_book.HandshakeHandle,
 };
 
-pub const ResponseHandshakeSendEffect = CompactSendEffect(response_book.HandshakeHandle);
+pub const HandshakeSendEffect = CompactSendEffect(HandshakeHandle);
 
 const staged_response_send_effect_size = 1_376;
 const staged_retry_send_effect_size = 1_384;
-const staged_response_handshake_send_effect_size = 1_384;
+const request_handshake_handle_size = 96;
+const handshake_handle_size = 104;
+const handshake_send_effect_size = 1_392;
 const challenge_handle_size = 72;
 const whoareyou_send_effect_size = 1_360;
-// ActorEffect 4_080 is a temporary staged baseline dominated by legacy request handshake.
-// It MUST be updated/replaced by the final <= 1_536 assertion when request handshake is compacted.
-const staged_actor_effect_size = 4_080;
+const staged_actor_effect_size = 1_400;
 
 comptime {
     if (@sizeOf(ActorEffect) != staged_actor_effect_size) {
-        @compileError("ActorEffect must remain at the temporary staged 4080-byte layout");
+        @compileError("ActorEffect must remain at the staged 1400-byte compact-handshake layout");
+    }
+    if (@sizeOf(request_book.HandshakeHandle) != request_handshake_handle_size or
+        @sizeOf(HandshakeHandle) != handshake_handle_size or
+        @typeInfo(HandshakeSendEffect).@"struct".fields.len != 2 or
+        !@hasField(HandshakeSendEffect, "handle") or
+        !@hasField(HandshakeSendEffect, "packet") or
+        @sizeOf(HandshakeSendEffect) != handshake_send_effect_size)
+    {
+        @compileError("unified handshake effect must remain exact semantic handle plus packet at 1392 bytes");
     }
     if (@sizeOf(session_book.ChallengeHandle) != challenge_handle_size or
         @typeInfo(WhoareyouSendEffect).@"struct".fields.len != 2 or
@@ -213,49 +223,21 @@ comptime {
     {
         @compileError("retry effect must remain handle plus packet bytes at the staged 1384-byte layout");
     }
-    if (@typeInfo(ResponseHandshakeSendEffect).@"struct".fields.len != 2 or
-        !@hasField(ResponseHandshakeSendEffect, "handle") or
-        !@hasField(ResponseHandshakeSendEffect, "packet") or
-        @sizeOf(ResponseHandshakeSendEffect) != staged_response_handshake_send_effect_size)
-    {
-        @compileError("response-source handshake effect must remain handle plus packet bytes at the staged 1384-byte layout");
-    }
-    for (.{ "admission", "permit", "transition", "deadline", "deadline_ns", "kind", "nonce", "probe", "plaintext", "enr", "remote_enr", "key", "keys", "source", "dest_pubkey" }) |field| {
+    for (.{ "admission", "permit", "transition", "deadline", "deadline_ns", "kind", "nonce", "probe", "plaintext", "enr", "remote_enr", "key", "keys", "source", "dest_pubkey", "destination", "prepared_at_ns" }) |field| {
         if (@hasField(RetrySendEffect, field)) {
             @compileError("compact retry effect may not regain canonical retry ownership");
         }
-        if (@hasField(ResponseSendEffect, field) or @hasField(ResponseHandshakeSendEffect, field)) {
-            @compileError("compact response effects may not regain canonical response ownership");
+        if (@hasField(ResponseSendEffect, field)) {
+            @compileError("compact response effect may not regain canonical response ownership");
+        }
+        if (@hasField(HandshakeSendEffect, field)) {
+            @compileError("compact handshake effect may not regain canonical handshake ownership");
         }
         if (@hasField(WhoareyouSendEffect, field)) {
             @compileError("compact WHOAREYOU effect may not regain canonical challenge ownership");
         }
     }
-    for (.{ "admission", "challenge_data", "triggering_nonce", "remote_enr", "prepared_at_ns", "deadline", "deadline_ns", "destination", "endpoint" }) |field| {
-        if (@hasField(WhoareyouSendEffect, field)) {
-            @compileError("compact WHOAREYOU effect contains a forbidden ownership field");
-        }
-    }
 }
-
-pub const HandshakeSendEffect = union(enum) {
-    request: RequestHandshakeSendEffect,
-    response: ResponseHandshakeSendEffect,
-
-    pub fn destination(self: *const HandshakeSendEffect) types.Address {
-        return switch (self.*) {
-            .request => |*value| value.destination,
-            .response => |*value| value.handle.response.endpoint.addr,
-        };
-    }
-
-    pub fn packetBytes(self: *const HandshakeSendEffect) []const u8 {
-        return switch (self.*) {
-            .request => |*value| value.packet.slice(),
-            .response => |*value| value.packet.slice(),
-        };
-    }
-};
 
 /// Runtime-owned bounded output for Actor effects. Actor transitions may
 /// append move-owned effects but never execute transport through this queue.
@@ -441,18 +423,18 @@ pub const Actor = struct {
                 }, env.ingress) orelse return;
                 if (completion_event == .sent) outbound.noteSentRequest(self, completed.kind);
             },
-            .handshake => |handshake_effect| switch (handshake_effect) {
-                .request => |value| {
-                    if (completion_event != .sent) return;
-                    self.requests.commitChallenge(value.source, .{
-                        .initiator_key = value.initiator_key,
-                        .recipient_key = value.recipient_key,
-                    }, value.deadline_ns);
-                    outbound.noteSent(self, value.plaintext.slice());
+            .handshake => |handshake_effect| switch (handshake_effect.handle) {
+                .request => |handle| {
+                    const completed = self.requests.completeHandshake(handle, switch (completion_event) {
+                        .sent => .sent,
+                        .failed => .failed,
+                        .runtime_stopped => .runtime_stopped,
+                    }) orelse return;
+                    if (completion_event == .sent) outbound.noteSentRequest(self, completed.kind);
                 },
-                .response => |value| {
-                    const plaintext = self.responses.handshakePlaintext(value.handle) orelse return;
-                    if (!self.responses.completeHandshake(value.handle, switch (completion_event) {
+                .response => |handle| {
+                    const plaintext = self.responses.handshakePlaintext(handle) orelse return;
+                    if (!self.responses.completeHandshake(handle, switch (completion_event) {
                         .sent => .sent,
                         .failed => .failed,
                         .runtime_stopped => .runtime_stopped,
@@ -1294,21 +1276,23 @@ test "discv5 actor: staged effect layouts remain exact" {
     try std.testing.expectEqual(@as(usize, 2), @typeInfo(RetrySendEffect).@"struct".fields.len);
     try std.testing.expect(@hasField(RetrySendEffect, "handle"));
     try std.testing.expect(@hasField(RetrySendEffect, "packet"));
-    try std.testing.expectEqual(staged_response_handshake_send_effect_size, @sizeOf(ResponseHandshakeSendEffect));
-    // This is temporary and MUST become <= 1_536 when request handshake is compacted.
+    try std.testing.expectEqual(request_handshake_handle_size, @sizeOf(request_book.HandshakeHandle));
+    try std.testing.expectEqual(handshake_handle_size, @sizeOf(HandshakeHandle));
+    try std.testing.expectEqual(handshake_send_effect_size, @sizeOf(HandshakeSendEffect));
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(HandshakeSendEffect).@"struct".fields.len);
     try std.testing.expectEqual(staged_actor_effect_size, @sizeOf(ActorEffect));
-    try std.testing.expect(@hasField(RequestHandshakeSendEffect, "source"));
-    try std.testing.expect(@hasField(RequestHandshakeSendEffect, "plaintext"));
     const request_layout = request_book.RequestBook.layout();
     try std.testing.expectEqual(@as(usize, 96), request_layout.retry_handle);
-    try std.testing.expectEqual(@as(usize, 2_612), request_layout.phase);
+    try std.testing.expectEqual(@as(usize, 96), request_layout.handshake_handle);
+    try std.testing.expectEqual(@as(usize, 40), request_layout.pending_handshake);
+    try std.testing.expectEqual(@as(usize, 2_616), request_layout.phase);
     try std.testing.expectEqual(@as(usize, 11_776), request_layout.stored_request);
-    const expected_request_book_size: usize = if (builtin.mode == .ReleaseFast) 240 else 264;
+    const expected_request_book_size: usize = if (builtin.mode == .ReleaseFast) 248 else 272;
     try std.testing.expectEqual(expected_request_book_size, request_layout.request_book);
     try std.testing.expectEqual(@as(usize, 1_024), config_mod.MAX_ACTIVE_REQUESTS);
     std.debug.print(
-        "RETRY_LAYOUT handle={} effect={} actor_effect={} request_book={} phase={} stored_request={} fifo={}\n",
-        .{ request_layout.retry_handle, @sizeOf(RetrySendEffect), @sizeOf(ActorEffect), request_layout.request_book, request_layout.phase, request_layout.stored_request, config_mod.MAX_ACTIVE_REQUESTS },
+        "REQUEST_HANDSHAKE_LAYOUT request_handle={} unified_handle={} effect={} actor_effect={} request_book={} pending={} wait={} phase={} sending={} active={} stored={} fifo={}\n",
+        .{ request_layout.handshake_handle, @sizeOf(HandshakeHandle), @sizeOf(HandshakeSendEffect), @sizeOf(ActorEffect), request_layout.request_book, request_layout.pending_handshake, request_layout.response_wait, request_layout.phase, request_layout.sending_handshake, request_layout.active_request, request_layout.stored_request, config_mod.MAX_ACTIVE_REQUESTS },
     );
 }
 

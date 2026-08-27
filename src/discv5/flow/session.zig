@@ -100,13 +100,16 @@ fn handleMessage(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket, a
             var authenticated_message: AuthenticatedMessage = undefined;
             if (!decodeAuthenticated(&authenticated_message, endpoint, plaintext, null)) return;
             if (!acceptExpectedMessage(actor, env, &authenticated_message)) return;
+            if (@import("builtin").is_test) if (env.pending_promotion_hook) |hook| {
+                hook.run(hook.context, actor, pending);
+            };
             var accepted = session_book.StableSession{
                 .initiator_key = pending.keys.initiator_key,
                 .recipient_key = pending.keys.recipient_key,
             };
             std.debug.assert(accepted.seen_nonces.insert(&parsed.static_header.nonce));
+            if (!actor.requests.promotePending(pending)) return;
             actor.sessions.put(endpoint, accepted, now_ns);
-            actor.requests.promotePending(pending);
             authenticated(actor, env, &authenticated_message);
             outbound.drainEndpoint(actor, env, endpoint);
             return;
@@ -174,6 +177,10 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
         ) orelse return },
         else => return,
     };
+    switch (source) {
+        .request => |preparation| actor.requests.preflightHandshake(preparation) catch return,
+        .response => {},
+    }
     env.commitExpected();
     var response_recovery_transferred = false;
     defer if (!response_recovery_transferred) switch (source) {
@@ -241,26 +248,26 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
     };
     const retained_datagram = types.PacketBytes.init(datagram) catch return;
     const effect: actor_mod.ActorEffect = switch (source) {
-        .request => |preparation| .{ .handshake = .{ .request = .{
-            .destination = from,
-            .packet = retained_datagram,
-            .source = preparation,
-            .initiator_key = keys.initiator_key,
-            .recipient_key = keys.recipient_key,
-            .deadline_ns = outbound.deadlineNs(now_ns, actor.request_timeout_ms),
-            .prepared_at_ns = now_ns,
-            .plaintext = recovery.plaintext,
-        } } },
+        .request => |preparation| blk: {
+            const handle = actor.requests.beginHandshake(preparation, .{
+                .initiator_key = keys.initiator_key,
+                .recipient_key = keys.recipient_key,
+            }, outbound.deadlineNs(now_ns, actor.request_timeout_ms)) catch return;
+            break :blk .{ .handshake = .{
+                .handle = .{ .request = handle },
+                .packet = retained_datagram,
+            } };
+        },
         .response => |view| blk: {
             const handle = actor.responses.beginHandshake(view, .{
                 .initiator_key = keys.initiator_key,
                 .recipient_key = keys.recipient_key,
             }, now_ns) catch return;
             response_recovery_transferred = true;
-            break :blk .{ .handshake = .{ .response = .{
-                .handle = handle,
+            break :blk .{ .handshake = .{
+                .handle = .{ .response = handle },
                 .packet = retained_datagram,
-            } } };
+            } };
         },
     };
     const effects = env.effects orelse unreachable;

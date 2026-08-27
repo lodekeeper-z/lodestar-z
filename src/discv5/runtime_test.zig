@@ -242,6 +242,51 @@ test "Runtime shutdown drains queued response completion then sweeps every resid
     try std.testing.expect(stale.stable_unchanged);
 }
 
+test "Runtime shutdown aborts queued request handshake before sweeping restored reliable request" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const runtime = try initTestRuntime(io, alloc, 0xd7, .{
+        .max_active_requests = 1,
+        .max_queued_requests = 1,
+        .event_capacity = 1,
+        .command_capacity = 1,
+        .request_result_capacity = 1,
+    }, .{});
+    defer runtime.deinit();
+
+    const fixture = try runtime_mod.Testing.seedRequestHandshakeShutdownFixture(runtime);
+    const before = runtime_mod.Testing.requestHandshakeShutdownState(runtime, &fixture);
+    try std.testing.expectEqual(@as(usize, 1), before.active);
+    try std.testing.expectEqual(@as(usize, 1), before.permits);
+    try std.testing.expectEqual(@as(usize, 1), before.effects);
+    try std.testing.expect(before.sending_handshake);
+    try std.testing.expect(before.lane_establishing);
+    try std.testing.expect(!before.challenge_indexed);
+    try std.testing.expect(before.stable_unchanged);
+
+    runtime.stop();
+    const result = runtime.popRequestResult() orelse return error.MissingStoppedRequestResult;
+    try std.testing.expectEqual(fixture.public_handle, result.handle);
+    try std.testing.expectEqual(types.RequestKind.ping, result.kind);
+    try std.testing.expect(result.terminal == .runtime_stopped);
+    try std.testing.expect(runtime.popRequestResult() == null);
+    const stopped = runtime_mod.Testing.requestHandshakeShutdownState(runtime, &fixture);
+    try std.testing.expectEqual(@as(usize, 0), stopped.active);
+    try std.testing.expectEqual(@as(usize, 0), stopped.permits);
+    try std.testing.expectEqual(@as(usize, 0), stopped.effects);
+    try std.testing.expect(!stopped.lane_establishing);
+    try std.testing.expect(!stopped.challenge_indexed);
+    try std.testing.expect(stopped.stable_unchanged);
+
+    runtime_mod.Testing.applyCopiedRequestHandshakeCompletion(runtime, &fixture);
+    const stale = runtime_mod.Testing.requestHandshakeShutdownState(runtime, &fixture);
+    try std.testing.expectEqual(@as(usize, 0), stale.active);
+    try std.testing.expectEqual(@as(usize, 0), stale.permits);
+    try std.testing.expectEqual(@as(usize, 0), stale.effects);
+    try std.testing.expect(stale.stable_unchanged);
+    try std.testing.expect(runtime.popRequestResult() == null);
+}
+
 fn awaitRequestResult(io: std.Io, runtime: *runtime_mod.Runtime) !runtime_mod.RequestResult {
     for (0..2_000) |_| {
         if (runtime.popRequestResult()) |result| return result;

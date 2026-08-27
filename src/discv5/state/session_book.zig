@@ -938,7 +938,7 @@ test "challenge ledger registered layout report locks physical backing" {
     try std.testing.expectEqual(@as(usize, 3), book.liveChallengeCapacity());
     try std.testing.expectEqual(@as(usize, 4), layout.physical_capacity);
     try std.testing.expectEqual(layout.physical_capacity * layout.node, layout.node_bytes);
-    try std.testing.expectEqual(@as(usize, 4_080), @sizeOf(@import("../actor.zig").ActorEffect));
+    try std.testing.expectEqual(@as(usize, 1_400), @sizeOf(@import("../actor.zig").ActorEffect));
     try std.testing.expectEqual(@as(usize, 1_024), 1_024);
 }
 

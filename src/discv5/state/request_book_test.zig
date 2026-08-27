@@ -47,6 +47,16 @@ fn beginActive(
     if (book.completeSending(handle) == null) return error.SendingCompletionRejected;
 }
 
+fn commitHandshake(
+    book: *book_mod.RequestBook,
+    preparation: book_mod.ChallengePreparation,
+    keys: book_mod.PendingSessionKeys,
+    deadline_ns: i64,
+) !void {
+    const handle = try book.beginHandshake(preparation, keys, deadline_ns);
+    _ = book.completeHandshake(handle, .sent) orelse return error.HandshakeCompletionRejected;
+}
+
 test "FINDNODE correlation stores bounded distance membership" {
     const distances = book_mod.RequestDistances.fromSlice(&.{ 256, 0, 256, 257, 1 });
     try std.testing.expect(distances.contains(0));
@@ -77,7 +87,7 @@ test "response waits preserve challenge and pending-key behavior across retries 
         1,
         true,
     );
-    book.commitChallenge(try book.challenge(&([_]u8{20} ** 12), promoted_retry.endpoint.addr), keys, 2);
+    try commitHandshake(&book, try book.challenge(&([_]u8{20} ** 12), promoted_retry.endpoint.addr), keys, 2);
     try std.testing.expect(book.pendingKeys(promoted_retry.endpoint) != null);
     try std.testing.expectError(error.InvalidChallenge, book.challenge(&([_]u8{20} ** 12), promoted_retry.endpoint.addr));
 
@@ -94,7 +104,7 @@ test "response waits preserve challenge and pending-key behavior across retries 
     const retry_pending = book.pendingKeys(promoted_retry.endpoint) orelse return error.MissingPendingKeys;
     try std.testing.expectEqual(keys, retry_pending.keys);
     _ = try book.challenge(&([_]u8{21} ** 12), promoted_retry.endpoint.addr);
-    book.promotePending(retry_pending);
+    _ = book.promotePending(retry_pending);
     try std.testing.expect(book.pendingKeys(promoted_retry.endpoint) == null);
     _ = try book.challenge(&([_]u8{21} ** 12), promoted_retry.endpoint.addr);
 
@@ -109,9 +119,9 @@ test "response waits preserve challenge and pending-key behavior across retries 
         1,
         true,
     );
-    book.commitChallenge(try book.challenge(&([_]u8{30} ** 12), confirmed_retry.endpoint.addr), keys, 2);
+    try commitHandshake(&book, try book.challenge(&([_]u8{30} ** 12), confirmed_retry.endpoint.addr), keys, 2);
     const confirmed_pending = book.pendingKeys(confirmed_retry.endpoint) orelse return error.MissingPendingKeys;
-    book.promotePending(confirmed_pending);
+    _ = book.promotePending(confirmed_pending);
     try std.testing.expect(book.pendingKeys(confirmed_retry.endpoint) == null);
     try std.testing.expectError(error.InvalidChallenge, book.challenge(&([_]u8{30} ** 12), confirmed_retry.endpoint.addr));
 
@@ -148,18 +158,167 @@ test "RequestBook conserves challenge lane active and admission indexes" {
     book.assertInvariants();
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
     const challenge = try book.challenge(&([_]u8{7} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, .{
+    try commitHandshake(&book, challenge, .{
         .initiator_key = [_]u8{10} ** 16,
         .recipient_key = [_]u8{11} ** 16,
     }, 2);
     const pending = book.pendingKeys(key.endpoint) orelse return error.MissingPendingKeys;
-    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.handle.key, key));
-    book.promotePending(pending);
+    try std.testing.expect(types.RequestKeyContext.eql(.{}, pending.handle.request.key, key));
+    _ = book.promotePending(pending);
     try std.testing.expect(book.pendingKeys(key.endpoint) == null);
     var removed = book.take(key) orelse return error.MissingActiveRequest;
     removed.admission.release(&ingress);
     book.assertInvariants();
     try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+}
+
+test "copied request handshake completion commits exact generation once" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(39), try message.ReqId.fromSlice(&.{ 3, 9 }));
+    try beginActive(
+        &book,
+        &ingress,
+        key,
+        .api,
+        .pong,
+        .{ .awaiting_whoareyou = try probe(39) },
+        1,
+        true,
+    );
+    const preparation = try book.challenge(&([_]u8{39} ** 12), key.endpoint.addr);
+    const handle = try book.beginHandshake(preparation, .{
+        .initiator_key = [_]u8{10} ** 16,
+        .recipient_key = [_]u8{11} ** 16,
+    }, 9);
+    const copied = handle;
+
+    try std.testing.expectEqual(types.RequestKind.ping, (book.completeHandshake(handle, .sent) orelse return error.HandshakeCompletionRejected).kind);
+    try std.testing.expect(book.completeHandshake(copied, .sent) == null);
+    const pending = book.pendingKeys(key.endpoint) orelse return error.MissingPendingKeys;
+    try std.testing.expectEqual(handle, pending.handle);
+    try std.testing.expectEqual(@as(i64, 9), book.get(key).?.deadline_ns);
+}
+
+test "failed request handshake restores exact challengeable request and rejects copied success" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(38), try message.ReqId.fromSlice(&.{ 3, 8 }));
+    const distances = requestedDistances(&.{ 1, 256 });
+    const recovery = (try probe(38)).recovery;
+    try beginActive(&book, &ingress, key, .api, .{ .nodes = distances }, .{ .awaiting_response = .{
+        .recovery = recovery,
+        .wait = .session_request,
+    } }, 4, false);
+    const active_before = book.get(key) orelse return error.MissingActiveRequest;
+    active_before.attempts = 7;
+    active_before.response.nodes.total_responses = 3;
+    active_before.response.nodes.responses_received = 1;
+    const preparation = try book.challenge(&recovery.nonce, key.endpoint.addr);
+    const handle = try book.beginHandshake(preparation, .{
+        .initiator_key = [_]u8{12} ** 16,
+        .recipient_key = [_]u8{13} ** 16,
+    }, 99);
+    const copied = handle;
+    try std.testing.expect(!book.hasChallenge(&recovery.nonce, key.endpoint.addr));
+
+    try std.testing.expectEqual(types.RequestKind.findnode, (book.completeHandshake(handle, .failed) orelse return error.HandshakeCompletionRejected).kind);
+    try std.testing.expect(book.completeHandshake(copied, .sent) == null);
+    const restored = book.get(key) orelse return error.MissingRestoredRequest;
+    try std.testing.expectEqual(@as(i64, 4), restored.deadline_ns);
+    try std.testing.expectEqual(@as(u32, 7), restored.attempts);
+    try std.testing.expectEqual(@as(u64, 3), restored.response.nodes.total_responses.?);
+    try std.testing.expectEqual(@as(u64, 1), restored.response.nodes.responses_received);
+    try std.testing.expect(restored.phase.awaiting_response.wait == .session_request);
+    try std.testing.expect(book.hasChallenge(&recovery.nonce, key.endpoint.addr));
+    try std.testing.expect(book.canEstablish(key));
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+}
+
+test "request handshake generation exhaustion is failure atomic" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(37), try message.ReqId.fromSlice(&.{ 3, 7 }));
+    try beginActive(&book, &ingress, key, .api, .pong, .{ .awaiting_whoareyou = try probe(37) }, 5, true);
+    const preparation = try book.challenge(&([_]u8{37} ** 12), key.endpoint.addr);
+    book_mod.Testing.exhaustHandshakeGeneration(&book);
+
+    try std.testing.expectError(error.GenerationExhausted, book.preflightHandshake(preparation));
+    try std.testing.expectError(error.GenerationExhausted, book.beginHandshake(preparation, .{
+        .initiator_key = [_]u8{14} ** 16,
+        .recipient_key = [_]u8{15} ** 16,
+    }, 100));
+    const active = book.get(key) orelse return error.MissingActiveRequest;
+    try std.testing.expectEqual(@as(i64, 5), active.deadline_ns);
+    try std.testing.expect(active.phase == .awaiting_whoareyou);
+    try std.testing.expect(book.hasChallenge(&([_]u8{37} ** 12), key.endpoint.addr));
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+}
+
+test "stale request candidate cannot promote a newer handshake generation" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(36), try message.ReqId.fromSlice(&.{ 3, 6 }));
+    try beginActive(&book, &ingress, key, .api, .pong, .{ .awaiting_whoareyou = try probe(36) }, 1, true);
+    const first = try book.beginHandshake(try book.challenge(&([_]u8{36} ** 12), key.endpoint.addr), .{
+        .initiator_key = [_]u8{16} ** 16,
+        .recipient_key = [_]u8{17} ** 16,
+    }, 2);
+    _ = book.completeHandshake(first, .sent) orelse return error.HandshakeCompletionRejected;
+    const stale = book.pendingKeys(key.endpoint) orelse return error.MissingPendingKeys;
+
+    var replacement = try ingress.acquire(key.endpoint.addr, admission.requestPacketBudget(.ping));
+    const retry = try book.prepareFreshRetry(first.request, try .init(&.{1}), .{ .response = [_]u8{35} ** 12 }, 3, &replacement);
+    _ = book.completeRetry(retry.handle, .sent, &ingress) orelse return error.RetryCompletionRejected;
+    const retained = book.pendingKeys(key.endpoint) orelse return error.MissingRetainedPendingKeys;
+    try std.testing.expectEqual(first, retained.handle);
+    const second = try book.beginHandshake(try book.challenge(&([_]u8{35} ** 12), key.endpoint.addr), .{
+        .initiator_key = [_]u8{18} ** 16,
+        .recipient_key = [_]u8{19} ** 16,
+    }, 4);
+    try std.testing.expect(book.completeHandshake(first, .sent) == null);
+    try std.testing.expect(book.completeHandshake(first, .failed) == null);
+    _ = book.completeHandshake(second, .sent) orelse return error.HandshakeCompletionRejected;
+
+    try std.testing.expect(!book.promotePending(stale));
+    try std.testing.expectEqual(second, (book.pendingKeys(key.endpoint) orelse return error.NewCandidateRemoved).handle);
+    const exact = book.pendingKeys(key.endpoint) orelse return error.MissingExactCandidate;
+    try std.testing.expect(book.promotePending(exact));
+    try std.testing.expect(!book.promotePending(exact));
+    try std.testing.expect(book.pendingKeys(key.endpoint) == null);
+}
+
+test "terminal request handshake cleanup invalidates copies and reused request keys" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+    const key = types.RequestKey.init(endpoint(35), try message.ReqId.fromSlice(&.{ 3, 5 }));
+    try beginActive(&book, &ingress, key, .api, .pong, .{ .awaiting_whoareyou = try probe(34) }, 1, true);
+    const old = try book.beginHandshake(try book.challenge(&([_]u8{34} ** 12), key.endpoint.addr), .{
+        .initiator_key = [_]u8{20} ** 16,
+        .recipient_key = [_]u8{21} ** 16,
+    }, 2);
+    var terminal = book.takeTerminal(key) orelse return error.MissingTerminalRequest;
+    terminal.release(&ingress);
+    try std.testing.expectEqual(@as(usize, 0), ingress.permitCount());
+    try std.testing.expect(book.completeHandshake(old, .sent) == null);
+    try std.testing.expect(book.completeHandshake(old, .failed) == null);
+
+    const replacement = try book.beginSending(&ingress, key, .api, .pong, .{ .awaiting_whoareyou = try probe(33) }, 3, true, false);
+    _ = book.completeSending(replacement) orelse return error.SendingCompletionRejected;
+    try std.testing.expect(replacement.generation != old.request.generation);
+    try std.testing.expect(book.completeHandshake(old, .runtime_stopped) == null);
+    try std.testing.expect(book.hasChallenge(&([_]u8{33} ** 12), key.endpoint.addr));
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
 }
 
 test "copied retained retry completion commits attempts and deadline once" {
@@ -373,7 +532,7 @@ test "fresh retry preflight validates exact active awaiting-response generation"
     try std.testing.expectError(error.StaleRequest, book.preflightFreshRetry(stale));
 
     const challenge = try book.challenge(&([_]u8{51} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, .{
+    try commitHandshake(&book, challenge, .{
         .initiator_key = [_]u8{13} ** 16,
         .recipient_key = [_]u8{14} ** 16,
     }, 2);
@@ -403,7 +562,7 @@ test "WHOAREYOU phase changes preserve the cumulative retry bound" {
     try std.testing.expectEqual(@as(u32, 1), book.get(key).?.attempts);
 
     const challenge = try book.challenge(&([_]u8{12} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, .{
+    try commitHandshake(&book, challenge, .{
         .initiator_key = [_]u8{10} ** 16,
         .recipient_key = [_]u8{11} ** 16,
     }, 3);
@@ -607,7 +766,7 @@ fn allocationLifecycle(alloc: std.mem.Allocator) !void {
         .awaiting_whoareyou = try probe(9),
     }, 0, true);
     const challenge = try book.challenge(&([_]u8{9} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, .{
+    try commitHandshake(&book, challenge, .{
         .initiator_key = [_]u8{6} ** 16,
         .recipient_key = [_]u8{7} ** 16,
     }, 1);
@@ -658,7 +817,7 @@ test "challenge preparation and commit remain allocation-free" {
         .awaiting_whoareyou = try probe(11),
     }, 10, true);
     const challenge = try book.challenge(&([_]u8{11} ** 12), key.endpoint.addr);
-    book.commitChallenge(challenge, .{
+    try commitHandshake(&book, challenge, .{
         .initiator_key = [_]u8{1} ** 16,
         .recipient_key = [_]u8{2} ** 16,
     }, 20);
