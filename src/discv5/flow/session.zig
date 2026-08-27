@@ -326,6 +326,9 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
     const endpoint = types.Endpoint{ .node_id = authdata.src_id, .addr = from };
     const now_ns = outbound.nowNs(env.io);
     const challenge = actor.sessions.peekChallenge(endpoint, now_ns) orelse return;
+    if (@import("builtin").is_test) if (env.handshake_challenge_hook) |hook| {
+        hook.run(hook.context, actor, env.ingress, challenge);
+    };
     const known = actor.peers.known(&endpoint.node_id);
     const validated_enr: ?enr.ValidatedEnr = if (authdata.maybe_enr) |raw| blk: {
         const validated = enr.ValidatedEnr.init(raw) catch return;
@@ -379,7 +382,10 @@ fn handleHandshake(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
     std.debug.assert(stable.seen_nonces.insert(&challenge.triggering_nonce));
     std.debug.assert(stable.seen_nonces.insert(&parsed.static_header.nonce));
 
-    std.debug.assert(actor.sessions.removeChallenge(challenge.handle, env.ingress));
+    const challenge_removed = actor.sessions.removeChallenge(challenge.handle, env.ingress);
+    if (@import("builtin").is_test) {
+        if (env.handshake_challenge_hook == null) std.debug.assert(challenge_removed);
+    } else std.debug.assert(challenge_removed);
     actor.sessions.put(endpoint, stable, now_ns);
     const responsive = actor.peers.acceptValidatedHandshake(
         endpoint.node_id,

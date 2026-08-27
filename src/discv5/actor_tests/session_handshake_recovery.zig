@@ -34,6 +34,51 @@ fn drainEffects(
     }
 }
 
+const HandshakeChallengeReplacement = struct {
+    publication: session_book.ChallengePublication,
+    called: bool = false,
+    old_removed: bool = false,
+    newer_handle: ?session_book.ChallengeHandle = null,
+    challenge_fingerprint: u64 = 0,
+    permit_fingerprint: u64 = 0,
+    failure: ?anyerror = null,
+
+    fn run(
+        context: *anyopaque,
+        actor: *actor_mod.Actor,
+        ingress: *admission.IngressAdmission,
+        old: session_book.ChallengeView,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.replace(actor, ingress, old) catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn replace(
+        self: *@This(),
+        actor: *actor_mod.Actor,
+        ingress: *admission.IngressAdmission,
+        old: session_book.ChallengeView,
+    ) !void {
+        if (self.called) return error.ReplacementHookCalledTwice;
+        self.called = true;
+        self.old_removed = actor.sessions.removeChallenge(old.handle, ingress);
+        if (!self.old_removed) return error.OldChallengeNotRemoved;
+
+        var permit = try ingress.acquire(old.handle.endpoint.addr, admission.challengePacketBudget(actor.request_retries));
+        var permit_transferred = false;
+        defer if (!permit_transferred) permit.release(ingress);
+        const newer = try actor.sessions.publishChallenge(old.handle.endpoint, self.publication, &permit, ingress);
+        permit_transferred = true;
+        errdefer _ = actor.sessions.removeChallenge(newer, ingress);
+        if (!actor.sessions.completeChallengeSend(newer, .sent, ingress)) return error.NewChallengeNotLive;
+        self.newer_handle = newer;
+        self.challenge_fingerprint = session_book.SessionBook.Testing.challengeGenerationFingerprint(&actor.sessions);
+        self.permit_fingerprint = admission.IngressAdmission.Testing.permitGenerationFingerprint(ingress);
+    }
+};
+
 test "oversized sessionless TALKREQ handshake fails once without waiting for timeout" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -380,7 +425,7 @@ test "actor challenge generation exhaustion preflight preserves every downstream
     try std.testing.expectEqual(stable, harness.actor.sessions.get(stable_endpoint, now_ns).?);
 }
 
-test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained datagram" {
+test "paired Actors authenticate a captured WHOAREYOU without removing its same-endpoint replacement" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const key_a = try secp.keyPairFromSecret(&([_]u8{0x95} ** 32));
@@ -429,10 +474,23 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
     defer sender_a.deinit();
     var sender_b = RecordingSender.init(alloc);
     defer sender_b.deinit();
+    const replacement_packet = try types.PacketBytes.init(&.{ 0xd7, 0xd8, 0xd9 });
+    var replacement = HandshakeChallengeReplacement{ .publication = .{
+        .challenge_data = [_]u8{0xd4} ** packet.WHOAREYOU_CHALLENGE_DATA_SIZE,
+        .triggering_nonce = [_]u8{0xd5} ** packet.NONCE_SIZE,
+        .datagram = replacement_packet,
+        .prepared_at_ns = outbound.nowNs(io),
+    } };
     var effect_storage_a: [2]actor_mod.ActorEffect = undefined;
     var effects_a = actor_mod.EffectQueue.init(&effect_storage_a);
     const env_a = actor_mod.Env{ .io = io, .ingress = &ingress_a, .outbox = &outbox_a, .effects = &effects_a };
-    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, .{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, &sender_b);
+    const env_b = actor_mod.Env{
+        .io = io,
+        .ingress = &ingress_b,
+        .outbox = &outbox_b,
+        .handshake_challenge_hook = .{ .context = &replacement, .run = HandshakeChallengeReplacement.run },
+    };
+    var link_a_to_b = PacketLink.init(&sender_a, address_b, address_a, &actor_b, env_b, &sender_b);
     var link_b_to_a = PacketLink.init(&sender_b, address_a, address_b, &actor_a, env_a, &sender_a);
     const now_ns = outbound.nowNs(io);
     try std.testing.expect(actor_a.addNode(id_b, &pubkey_b, address_b, null, now_ns));
@@ -479,16 +537,43 @@ test "paired Actors recover a dropped WHOAREYOU by replaying its exact retained 
 
     try link_b_to_a.deliverNext();
     try link_a_to_b.deliverNext();
-    try std.testing.expectEqual(@as(usize, 0), actor_b.sessions.challengeCount());
+    try std.testing.expect(replacement.called);
+    try std.testing.expect(replacement.failure == null);
+    try std.testing.expect(replacement.old_removed);
+    const newer_handle = replacement.newer_handle orelse return error.MissingReplacementChallenge;
+    try std.testing.expect(newer_handle.generation != live_before_replay.handle.generation);
+    try std.testing.expect(!std.mem.eql(u8, &replacement.publication.challenge_data, &live_before_replay.challenge_data));
+    try std.testing.expect(!std.mem.eql(u8, &replacement.publication.triggering_nonce, &live_before_replay.triggering_nonce));
+    try std.testing.expect(!std.mem.eql(u8, replacement_packet.slice(), live_before_replay.datagram.slice()));
+    try std.testing.expect(replacement.permit_fingerprint != permit_fingerprint);
+    const newer = actor_b.sessions.peekChallenge(endpoint_a, outbound.nowNs(io)) orelse return error.ReplacementChallengeRemoved;
+    try std.testing.expectEqual(newer_handle, newer.handle);
+    try std.testing.expectEqual(replacement.publication.challenge_data, newer.challenge_data);
+    try std.testing.expectEqual(replacement.publication.triggering_nonce, newer.triggering_nonce);
+    try std.testing.expectEqualSlices(u8, replacement_packet.slice(), newer.datagram.slice());
+    try std.testing.expectEqual(replacement.challenge_fingerprint, session_book.SessionBook.Testing.challengeGenerationFingerprint(&actor_b.sessions));
+    const authenticated_session = actor_b.sessions.get(endpoint_a, outbound.nowNs(io)) orelse return error.HandshakeNotAuthenticated;
+    try std.testing.expect(authenticated_session.seen_nonces.contains(&live_before_replay.triggering_nonce));
+    try std.testing.expectEqual(@as(u64, 1), actor_b.metrics.rcvd_message_count[metrics.MessageType.ping.index()]);
+    try std.testing.expectEqual(@as(usize, 2), ingress_b.permitCount());
+    const authenticated_permit_fingerprint = admission.IngressAdmission.Testing.permitGenerationFingerprint(&ingress_b);
+    try std.testing.expect(authenticated_permit_fingerprint != replacement.permit_fingerprint);
+    try std.testing.expect(!actor_b.sessions.removeChallenge(live_before_replay.handle, &ingress_b));
     actor_b.applyEffectCompletion(.{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, copied_replay, .sent);
     actor_b.applyEffectCompletion(.{ .io = io, .ingress = &ingress_b, .outbox = &outbox_b }, copied_replay, .failed);
-    try std.testing.expectEqual(@as(usize, 0), actor_b.sessions.challengePhaseCount());
+    try std.testing.expectEqual(newer_handle, (actor_b.sessions.peekChallenge(endpoint_a, outbound.nowNs(io)) orelse return error.CopiedReplayRemovedReplacement).handle);
     try link_b_to_a.deliverNext();
     try std.testing.expectEqual(@as(usize, 0), actor_a.requests.activeCount());
     try std.testing.expectEqual(@as(usize, 0), ingress_a.permitCount());
-    try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
+    try std.testing.expectEqual(@as(usize, 2), ingress_b.permitCount());
     actor_b.responses.prune(std.math.maxInt(i64), &ingress_b);
+    try std.testing.expectEqual(@as(usize, 1), ingress_b.permitCount());
+    try std.testing.expectEqual(authenticated_permit_fingerprint, admission.IngressAdmission.Testing.permitGenerationFingerprint(&ingress_b));
+    try std.testing.expectEqual(newer_handle, (actor_b.sessions.peekChallenge(endpoint_a, outbound.nowNs(io)) orelse return error.ReplacementNotOwned).handle);
+    try std.testing.expect(actor_b.sessions.removeChallenge(newer_handle, &ingress_b));
     try std.testing.expectEqual(@as(usize, 0), ingress_b.permitCount());
+    try std.testing.expectEqual(authenticated_permit_fingerprint, admission.IngressAdmission.Testing.permitGenerationFingerprint(&ingress_b));
+    try std.testing.expectEqual(@as(usize, 0), actor_b.sessions.challengePhaseCount());
     try std.testing.expect(outbox_a.pop() == null);
 }
 
