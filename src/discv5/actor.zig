@@ -44,6 +44,7 @@ pub const Env = if (builtin.is_test) struct {
     request_results: ?*request_results.RequestResultOutbox = null,
     expected_credit: ?*admission.ExpectedCredit = null,
     retry_nonce: ?[packet.NONCE_SIZE]u8 = null,
+    handshake_preparation_attempts: ?*usize = null,
     handshake_challenge_hook: ?struct {
         context: *anyopaque,
         run: *const fn (*anyopaque, *Actor, *admission.IngressAdmission, session_book.ChallengeView) void,

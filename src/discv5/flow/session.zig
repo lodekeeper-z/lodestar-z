@@ -205,7 +205,7 @@ fn handleWhoareyou(actor: *Actor, env: Env, parsed: *const packet.DecodedPacket,
     @memcpy(challenge_data[packet.MASKING_IV_SIZE..], parsed.header_raw);
 
     var candidates = RandomSecretCandidates{ .io = env.io };
-    const ephemeral = generateEphemeral(&candidates, null) orelse return;
+    const ephemeral = generateEphemeral(&candidates, if (@import("builtin").is_test) env.handshake_preparation_attempts else null) orelse return;
     const ephemeral_pubkey = secp.compressedPubkey(&ephemeral);
     const keys = session_crypto.deriveKeys(
         &ephemeral,

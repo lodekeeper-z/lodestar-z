@@ -220,7 +220,11 @@ test "copied request handshake sent completion publishes metric and candidate on
     var harness = try ActorHarness.init(alloc, io, .{
         .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
         .local_key_pair = local_key,
-        .rate_limiter = null,
+        .rate_limiter = .{
+            .global_quota = .{ .replenish_all_every_ms = 60_000, .max_tokens = 1 },
+            .by_ip_quota = .{ .replenish_all_every_ms = 60_000, .max_tokens = 1 },
+            .by_ip_state_capacity = 1,
+        },
         .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 1, .command_capacity = 1 },
     });
     defer harness.deinit();
@@ -294,14 +298,34 @@ test "copied request handshake sent completion publishes metric and candidate on
         .enr_seq = 0,
     }, null);
     request_book.Testing.exhaustHandshakeGeneration(&harness.actor.requests);
+    try std.testing.expect(harness.ingress.admit(endpoint.addr, 0) == .ordinary);
+    var expected_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |credit| credit,
+        else => return error.MissingExpectedCredit,
+    };
+    defer expected_credit.rollback(&harness.ingress);
+    var preparation_attempts: usize = 0;
+    var exhaustion_env = harness.env();
+    exhaustion_env.expected_credit = &expected_credit;
+    exhaustion_env.handshake_preparation_attempts = &preparation_attempts;
     const packets_before = harness.recording.datagrams.items.len;
     const metrics_before = harness.actor.metrics;
-    harness.actor.handlePacket(harness.env(), exhausted_challenge, endpoint.addr);
+    const permit_fingerprint_before = admission.IngressAdmission.Testing.permitGenerationFingerprint(&harness.ingress);
+    harness.actor.handlePacket(exhaustion_env, exhausted_challenge, endpoint.addr);
+    try std.testing.expectEqual(@as(usize, 0), preparation_attempts);
     try std.testing.expectEqual(@as(usize, 0), harness.effects.count());
     try std.testing.expectEqual(packets_before, harness.recording.datagrams.items.len);
     try std.testing.expect(std.meta.eql(metrics_before, harness.actor.metrics));
     try std.testing.expect(harness.actor.requests.hasChallenge(&exhausted_nonce, endpoint.addr));
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(permit_fingerprint_before, admission.IngressAdmission.Testing.permitGenerationFingerprint(&harness.ingress));
+    expected_credit.rollback(&harness.ingress);
+    var reacquired_credit = switch (harness.ingress.admit(endpoint.addr, 0)) {
+        .expected => |credit| credit,
+        else => return error.ExpectedCreditNotRestored,
+    };
+    defer reacquired_credit.rollback(&harness.ingress);
+    reacquired_credit.rollback(&harness.ingress);
     try std.testing.expect(harness.actor.cancelRequest(harness.env(), exhausted_request));
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
 }
