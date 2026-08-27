@@ -118,7 +118,7 @@ Runtime delivers command | packet | maintenance | completion
 | Ordered Actor effect queues | request-only | 1 queue for every datagram effect |
 | Queued requests reserved simultaneously for redrain | potentially loop-driven | exactly 1 queue head per completion |
 | Explicit Runtime-stop completion | implicit ordinary failure | `runtime_stopped` |
-| DiscV5 tests after migration | 307 | 429 after request/response/retry/challenge ledger canonicalization, exact admission correlation, compact in-place handshake rollback, and runtime/auth race tracers |
+| DiscV5 tests after migration | 307 | 430 after request/response/retry/challenge ledger canonicalization, exact admission correlation, initial response-generation preflight, compact in-place handshake rollback, and runtime/auth race tracers |
 | Bounded effect size | request effect within four packet budgets | `ActorEffect` is exactly 1,400 bytes under the production compile-time `<= 1,536` ceiling; every variant is immutable packet bytes plus its semantic handle, including unified handshake at 1,392 bytes, WHOAREYOU at 1,360 bytes, and retry at 1,384 bytes. |
 
 ### Canonical completion ownership
@@ -193,4 +193,4 @@ Compact effects are forbidden from regaining admission/permit, challenge/prepara
 
 The request, response, retry, WHOAREYOU, handshake, and admission ownership stages are integrated. Runtime transport, the single 1,024-entry effect FIFO, generation-correlated canonical books, and exact expected-credit/admission authority are complete; no admission or final ownership migration stage remains.
 
-The registered layout gates retain `ActorEffect` at exactly 1,400 bytes under its production `<= 1,536` ceiling in Debug, ReleaseSafe, and ReleaseFast. The complete DiscV5 suite contains 429 tests and passes in all three modes. The repository default build completes all 54 steps, and lint completes with zero errors and ten warnings.
+The registered layout gates retain `ActorEffect` at exactly 1,400 bytes under its production `<= 1,536` ceiling in Debug, ReleaseSafe, and ReleaseFast. Initial response sends preflight response-generation availability before session refresh, packet preparation, response pruning, permit acquisition, or effect publication, while canonical publication repeats the checked successor validation. The complete DiscV5 suite contains 430 tests and passes in all three modes. The repository default build completes all 54 steps, and lint completes with zero errors and ten warnings.

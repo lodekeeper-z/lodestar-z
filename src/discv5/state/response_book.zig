@@ -127,6 +127,12 @@ pub const ResponseBook = struct {
         self.candidates.deinit(alloc);
     }
 
+    /// Ordering guard for response preparation. `beginResponse` repeats this
+    /// checked successor validation at the canonical mutation boundary.
+    pub fn preflightResponse(self: *const ResponseBook) error{GenerationExhausted}!void {
+        _ = std.math.add(u64, self.next_generation, 1) catch return error.GenerationExhausted;
+    }
+
     /// Publishes canonical `.sending_response` only after every failure check.
     /// `permit` remains caller-owned on error and is moved only on success.
     pub fn beginResponse(
@@ -347,6 +353,24 @@ pub const ResponseBook = struct {
     }
 
     pub const Testing = if (builtin.is_test) struct {
+        pub const Fingerprint = struct {
+            phase_count: usize,
+            candidate_count: usize,
+            recoverable_count: usize,
+            next_generation: u64,
+            next_handshake_generation: u64,
+        };
+
+        pub fn fingerprint(self: *const ResponseBook) Fingerprint {
+            return .{
+                .phase_count = self.phases.count(),
+                .candidate_count = self.candidates.count(),
+                .recoverable_count = self.recoverable_count,
+                .next_generation = self.next_generation,
+                .next_handshake_generation = self.next_handshake_generation,
+            };
+        }
+
         pub fn setNextGeneration(self: *ResponseBook, generation: u64) void {
             self.next_generation = generation;
         }
@@ -395,6 +419,12 @@ pub const ResponseBook = struct {
         pub fn hasPhase(self: *const ResponseBook, handle: ResponseHandle) bool {
             const current = self.phases.peekPtrRaw(handleKey(handle)) orelse return false;
             return sameHandle(current.handle, handle);
+        }
+
+        pub fn phasePermit(self: *const ResponseBook, handle: ResponseHandle) ?admission_mod.PermitHandle {
+            const current = self.phases.peekPtrRaw(handleKey(handle)) orelse return null;
+            if (!sameHandle(current.handle, handle)) return null;
+            return current.recovery.admission.handle();
         }
     } else struct {};
 };

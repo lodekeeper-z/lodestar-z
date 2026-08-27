@@ -79,6 +79,11 @@ pub fn LruCacheWithContext(comptime K: type, comptime V: type, comptime Context:
             pub fn mapCapacity(self: *const Self) usize {
                 return self.map.capacity();
             }
+
+            pub fn isMostRecentlyUsed(self: *const Self, key: *const K) bool {
+                const index = self.map.get(key.*) orelse return false;
+                return self.head == index;
+            }
         } else struct {};
 
         /// Test whether storage contains a key without changing TTL or recency.

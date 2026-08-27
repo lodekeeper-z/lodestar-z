@@ -2657,6 +2657,112 @@ test "transactional capacity-one challenge replacement send failure preserves or
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
 }
 
+test "initial response generation exhaustion preflights before every actor side effect" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xe1} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xe2} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const remote_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey);
+    const endpoint = types.Endpoint{
+        .node_id = remote_id,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 81 }, .port = 9281 } },
+    };
+    const newer_endpoint = types.Endpoint{
+        .node_id = [_]u8{0xe3} ** 32,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 82 }, .port = 9282 } },
+    };
+    const response_nonce = [_]u8{0xe4} ** packet.NONCE_SIZE;
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .response_recovery_timeout_ms = 1,
+        .rate_limiter = null,
+        .limits = .{
+            .max_active_requests = 2,
+            .max_queued_requests = 2,
+            .session_capacity = 2,
+            .response_recovery_capacity = 1,
+            .event_capacity = 2,
+            .command_capacity = 2,
+        },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    const now_ns = outbound.nowNs(io);
+    try std.testing.expect(actor.addNode(remote_id, &remote_pubkey, endpoint.addr, null, now_ns));
+    const stable = session_book.StableSession{
+        .initiator_key = [_]u8{0xe5} ** 16,
+        .recipient_key = [_]u8{0xe6} ** 16,
+    };
+    actor.sessions.put(endpoint, stable, now_ns);
+    actor.sessions.put(newer_endpoint, .{
+        .initiator_key = [_]u8{0xe7} ** 16,
+        .recipient_key = [_]u8{0xe8} ** 16,
+    }, now_ns);
+    try std.testing.expect(!session_book.SessionBook.Testing.sessionIsMostRecentlyUsed(&actor.sessions, &endpoint));
+
+    var sentinel_permit = try harness.ingress.acquire(endpoint.addr, admission.RESPONSE_RECOVERY_PACKET_BUDGET);
+    errdefer sentinel_permit.release(&harness.ingress);
+    const sentinel_permit_handle = sentinel_permit.handle();
+    const sentinel = try actor.responses.beginResponse(.{
+        .endpoint = endpoint,
+        .nonce = response_nonce,
+        .dest_pubkey = remote_pubkey,
+        .plaintext = try .init("prune sentinel"),
+    }, &sentinel_permit, now_ns - 2 * std.time.ns_per_ms);
+    try std.testing.expect(actor.responses.completeResponseSend(sentinel, .sent, &harness.ingress));
+    response_book.ResponseBook.Testing.setNextGeneration(&actor.responses, std.math.maxInt(u64));
+
+    const response_before = response_book.ResponseBook.Testing.fingerprint(&actor.responses);
+    const admission_before = admission.IngressAdmission.Testing.fingerprint(&harness.ingress);
+    const session_before = actor.sessions.metricsSnapshot();
+    const stable_before = actor.sessions.peekPtr(endpoint, now_ns).?.*;
+    const metrics_before = actor.metrics;
+    const effects_before = harness.effects.count();
+    const datagrams_before = harness.recording.datagrams.items.len;
+    var preparation_attempts: usize = 0;
+    var env = harness.env();
+    env.response_nonce = response_nonce;
+    env.response_preparation_attempts = &preparation_attempts;
+
+    try std.testing.expectError(error.GenerationExhausted, actor.sendTalkResponse(
+        env,
+        endpoint,
+        try message.ReqId.fromSlice(&.{0xe9}),
+        "exhausted",
+    ));
+
+    try std.testing.expectEqual(@as(usize, 0), preparation_attempts);
+    try std.testing.expectEqual(response_before, response_book.ResponseBook.Testing.fingerprint(&actor.responses));
+    try std.testing.expect(response_book.ResponseBook.Testing.hasPhase(&actor.responses, sentinel));
+    try std.testing.expectEqual(sentinel_permit_handle, response_book.ResponseBook.Testing.phasePermit(&actor.responses, sentinel).?);
+    try std.testing.expectEqual(admission_before, admission.IngressAdmission.Testing.fingerprint(&harness.ingress));
+    try std.testing.expectEqual(session_before, actor.sessions.metricsSnapshot());
+    try std.testing.expect(std.meta.eql(stable_before, actor.sessions.peekPtr(endpoint, now_ns).?.*));
+    try std.testing.expect(!session_book.SessionBook.Testing.sessionIsMostRecentlyUsed(&actor.sessions, &endpoint));
+    try std.testing.expect(std.meta.eql(metrics_before, actor.metrics));
+    try std.testing.expectEqual(effects_before, harness.effects.count());
+    try std.testing.expectEqual(datagrams_before, harness.recording.datagrams.items.len);
+
+    response_book.ResponseBook.Testing.setNextGeneration(&actor.responses, 100);
+    try actor.sendTalkResponse(
+        env,
+        endpoint,
+        try message.ReqId.fromSlice(&.{0xea}),
+        "positive control",
+    );
+    try std.testing.expectEqual(@as(usize, 1), preparation_attempts);
+    try std.testing.expectEqual(@as(usize, 1), harness.effects.count());
+    try std.testing.expect(!response_book.ResponseBook.Testing.hasPhase(&actor.responses, sentinel));
+    try std.testing.expectEqual(@as(usize, 1), actor.responses.phaseCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try harness.drainEffects();
+    try std.testing.expectEqual(@as(usize, 1), harness.recording.datagrams.items.len);
+    try std.testing.expectEqual(@as(u64, 1), actor.metrics.sent_message_count[metrics.MessageType.talkresp.index()]);
+}
+
 test "transactional capacity-one response replacement send failure preserves original" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;

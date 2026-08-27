@@ -391,6 +391,10 @@ pub const SessionBook = struct {
                 (@as(u64, @intCast(self.challengeCount())) << 32);
         }
 
+        pub fn sessionIsMostRecentlyUsed(self: *const SessionBook, endpoint: *const types.Endpoint) bool {
+            return SessionCache.Testing.isMostRecentlyUsed(&self.sessions, endpoint);
+        }
+
         pub fn whoareyouRateState(self: *const SessionBook, address: types.Address, now_ns: i64) ?struct { count: u32, window_start_ns: i64 } {
             const entry = self.whoareyou_rate.peek(rate_limit.IpKey.fromAddress(address), now_ns) orelse return null;
             return .{ .count = entry.count, .window_start_ns = entry.window_start_ns };

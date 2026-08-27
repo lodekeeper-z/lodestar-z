@@ -124,6 +124,7 @@ fn prepareDispatch(
 
 pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext: []const u8) !void {
     const retained_plaintext = types.RecoverablePlaintext.init(plaintext) catch return error.MessageTooLarge;
+    try actor.responses.preflightResponse();
     const now_ns = nowNs(env.io);
     const stable = actor.sessions.get(endpoint, now_ns) orelse return error.NoSession;
     const known = actor.peers.known(&endpoint.node_id) orelse return error.UnknownPeer;
@@ -132,7 +133,13 @@ pub fn sendResponse(actor: *Actor, env: Env, endpoint: types.Endpoint, plaintext
     var encoded: Encoded = undefined;
     var attempts: usize = 0;
     while (attempts < 32) : (attempts += 1) {
-        encoded = try encodeMessage(actor, env.io, &buffer, endpoint.node_id, &stable.initiator_key, plaintext);
+        if (@import("builtin").is_test) {
+            if (env.response_preparation_attempts) |counter| counter.* += 1;
+        }
+        encoded = if (@import("builtin").is_test and env.response_nonce != null)
+            try encodeMessageWithNonce(actor, env.io, &buffer, endpoint.node_id, &stable.initiator_key, plaintext, env.response_nonce.?)
+        else
+            try encodeMessage(actor, env.io, &buffer, endpoint.node_id, &stable.initiator_key, plaintext);
         actor.responses.removeExpired(endpoint.addr, &encoded.nonce, now_ns, env.ingress);
         if (!actor.requests.hasChallenge(&encoded.nonce, endpoint.addr) and
             !actor.responses.hasLive(endpoint.addr, &encoded.nonce, now_ns)) break;
