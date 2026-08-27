@@ -19,6 +19,20 @@ const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
 const RecordingSender = @import("../test_support/recording_sender.zig").RecordingSender;
 const deliverEncrypted = @import("../test_support/encrypted_delivery.zig").deliverEncrypted;
 
+fn expectSessionRequestPhase(
+    phase: *const request_book.Phase,
+    nonce: *const [packet.NONCE_SIZE]u8,
+    dest_pubkey: *const [33]u8,
+    plaintext: []const u8,
+) !void {
+    try std.testing.expect(phase.* == .awaiting_response);
+    const response = &phase.awaiting_response;
+    try std.testing.expectEqualSlices(u8, nonce, &response.recovery.nonce);
+    try std.testing.expectEqualSlices(u8, dest_pubkey, &response.recovery.dest_pubkey);
+    try std.testing.expectEqualSlices(u8, plaintext, response.recovery.plaintext.slice());
+    try std.testing.expect(response.wait == .session_request);
+}
+
 test "Actor isolates health request identity" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -872,7 +886,11 @@ test "copied retained retry completion commits actor metric once" {
     const deadline = actor.requests.get(request.key).?.deadline_ns;
     actor.maintenanceAt(harness.env(), deadline);
     const effect = harness.effects.pop() orelse return error.MissingRetryEffect;
-    const copied = effect;
+    try std.testing.expect(effect == .retry);
+    const copied = actor_mod.ActorEffect{ .retry = .{
+        .handle = effect.retry.handle,
+        .packet = try .init(effect.retry.packet.slice()),
+    } };
 
     actor.applyEffectCompletion(harness.env(), effect, .sent);
     actor.applyEffectCompletion(harness.env(), copied, .sent);
@@ -929,7 +947,13 @@ test "fresh retry generation exhaustion preflights before actor side effects" {
     }, &matching_permit, deadline - std.time.ns_per_ms);
     request_book.Testing.exhaustRetryGeneration(&actor.requests);
 
-    const before = actor.requests.get(handle.key).?.*;
+    const before = actor.requests.get(handle.key) orelse return error.MissingActiveRequest;
+    try std.testing.expect(before.response == .pong);
+    try std.testing.expect(before.phase == .awaiting_response);
+    const before_nonce = before.phase.awaiting_response.recovery.nonce;
+    const before_plaintext = try types.PacketBytes.init(before.phase.awaiting_response.recovery.plaintext.slice());
+    const before_permit = before.permitHandle();
+    const before_deadline = before.deadline_ns;
     const response_count = actor.responses.count();
     const permit_count = harness.ingress.permitCount();
     const permit_fingerprint = admission.IngressAdmission.Testing.permitGenerationFingerprint(&harness.ingress);
@@ -941,7 +965,16 @@ test "fresh retry generation exhaustion preflights before actor side effects" {
     actor.maintenanceAt(env, deadline);
 
     const after = actor.requests.get(handle.key) orelse return error.MissingActiveRequest;
-    try std.testing.expect(std.meta.eql(before, after.*));
+    try std.testing.expectEqual(handle.generation, after.generation);
+    try std.testing.expect(after.origin == .api);
+    try std.testing.expectEqual(before_permit, after.permitHandle());
+    try std.testing.expectEqual(before_deadline, after.deadline_ns);
+    try std.testing.expectEqual(@as(u32, 0), after.attempts);
+    try std.testing.expect(!after.queued_intent);
+    try std.testing.expect(after.handshake_send == null);
+    try std.testing.expect(after.retry_send == null);
+    try std.testing.expect(after.response == .pong);
+    try expectSessionRequestPhase(&after.phase, &before_nonce, &remote_pubkey, before_plaintext.slice());
     try std.testing.expectEqual(response_count, actor.responses.count());
     try std.testing.expect(response_book.ResponseBook.Testing.hasPhase(&actor.responses, matching_handle));
     try std.testing.expect(response_book.ResponseBook.Testing.hasPhase(&actor.responses, blocker_handle));
@@ -975,13 +1008,15 @@ test "retry FIFO rejection resolves exact generation and preserves retry policy"
     const actor = &harness.actor;
     const request = try actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .api);
     const initial = harness.effects.pop() orelse return error.MissingInitialEffect;
-    const filler = initial;
+    try std.testing.expect(initial == .request);
+    const filler_handle = initial.request.handle;
+    const filler_packet = try types.PacketBytes.init(initial.request.packet.slice());
     actor.applyEffectCompletion(harness.env(), initial, .sent);
     const first_deadline = actor.requests.get(request.key).?.deadline_ns;
 
     var full_storage: [1]actor_mod.ActorEffect = undefined;
     var full_effects = actor_mod.EffectQueue.init(&full_storage);
-    try full_effects.push(filler);
+    try full_effects.push(.{ .request = .{ .handle = filler_handle, .packet = filler_packet } });
     var full_env = harness.env();
     full_env.effects = &full_effects;
     actor.maintenanceAt(full_env, first_deadline);
@@ -1019,40 +1054,69 @@ test "fresh retry FIFO rejection restores prior state and releases prepared perm
     actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{11} ** 16, .recipient_key = [_]u8{12} ** 16 }, outbound.nowNs(io));
     const request = try actor_mod.Testing.sendFindNodeResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, &.{1}, .api);
     const initial = harness.effects.pop() orelse return error.MissingInitialEffect;
-    const filler = initial;
+    try std.testing.expect(initial == .request);
+    const filler_handle = initial.request.handle;
+    const filler_packet = try types.PacketBytes.init(initial.request.packet.slice());
     actor.applyEffectCompletion(harness.env(), initial, .sent);
     const active_before = actor.requests.get(request.key) orelse return error.MissingActiveRequest;
     active_before.response.nodes.total_responses = 7;
     active_before.response.nodes.responses_received = 3;
-    const phase_before = active_before.phase;
+    try std.testing.expect(active_before.phase == .awaiting_response);
+    const phase_nonce = active_before.phase.awaiting_response.recovery.nonce;
+    const phase_plaintext = try types.PacketBytes.init(active_before.phase.awaiting_response.recovery.plaintext.slice());
+    const permit_before = active_before.permitHandle();
     const deadline_before = active_before.deadline_ns;
     const sent_before = actor.metrics.sent_message_count[metrics.MessageType.findnode.index()];
 
     var full_storage: [1]actor_mod.ActorEffect = undefined;
     var full_effects = actor_mod.EffectQueue.init(&full_storage);
-    try full_effects.push(filler);
+    try full_effects.push(.{ .request = .{ .handle = filler_handle, .packet = filler_packet } });
     var full_env = harness.env();
     full_env.effects = &full_effects;
     actor.maintenanceAt(full_env, deadline_before);
 
     const restored = actor.requests.get(request.key) orelse return error.MissingActiveRequest;
-    try std.testing.expect(std.meta.eql(phase_before, restored.phase));
+    try std.testing.expectEqual(request.generation, restored.generation);
+    try std.testing.expect(restored.origin == .api);
+    try std.testing.expectEqual(permit_before, restored.permitHandle());
+    try std.testing.expect(!restored.queued_intent);
+    try std.testing.expect(restored.handshake_send == null);
+    try std.testing.expect(restored.retry_send == null);
+    try expectSessionRequestPhase(&restored.phase, &phase_nonce, &remote_pubkey, phase_plaintext.slice());
+    try std.testing.expect(restored.response == .nodes);
+    try std.testing.expectEqual(@as(usize, 0), restored.response.nodes.validated_enrs.slice().len);
     try std.testing.expectEqual(@as(u64, 7), restored.response.nodes.total_responses.?);
     try std.testing.expectEqual(@as(u64, 3), restored.response.nodes.responses_received);
+    try std.testing.expectEqual(@as(usize, 1), restored.response.nodes.requested_distances.bits.count());
+    try std.testing.expect(restored.response.nodes.requested_distances.contains(1));
     try std.testing.expectEqual(@as(u32, 1), restored.attempts);
     try std.testing.expect(restored.deadline_ns > deadline_before);
+    const deadline_after_rejection = restored.deadline_ns;
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(sent_before, actor.metrics.sent_message_count[metrics.MessageType.findnode.index()]);
     try std.testing.expectEqual(@as(usize, 1), full_effects.count());
 
     const stale = full_effects.pop() orelse return error.MissingFillerEffect;
-    try std.testing.expect(std.meta.eql(filler, stale));
+    try std.testing.expect(stale == .request);
+    try std.testing.expectEqual(filler_handle, stale.request.handle);
+    try std.testing.expectEqualSlices(u8, filler_packet.slice(), stale.request.packet.slice());
     actor.applyEffectCompletion(full_env, stale, .failed);
     const after_stale = actor.requests.get(request.key) orelse return error.MissingActiveRequest;
-    try std.testing.expect(std.meta.eql(phase_before, after_stale.phase));
+    try std.testing.expectEqual(request.generation, after_stale.generation);
+    try std.testing.expect(after_stale.origin == .api);
+    try std.testing.expectEqual(permit_before, after_stale.permitHandle());
+    try std.testing.expect(!after_stale.queued_intent);
+    try std.testing.expect(after_stale.handshake_send == null);
+    try std.testing.expect(after_stale.retry_send == null);
+    try expectSessionRequestPhase(&after_stale.phase, &phase_nonce, &remote_pubkey, phase_plaintext.slice());
+    try std.testing.expect(after_stale.response == .nodes);
+    try std.testing.expectEqual(@as(usize, 0), after_stale.response.nodes.validated_enrs.slice().len);
     try std.testing.expectEqual(@as(u64, 7), after_stale.response.nodes.total_responses.?);
     try std.testing.expectEqual(@as(u64, 3), after_stale.response.nodes.responses_received);
+    try std.testing.expectEqual(@as(usize, 1), after_stale.response.nodes.requested_distances.bits.count());
+    try std.testing.expect(after_stale.response.nodes.requested_distances.contains(1));
     try std.testing.expectEqual(@as(u32, 1), after_stale.attempts);
+    try std.testing.expectEqual(deadline_after_rejection, after_stale.deadline_ns);
     try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
     try std.testing.expectEqual(sent_before, actor.metrics.sent_message_count[metrics.MessageType.findnode.index()]);
 }
@@ -1090,7 +1154,11 @@ test "exact cancellation of prepared fresh retry releases both permits and inval
     const nonce = actor.requests.get(request.key).?.phase.awaiting_response.recovery.nonce;
     actor.maintenanceAt(env, actor.requests.get(request.key).?.deadline_ns);
     const retry = harness.effects.pop() orelse return error.MissingRetryEffect;
-    const copied = retry;
+    try std.testing.expect(retry == .retry);
+    const copied = actor_mod.ActorEffect{ .retry = .{
+        .handle = retry.retry.handle,
+        .packet = try .init(retry.retry.packet.slice()),
+    } };
     const sent_before = actor.metrics.sent_message_count[metrics.MessageType.ping.index()];
     try std.testing.expect(actor.requests.hasChallenge(&nonce, endpoint.addr));
     try std.testing.expectEqual(@as(usize, 2), harness.ingress.permitCount());
