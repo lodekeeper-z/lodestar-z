@@ -84,6 +84,7 @@ fn retryTimedOut(actor: *Actor, env: Env, key: types.RequestKey, retry: RetrySta
             };
         },
         .awaiting_response => |response| {
+            actor.requests.preflightFreshRetry(retry.handle) catch return;
             var buffer: [packet.MAX_PACKET_SIZE]u8 = undefined;
             const pending_write_key = if (response.wait.pendingKeys()) |keys| keys.initiator_key else null;
             const stable = if (pending_write_key == null) actor.sessions.get(key.endpoint, now_ns) else null;

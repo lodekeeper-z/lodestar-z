@@ -213,6 +213,14 @@ pub const IngressAdmission = struct {
         return self.live_permits;
     }
 
+    pub const Testing = if (@import("builtin").is_test) struct {
+        pub fn permitGenerationFingerprint(self: *IngressAdmission) u64 {
+            var fingerprint: u64 = 0;
+            for (self.permit_slots) |slot| fingerprint +%= slot.generation;
+            return fingerprint;
+        }
+    } else struct {};
+
     fn reserveExpected(self: *IngressAdmission, ip: IpKey) ?ExpectedCredit {
         const entry = self.expected_by_ip.getPtr(ip) orelse return null;
         const slot_index = entry.head orelse unreachable;

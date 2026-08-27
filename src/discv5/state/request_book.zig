@@ -712,6 +712,13 @@ pub const RequestBook = struct {
         return true;
     }
 
+    pub fn preflightFreshRetry(self: *const RequestBook, handle: RequestHandle) !void {
+        const request = self.active.get(handle.key) orelse return error.StaleRequest;
+        if (request != .active or request.active.generation != handle.generation) return error.StaleRequest;
+        if (request.active.phase != .awaiting_response) return error.InvalidRetryPhase;
+        _ = std.math.add(u64, self.next_retry_generation, 1) catch return error.GenerationExhausted;
+    }
+
     pub fn prepareFreshRetry(
         self: *RequestBook,
         handle: RequestHandle,

@@ -358,6 +358,10 @@ pub const ResponseBook = struct {
             self.next_generation = successor;
             _ = self.candidates.putMove(endpoint, .{ .handle = handle, .keys = keys }, self.timeout_ms, now_ns);
         }
+
+        pub fn hasCandidate(self: *const ResponseBook, endpoint: types.Endpoint) bool {
+            return self.candidates.contains(endpoint);
+        }
     } else struct {};
 };
 

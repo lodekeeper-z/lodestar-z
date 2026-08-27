@@ -1310,6 +1310,12 @@ test "discv5 actor: staged effect layouts remain exact" {
     try std.testing.expect(@hasField(RequestHandshakeSendEffect, "source"));
     try std.testing.expect(@hasField(RequestHandshakeSendEffect, "plaintext"));
     const request_layout = request_book.RequestBook.layout();
+    try std.testing.expectEqual(@as(usize, 96), request_layout.retry_handle);
+    try std.testing.expectEqual(@as(usize, 2_612), request_layout.phase);
+    try std.testing.expectEqual(@as(usize, 11_776), request_layout.stored_request);
+    const expected_request_book_size: usize = if (builtin.mode == .ReleaseFast) 240 else 264;
+    try std.testing.expectEqual(expected_request_book_size, request_layout.request_book);
+    try std.testing.expectEqual(@as(usize, 1_024), config_mod.MAX_ACTIVE_REQUESTS);
     std.debug.print(
         "RETRY_LAYOUT handle={} effect={} actor_effect={} request_book={} phase={} stored_request={} fifo={}\n",
         .{ request_layout.retry_handle, @sizeOf(RetrySendEffect), @sizeOf(ActorEffect), request_layout.request_book, request_layout.phase, request_layout.stored_request, config_mod.MAX_ACTIVE_REQUESTS },

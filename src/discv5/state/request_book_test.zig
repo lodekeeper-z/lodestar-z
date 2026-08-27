@@ -353,18 +353,31 @@ test "retry generation exhaustion precedes state permit and effect mutation" {
         .wait = .session_request,
     } }, 3, false, false);
     _ = book.completeSending(fresh) orelse return error.SendingCompletionRejected;
-    var replacement = try ingress.acquire(fresh_key.endpoint.addr, admission.requestPacketBudget(.ping));
-    try std.testing.expectError(error.GenerationExhausted, book.prepareFreshRetry(
-        fresh,
-        try .init(&.{1}),
-        .{ .response = [_]u8{51} ** 12 },
-        4,
-        &replacement,
-    ));
+    try std.testing.expectError(error.GenerationExhausted, book.preflightFreshRetry(fresh));
     try std.testing.expectEqual(@as(i64, 3), book.get(fresh_key).?.deadline_ns);
     try std.testing.expectEqual(@as(u32, 0), book.get(fresh_key).?.attempts);
-    try std.testing.expectEqual(@as(usize, 2), ingress.permitCount());
-    replacement.release(&ingress);
+    try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
+}
+
+test "fresh retry preflight validates exact active awaiting-response generation" {
+    var ingress = try admission.IngressAdmission.init(std.testing.allocator, null, limits.max_active_requests);
+    defer ingress.deinit();
+    var book = try book_mod.RequestBook.init(std.testing.allocator, limits);
+    defer book.deinit(&ingress);
+
+    const key = types.RequestKey.init(endpoint(51), try message.ReqId.fromSlice(&.{ 5, 1 }));
+    const retained = try book.beginSending(&ingress, key, .api, .pong, .{ .awaiting_whoareyou = try probe(51) }, 1, true, false);
+    _ = book.completeSending(retained) orelse return error.SendingCompletionRejected;
+    try std.testing.expectError(error.InvalidRetryPhase, book.preflightFreshRetry(retained));
+    const stale = types.RequestHandle{ .key = retained.key, .generation = retained.generation + 1 };
+    try std.testing.expectError(error.StaleRequest, book.preflightFreshRetry(stale));
+
+    const challenge = try book.challenge(&([_]u8{51} ** 12), key.endpoint.addr);
+    book.commitChallenge(challenge, .{
+        .initiator_key = [_]u8{13} ** 16,
+        .recipient_key = [_]u8{14} ** 16,
+    }, 2);
+    try book.preflightFreshRetry(retained);
     try std.testing.expectEqual(@as(usize, 1), ingress.permitCount());
 }
 

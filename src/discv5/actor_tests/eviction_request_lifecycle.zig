@@ -11,6 +11,7 @@ const metrics = @import("../metrics.zig");
 const secp = @import("../secp256k1.zig");
 const peer_store = @import("../state/peer_store.zig");
 const request_book = @import("../state/request_book.zig");
+const response_book = @import("../state/response_book.zig");
 const session_book = @import("../state/session_book.zig");
 const types = @import("../types.zig");
 const ActorHarness = @import("../test_support/actor_harness.zig").ActorHarness;
@@ -878,6 +879,60 @@ test "copied retained retry completion commits actor metric once" {
     try std.testing.expectEqual(@as(u64, 2), actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
 }
 
+test "fresh retry generation exhaustion preflights before actor side effects" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xb3} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xb4} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 73 }, .port = 9073 } },
+    };
+    const sentinel_endpoint = types.Endpoint{
+        .node_id = [_]u8{0xb5} ** 32,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 74 }, .port = 9074 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .request_timeout_ms = 1,
+        .request_retries = 1,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 2, .max_queued_requests = 2, .event_capacity = 2, .command_capacity = 2 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{7} ** 16, .recipient_key = [_]u8{8} ** 16 }, outbound.nowNs(io));
+    const handle = try actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .api);
+    try harness.drainEffects();
+    const deadline = actor.requests.get(handle.key).?.deadline_ns;
+    response_book.ResponseBook.Testing.putCandidate(&actor.responses, sentinel_endpoint, .{
+        .initiator_key = [_]u8{9} ** 16,
+        .recipient_key = [_]u8{10} ** 16,
+    }, deadline);
+    request_book.Testing.exhaustRetryGeneration(&actor.requests);
+
+    const before = actor.requests.get(handle.key).?.*;
+    const response_count = actor.responses.count();
+    const permit_count = harness.ingress.permitCount();
+    const permit_fingerprint = admission.IngressAdmission.Testing.permitGenerationFingerprint(&harness.ingress);
+    const actor_metrics = actor.metrics;
+    const effect_count = harness.effects.count();
+
+    actor.maintenanceAt(harness.env(), deadline);
+
+    const after = actor.requests.get(handle.key) orelse return error.MissingActiveRequest;
+    try std.testing.expect(std.meta.eql(before, after.*));
+    try std.testing.expectEqual(response_count, actor.responses.count());
+    try std.testing.expect(response_book.ResponseBook.Testing.hasCandidate(&actor.responses, sentinel_endpoint));
+    try std.testing.expectEqual(permit_count, harness.ingress.permitCount());
+    try std.testing.expectEqual(permit_fingerprint, admission.IngressAdmission.Testing.permitGenerationFingerprint(&harness.ingress));
+    try std.testing.expect(std.meta.eql(actor_metrics, actor.metrics));
+    try std.testing.expectEqual(effect_count, harness.effects.count());
+}
+
 test "retry FIFO rejection resolves exact generation and preserves retry policy" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
@@ -921,7 +976,69 @@ test "retry FIFO rejection resolves exact generation and preserves retry policy"
     try std.testing.expectEqual(@as(u32, 1), actor.requests.get(request.key).?.attempts);
 }
 
-test "shutdown before fresh retry completion releases prepared permit and invalidates copy" {
+test "fresh retry FIFO rejection restores prior state and releases prepared permit" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const local_key = try secp.keyPairFromSecret(&([_]u8{0xb6} ** 32));
+    const remote_key = try secp.keyPairFromSecret(&([_]u8{0xb7} ** 32));
+    const remote_pubkey = secp.compressedPubkey(&remote_key);
+    const endpoint = types.Endpoint{
+        .node_id = try enr.nodeIdFromCompressedPubkey(&remote_pubkey),
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 75 }, .port = 9075 } },
+    };
+    const cfg = config.Config{
+        .bind_addresses = .{ .ip4 = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .local_key_pair = local_key,
+        .request_timeout_ms = 1,
+        .request_retries = 1,
+        .rate_limiter = null,
+        .limits = .{ .max_active_requests = 1, .max_queued_requests = 1, .event_capacity = 2, .command_capacity = 1 },
+    };
+    var harness = try ActorHarness.init(alloc, io, cfg);
+    defer harness.deinit();
+    const actor = &harness.actor;
+    actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{11} ** 16, .recipient_key = [_]u8{12} ** 16 }, outbound.nowNs(io));
+    const request = try actor_mod.Testing.sendFindNodeResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, &.{1}, .api);
+    const initial = harness.effects.pop() orelse return error.MissingInitialEffect;
+    const filler = initial;
+    actor.applyEffectCompletion(harness.env(), initial, .sent);
+    const active_before = actor.requests.get(request.key) orelse return error.MissingActiveRequest;
+    active_before.response.nodes.total_responses = 7;
+    active_before.response.nodes.responses_received = 3;
+    const phase_before = active_before.phase;
+    const deadline_before = active_before.deadline_ns;
+    const sent_before = actor.metrics.sent_message_count[metrics.MessageType.findnode.index()];
+
+    var full_storage: [1]actor_mod.ActorEffect = undefined;
+    var full_effects = actor_mod.EffectQueue.init(&full_storage);
+    try full_effects.push(filler);
+    var full_env = harness.env();
+    full_env.effects = &full_effects;
+    actor.maintenanceAt(full_env, deadline_before);
+
+    const restored = actor.requests.get(request.key) orelse return error.MissingActiveRequest;
+    try std.testing.expect(std.meta.eql(phase_before, restored.phase));
+    try std.testing.expectEqual(@as(u64, 7), restored.response.nodes.total_responses.?);
+    try std.testing.expectEqual(@as(u64, 3), restored.response.nodes.responses_received);
+    try std.testing.expectEqual(@as(u32, 1), restored.attempts);
+    try std.testing.expect(restored.deadline_ns > deadline_before);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(sent_before, actor.metrics.sent_message_count[metrics.MessageType.findnode.index()]);
+    try std.testing.expectEqual(@as(usize, 1), full_effects.count());
+
+    const stale = full_effects.pop() orelse return error.MissingFillerEffect;
+    try std.testing.expect(std.meta.eql(filler, stale));
+    actor.applyEffectCompletion(full_env, stale, .failed);
+    const after_stale = actor.requests.get(request.key) orelse return error.MissingActiveRequest;
+    try std.testing.expect(std.meta.eql(phase_before, after_stale.phase));
+    try std.testing.expectEqual(@as(u64, 7), after_stale.response.nodes.total_responses.?);
+    try std.testing.expectEqual(@as(u64, 3), after_stale.response.nodes.responses_received);
+    try std.testing.expectEqual(@as(u32, 1), after_stale.attempts);
+    try std.testing.expectEqual(@as(usize, 1), harness.ingress.permitCount());
+    try std.testing.expectEqual(sent_before, actor.metrics.sent_message_count[metrics.MessageType.findnode.index()]);
+}
+
+test "exact cancellation of prepared fresh retry releases both permits and invalidates copy" {
     const alloc = std.testing.allocator;
     const io = std.Options.debug_io;
     const local_key = try secp.keyPairFromSecret(&([_]u8{0x4b} ** 32));
@@ -945,17 +1062,27 @@ test "shutdown before fresh retry completion releases prepared permit and invali
     actor.sessions.put(endpoint, .{ .initiator_key = [_]u8{5} ** 16, .recipient_key = [_]u8{6} ** 16 }, outbound.nowNs(io));
     const request = try actor_mod.Testing.sendPingResolvedForTest(&actor, harness.env(), endpoint, &remote_pubkey, .api);
     try harness.drainEffects();
+    const nonce = actor.requests.get(request.key).?.phase.awaiting_response.recovery.nonce;
     actor.maintenanceAt(harness.env(), actor.requests.get(request.key).?.deadline_ns);
     const retry = harness.effects.pop() orelse return error.MissingRetryEffect;
     const copied = retry;
+    const sent_before = actor.metrics.sent_message_count[metrics.MessageType.ping.index()];
+    try std.testing.expect(actor.requests.hasChallenge(&nonce, endpoint.addr));
     try std.testing.expectEqual(@as(usize, 2), harness.ingress.permitCount());
 
-    actor.finishAllRequests(harness.env());
-    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expect(actor.cancelRequest(harness.env(), request));
+    try std.testing.expect(!actor.cancelRequest(harness.env(), request));
+    try std.testing.expect(actor.requests.get(request.key) == null);
+    try std.testing.expect(!actor.requests.hasChallenge(&nonce, endpoint.addr));
+    try std.testing.expect(actor.requests.lanes.get(endpoint) == null);
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expect(harness.outbox.pop() == null);
+
     actor.applyEffectCompletion(harness.env(), copied, .sent);
-    try std.testing.expectEqual(@as(usize, 0), actor.requests.activeCount());
+    try std.testing.expect(actor.requests.get(request.key) == null);
     try std.testing.expectEqual(@as(usize, 0), harness.ingress.permitCount());
+    try std.testing.expectEqual(sent_before, actor.metrics.sent_message_count[metrics.MessageType.ping.index()]);
+    try std.testing.expect(harness.outbox.pop() == null);
 }
 
 test "AdmissionPermit survives retry and releases on final timeout" {
