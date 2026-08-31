@@ -1,0 +1,156 @@
+//! Pure wire-format and validation helpers for the discv5 handshake.
+//!
+//! These functions are stateless: they take explicit inputs and return values
+//! or errors, with no reference to the protocol instance. That keeps the
+//! `handleWhoareyou`/`handleHandshake` handlers as thin orchestration and makes
+//! the fiddly byte-layout and ENR-validation logic unit-testable on its own.
+
+const std = @import("std");
+const enr_mod = @import("../enr.zig");
+const secp = @import("../secp256k1.zig");
+
+const NodeId = enr_mod.NodeId;
+
+/// id-signature size in handshake authdata (fixed for identity scheme "v4").
+pub const sig_size: u8 = 64;
+/// Ephemeral compressed-pubkey size in handshake authdata.
+pub const eph_key_size: u8 = 33;
+/// authdata-head = src-id (32) || sig-size (1) || eph-key-size (1).
+pub const AUTHDATA_HEAD_SIZE: usize = 34;
+pub const RECORDLESS_AUTHDATA_SIZE: usize = AUTHDATA_HEAD_SIZE + @as(usize, sig_size) + @as(usize, eph_key_size);
+pub const MAX_AUTHDATA_SIZE: usize = RECORDLESS_AUTHDATA_SIZE + enr_mod.MAX_ENR_SIZE;
+
+pub const Error = error{
+    ShortAuthdata,
+    TruncatedAuthdata,
+    BadAuthdataSizes,
+    InvalidEnr,
+    EnrMissingPubkey,
+    EnrNodeIdMismatch,
+    BufferTooSmall,
+};
+
+/// Parsed view over a received HANDSHAKE packet's authdata. `id_sig` and
+/// `eph_pubkey` borrow from the caller's `authdata` buffer.
+pub const Authdata = struct {
+    src_id: NodeId,
+    id_sig: *const [sig_size]u8,
+    eph_pubkey: *const [eph_key_size]u8,
+    maybe_enr: ?[]const u8,
+};
+
+/// Validate the authdata structure and slice out its fields:
+///   authdata = src-id (32) || sig-size (1) || eph-key-size (1)
+///              || id-signature (64) || eph-pubkey (33) || [record]
+pub fn parseAuthdata(authdata: []const u8) Error!Authdata {
+    if (authdata.len < AUTHDATA_HEAD_SIZE) return Error.ShortAuthdata;
+
+    const declared_sig = authdata[32];
+    const declared_eph = authdata[33];
+    if (authdata.len < AUTHDATA_HEAD_SIZE + @as(usize, declared_sig) + @as(usize, declared_eph))
+        return Error.TruncatedAuthdata;
+    if (declared_sig != sig_size or declared_eph != eph_key_size) return Error.BadAuthdataSizes;
+
+    const sig_end = AUTHDATA_HEAD_SIZE + @as(usize, sig_size);
+    const eph_end = sig_end + @as(usize, eph_key_size);
+    return .{
+        .src_id = authdata[0..32].*,
+        .id_sig = authdata[AUTHDATA_HEAD_SIZE..][0..sig_size],
+        .eph_pubkey = authdata[sig_end..][0..eph_key_size],
+        .maybe_enr = if (authdata.len > eph_end) authdata[eph_end..] else null,
+    };
+}
+
+/// Assemble HANDSHAKE authdata into `out`, returning the populated prefix.
+/// `enr_bytes` may be empty to omit the optional record.
+pub fn buildAuthdata(
+    out: []u8,
+    local_node_id: NodeId,
+    id_sig: *const [sig_size]u8,
+    eph_pubkey: *const [eph_key_size]u8,
+    enr_bytes: []const u8,
+) Error![]u8 {
+    const sig_end = AUTHDATA_HEAD_SIZE + @as(usize, sig_size);
+    const eph_end = sig_end + @as(usize, eph_key_size);
+    const total = eph_end + enr_bytes.len;
+    if (total > out.len) return Error.BufferTooSmall;
+
+    out[0..32].* = local_node_id;
+    out[32] = sig_size;
+    out[33] = eph_key_size;
+    @memcpy(out[AUTHDATA_HEAD_SIZE..sig_end], id_sig);
+    @memcpy(out[sig_end..eph_end], eph_pubkey);
+    if (enr_bytes.len > 0) @memcpy(out[eph_end..total], enr_bytes);
+    return out[0..total];
+}
+
+/// Decode `enr_bytes`, confirm it carries a secp256k1 pubkey whose derived
+/// node-id equals `src_id`, and return that compressed pubkey.
+pub fn pubkeyFromEnr(enr_bytes: []const u8, src_id: NodeId) Error![eph_key_size]u8 {
+    const parsed = enr_mod.decode(enr_bytes) catch return Error.InvalidEnr;
+    const pk = parsed.pubkey orelse return Error.EnrMissingPubkey;
+    const node_id = enr_mod.nodeIdFromCompressedPubkey(&pk) catch return Error.InvalidEnr;
+    if (!std.mem.eql(u8, &node_id, &src_id))
+        return Error.EnrNodeIdMismatch;
+    return pk;
+}
+
+test "parseAuthdata round-trips a built authdata header" {
+    const node_id = [_]u8{0xAB} ** 32;
+    var sig = [_]u8{0} ** sig_size;
+    sig[0] = 0x11;
+    var eph = [_]u8{0} ** eph_key_size;
+    eph[0] = 0x22;
+
+    var buf: [256]u8 = undefined;
+    const built = try buildAuthdata(&buf, node_id, &sig, &eph, &[_]u8{});
+    const parsed = try parseAuthdata(built);
+
+    try std.testing.expectEqualSlices(u8, &node_id, &parsed.src_id);
+    try std.testing.expectEqualSlices(u8, &sig, parsed.id_sig);
+    try std.testing.expectEqualSlices(u8, &eph, parsed.eph_pubkey);
+    try std.testing.expect(parsed.maybe_enr == null);
+}
+
+test "parseAuthdata carries the optional trailing ENR" {
+    const node_id = [_]u8{0x01} ** 32;
+    const sig = [_]u8{0} ** sig_size;
+    const eph = [_]u8{0} ** eph_key_size;
+    const enr = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+
+    var buf: [256]u8 = undefined;
+    const built = try buildAuthdata(&buf, node_id, &sig, &eph, &enr);
+    const parsed = try parseAuthdata(built);
+    try std.testing.expectEqualSlices(u8, &enr, parsed.maybe_enr.?);
+}
+
+test "parseAuthdata rejects short and truncated authdata" {
+    try std.testing.expectError(Error.ShortAuthdata, parseAuthdata(&[_]u8{ 0x00, 0x01 }));
+
+    var head = [_]u8{0} ** AUTHDATA_HEAD_SIZE;
+    head[32] = sig_size;
+    head[33] = eph_key_size;
+    try std.testing.expectError(Error.TruncatedAuthdata, parseAuthdata(&head));
+}
+
+test "parseAuthdata rejects non-v4 sizes" {
+    // Long enough to pass the truncation check (which runs first) so the
+    // wrong-sizes check is what trips.
+    var buf = [_]u8{0} ** (AUTHDATA_HEAD_SIZE + 65 + eph_key_size);
+    buf[32] = 65; // wrong sig size
+    buf[33] = eph_key_size;
+    try std.testing.expectError(Error.BadAuthdataSizes, parseAuthdata(&buf));
+}
+
+test "pubkeyFromEnr rejects a valid ENR for a different source id" {
+    const key_pair = try secp.keyPairFromSecret(&([_]u8{0x6d} ** 32));
+    var builder = enr_mod.Builder.init(std.testing.allocator, key_pair, 1);
+    builder.ip = .{ 127, 0, 0, 1 };
+    builder.udp = 9_009;
+    const raw = try builder.encode();
+    defer std.testing.allocator.free(raw);
+    var wrong_src_id = try enr_mod.nodeIdFromCompressedPubkey(&secp.compressedPubkey(&key_pair));
+    wrong_src_id[0] ^= 1;
+
+    try std.testing.expectError(Error.EnrNodeIdMismatch, pubkeyFromEnr(raw, wrong_src_id));
+}

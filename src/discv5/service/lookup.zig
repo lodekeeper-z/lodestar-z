@@ -1,0 +1,471 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const enr = @import("../enr.zig");
+const peer_store = @import("../state/peer_store.zig");
+const types = @import("../types.zig");
+
+const NodeId = enr.NodeId;
+
+pub const MAX_RESULTS: usize = peer_store.K;
+pub const MAX_PARALLELISM: usize = peer_store.K;
+/// Bound the closest-candidate frontier while retaining contacted/in-flight
+/// entries so eviction cannot erase request history and cause repeated queries.
+pub const MAX_CANDIDATES: usize = MAX_RESULTS + MAX_PARALLELISM;
+
+pub const Config = struct {
+    num_results: usize,
+    parallelism: usize,
+    request_limit: usize,
+    timeout_ms: u64,
+};
+
+pub const PeerState = enum {
+    not_contacted,
+    waiting,
+    succeeded,
+    failed,
+};
+
+/// Lookup-owned contact metadata authenticated at the NODES boundary. The raw
+/// ENR stays inline, so retaining a returned candidate never creates separate
+/// heap ownership.
+pub const Candidate = struct {
+    node_id: NodeId,
+    pubkey: [33]u8,
+    addr: types.Address,
+    raw: enr.RawEnr,
+    seq: u64,
+
+    pub fn fromValidated(validated: *const enr.ValidatedEnr, address: types.Address) Candidate {
+        const advertised = switch (address) {
+            .ip4 => validated.parsed.udpAddress4(),
+            .ip6 => validated.parsed.udpAddress6(),
+        } orelse unreachable;
+        std.debug.assert(advertised.eql(&address));
+        return .{
+            .node_id = validated.node_id,
+            .pubkey = validated.parsed.pubkey orelse unreachable,
+            .addr = address,
+            .raw = validated.raw,
+            .seq = validated.parsed.seq,
+        };
+    }
+
+    /// Construct lookup-local metadata from an authoritative routing entry.
+    /// Nonempty routing ENRs were already authenticated at ingestion, so this
+    /// preserves the validated representation without repeating verification.
+    /// The runtime address may intentionally differ from the ENR-advertised
+    /// address until traffic proves a newly advertised endpoint.
+    pub fn fromRouteSnapshot(route: *const peer_store.RouteSnapshot) ?Candidate {
+        const raw = route.enr orelse return null;
+        return .{
+            .node_id = route.node_id,
+            .pubkey = route.pubkey,
+            .addr = route.addr,
+            .raw = raw,
+            .seq = route.enr_seq,
+        };
+    }
+};
+
+pub const Peer = struct {
+    node_id: NodeId,
+    local_candidate: ?Candidate = null,
+    peers_returned: usize = 0,
+    state: PeerState = .not_contacted,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Candidate) <= 512);
+    std.debug.assert(@sizeOf(Peer) * MAX_CANDIDATES <= 16 * 1024);
+}
+
+pub const State = enum {
+    iterating,
+    stalled,
+    finished,
+};
+
+pub const Lookup = struct {
+    target: NodeId,
+    started_at_ns: i64,
+    state: State = .iterating,
+    no_progress: usize = 0,
+    num_waiting: usize = 0,
+    deferred: bool = false,
+    reliable_result: bool = false,
+    peers: std.ArrayListUnmanaged(Peer) = .empty,
+
+    pub fn init(alloc: Allocator, target: NodeId, seeds: []const NodeId, started_at_ns: i64, config: Config) !Lookup {
+        if (config.num_results == 0 or config.num_results > MAX_RESULTS) return error.InvalidNumResults;
+        if (config.parallelism == 0 or config.parallelism > MAX_PARALLELISM) return error.InvalidParallelism;
+        if (seeds.len > MAX_RESULTS) return error.TooManySeeds;
+
+        var lookup = Lookup{
+            .target = target,
+            .started_at_ns = started_at_ns,
+        };
+        errdefer lookup.deinit(alloc);
+        try lookup.peers.ensureTotalCapacityPrecise(alloc, MAX_CANDIDATES);
+
+        for (seeds) |seed| {
+            _ = lookup.insertCandidate(&seed, null);
+        }
+        lookup.truncateCandidates(config.num_results);
+        return lookup;
+    }
+
+    pub fn deinit(self: *Lookup, alloc: Allocator) void {
+        self.peers.deinit(alloc);
+    }
+
+    pub fn isTimedOut(self: *const Lookup, now_ns: i64, config: Config) bool {
+        const elapsed_ns: i128 = @as(i128, now_ns) - @as(i128, self.started_at_ns);
+        return elapsed_ns >= @as(i128, config.timeout_ms) * std.time.ns_per_ms;
+    }
+
+    pub fn atCapacity(self: *const Lookup, config: Config) bool {
+        return switch (self.state) {
+            .iterating => self.num_waiting >= config.parallelism,
+            .stalled => self.num_waiting >= config.num_results,
+            .finished => true,
+        };
+    }
+
+    fn insertCandidate(self: *Lookup, node_id: *const NodeId, candidate: ?*const Candidate) ?usize {
+        std.debug.assert(self.peers.items.len <= MAX_CANDIDATES);
+        std.debug.assert(self.peers.capacity >= MAX_CANDIDATES);
+        if (candidate) |value| std.debug.assert(std.mem.eql(u8, node_id, &value.node_id));
+
+        for (self.peers.items) |*peer| {
+            if (!std.mem.eql(u8, &peer.node_id, node_id)) continue;
+            if (candidate) |value| {
+                // Retain the first same-sequence record deterministically. An
+                // equal or older duplicate must not replace its endpoint/raw.
+                if (peer.local_candidate == null or value.seq > peer.local_candidate.?.seq) {
+                    peer.local_candidate = value.*;
+                }
+            }
+            return null;
+        }
+
+        const candidate_distance = peer_store.xorDistance(&self.target, node_id);
+        var insert_at = self.peers.items.len;
+        for (self.peers.items, 0..) |*peer, i| {
+            const peer_distance = peer_store.xorDistance(&self.target, &peer.node_id);
+            if (std.mem.lessThan(u8, &candidate_distance, &peer_distance)) {
+                insert_at = i;
+                break;
+            }
+        }
+
+        if (self.peers.items.len == MAX_CANDIDATES) {
+            // Only an uncontacted candidate can be replaced. Keeping waiting,
+            // succeeded, and failed peers prevents a later response from
+            // reintroducing the same NodeId as fresh work.
+            var evict_index = self.peers.items.len;
+            while (evict_index > 0) {
+                evict_index -= 1;
+                if (self.peers.items[evict_index].state == .not_contacted) break;
+            } else return null;
+
+            if (insert_at > evict_index) return null;
+            _ = self.peers.orderedRemove(evict_index);
+        }
+
+        self.peers.insertAssumeCapacity(insert_at, .{
+            .node_id = node_id.*,
+            .local_candidate = if (candidate) |value| value.* else null,
+        });
+        return insert_at;
+    }
+
+    pub fn findPeerIndex(self: *const Lookup, node_id: *const NodeId) ?usize {
+        for (self.peers.items, 0..) |*peer, i| {
+            if (std.mem.eql(u8, &peer.node_id, node_id)) return i;
+        }
+        return null;
+    }
+
+    pub fn localCandidate(self: *const Lookup, node_id: *const NodeId) ?*const Candidate {
+        const index = self.findPeerIndex(node_id) orelse return null;
+        return if (self.peers.items[index].local_candidate) |*candidate| candidate else null;
+    }
+
+    pub fn truncateCandidates(self: *Lookup, max_candidates: usize) void {
+        if (self.peers.items.len <= max_candidates) return;
+        self.peers.shrinkRetainingCapacity(max_candidates);
+    }
+
+    pub fn onSuccess(self: *Lookup, node_id: *const NodeId, closer_peers: []const Candidate, config: Config) void {
+        if (self.state == .finished) return;
+
+        const peer_index = self.findPeerIndex(node_id) orelse {
+            self.maybeFinish(config);
+            return;
+        };
+
+        const accepted_peers = closer_peers[0..@min(closer_peers.len, peer_store.K)];
+        if (self.peers.items[peer_index].state == .waiting) {
+            self.num_waiting -= 1;
+            self.peers.items[peer_index].peers_returned += accepted_peers.len;
+            self.peers.items[peer_index].state = .succeeded;
+        }
+
+        const had_few_results = self.peers.items.len < config.num_results;
+        var progress = false;
+        for (accepted_peers) |*candidate| {
+            if (self.insertCandidate(&candidate.node_id, candidate)) |insert_index| {
+                if (insert_index == 0 or had_few_results) progress = true;
+            }
+        }
+
+        switch (self.state) {
+            .iterating => {
+                self.no_progress = if (progress) 0 else self.no_progress + 1;
+                if (self.no_progress >= config.parallelism) self.state = .stalled;
+            },
+            .stalled => {
+                if (progress) {
+                    self.state = .iterating;
+                    self.no_progress = 0;
+                }
+            },
+            .finished => {},
+        }
+
+        self.maybeFinish(config);
+    }
+
+    pub fn onFailure(self: *Lookup, node_id: *const NodeId, config: Config) void {
+        if (self.state == .finished) return;
+
+        if (self.findPeerIndex(node_id)) |index| {
+            if (self.peers.items[index].state == .waiting) {
+                self.num_waiting -= 1;
+                self.peers.items[index].state = .failed;
+            }
+        }
+
+        self.maybeFinish(config);
+    }
+
+    pub fn onDeferred(self: *Lookup, node_id: *const NodeId) void {
+        if (self.state == .finished) return;
+
+        if (self.findPeerIndex(node_id)) |index| {
+            if (self.peers.items[index].state == .waiting) {
+                std.debug.assert(self.num_waiting > 0);
+                self.num_waiting -= 1;
+                self.peers.items[index].state = .not_contacted;
+                self.deferred = true;
+            }
+        }
+    }
+
+    pub fn nextPeer(self: *Lookup, config: Config) ?NodeId {
+        if (self.state == .finished or self.atCapacity(config)) return null;
+
+        for (self.peers.items) |*peer| {
+            if (peer.state != .not_contacted) continue;
+            peer.state = .waiting;
+            self.num_waiting += 1;
+            return peer.node_id;
+        }
+
+        self.maybeFinish(config);
+        return null;
+    }
+
+    fn maybeFinish(self: *Lookup, config: Config) void {
+        if (self.state == .finished) return;
+
+        const limit = @min(config.num_results, self.peers.items.len);
+        var blocked = false;
+        var succeeded: usize = 0;
+        for (self.peers.items[0..limit]) |*peer| {
+            switch (peer.state) {
+                .succeeded => succeeded += 1,
+                .waiting, .not_contacted => {
+                    blocked = true;
+                    break;
+                },
+                .failed => {},
+            }
+        }
+        if (!blocked and succeeded == limit) {
+            self.state = .finished;
+            return;
+        }
+
+        if (self.num_waiting == 0) {
+            for (self.peers.items) |*peer| {
+                if (peer.state == .not_contacted) return;
+            }
+            self.state = .finished;
+        }
+    }
+};
+
+fn appendUniqueDistance(out: []u16, len: *usize, distance: u16) void {
+    for (out[0..len.*]) |existing| {
+        if (existing == distance) return;
+    }
+    out[len.*] = distance;
+    len.* += 1;
+}
+
+pub fn findNodeLogDistances(target: *const NodeId, peer_id: *const NodeId, max_distances: usize, out: []u16) usize {
+    if (max_distances == 0) return 0;
+
+    var len: usize = 0;
+    var wire_distance: u16 = 1;
+    if (peer_store.logDistance(target, peer_id)) |distance| {
+        wire_distance = @as(u16, distance) + 1;
+    }
+
+    appendUniqueDistance(out, &len, wire_distance);
+
+    var diff: u16 = 1;
+    while (len < max_distances and diff <= 256) : (diff += 1) {
+        if (wire_distance + diff <= 256) appendUniqueDistance(out, &len, wire_distance + diff);
+        if (len >= max_distances) break;
+        if (wire_distance > diff) appendUniqueDistance(out, &len, wire_distance - diff);
+    }
+    return len;
+}
+
+fn testNodeId(last_byte: u8) NodeId {
+    var node_id = [_]u8{0} ** 32;
+    node_id[31] = last_byte;
+    return node_id;
+}
+
+fn testCandidate(last_byte: u8) Candidate {
+    return .{
+        .node_id = testNodeId(last_byte),
+        .pubkey = [_]u8{0} ** 33,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, last_byte }, .port = 9000 } },
+        .raw = .{},
+        .seq = 0,
+    };
+}
+
+fn testConfig(num_results: usize, parallelism: usize) Config {
+    return .{
+        .num_results = num_results,
+        .parallelism = parallelism,
+        .request_limit = 3,
+        .timeout_ms = 60_000,
+    };
+}
+
+test "discv5 lookup: routing candidate requires stored raw ENR" {
+    const route = peer_store.RouteSnapshot{
+        .node_id = testNodeId(1),
+        .pubkey = [_]u8{0} ** 33,
+        .addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 9000 } },
+        .connected = false,
+        .relayable = false,
+        .runtime_contact_trusted = false,
+        .advertised_endpoint_trusted = false,
+        .health_request = null,
+        .next_ping_at_ns = 0,
+        .enr = null,
+        .enr_seq = 0,
+    };
+
+    try std.testing.expect(Candidate.fromRouteSnapshot(&route) == null);
+}
+
+test "discv5 lookup: initial peers are bounded to requested result count" {
+    const alloc = std.testing.allocator;
+    const config = testConfig(3, 2);
+    const target = testNodeId(0);
+    const seeds = [_]NodeId{
+        testNodeId(1),
+        testNodeId(2),
+        testNodeId(3),
+        testNodeId(4),
+        testNodeId(5),
+    };
+
+    var lookup = try Lookup.init(alloc, target, &seeds, 0, config);
+    defer lookup.deinit(alloc);
+
+    try std.testing.expectEqual(config.num_results, lookup.peers.items.len);
+    try std.testing.expectEqual(testNodeId(1), lookup.peers.items[0].node_id);
+    try std.testing.expectEqual(testNodeId(2), lookup.peers.items[1].node_id);
+    try std.testing.expectEqual(testNodeId(3), lookup.peers.items[2].node_id);
+}
+
+test "discv5 lookup: success from unknown peer does not add candidates" {
+    const alloc = std.testing.allocator;
+    const config = testConfig(3, 2);
+    const target = testNodeId(0);
+    const seeds = [_]NodeId{testNodeId(10)};
+    const returned = [_]Candidate{ testCandidate(1), testCandidate(2) };
+
+    var lookup = try Lookup.init(alloc, target, &seeds, 0, config);
+    defer lookup.deinit(alloc);
+
+    lookup.onSuccess(&testNodeId(99), &returned, config);
+
+    try std.testing.expectEqual(@as(usize, 1), lookup.peers.items.len);
+    try std.testing.expectEqual(testNodeId(10), lookup.peers.items[0].node_id);
+}
+
+test "discv5 lookup: candidate growth is bounded across responses" {
+    const alloc = std.testing.allocator;
+    const config = testConfig(3, 2);
+    const target = testNodeId(0);
+    const seeds = [_]NodeId{testNodeId(250)};
+    const first_batch = [_]Candidate{
+        testCandidate(33), testCandidate(34), testCandidate(35), testCandidate(36),
+        testCandidate(37), testCandidate(38), testCandidate(39), testCandidate(40),
+        testCandidate(41), testCandidate(42), testCandidate(43), testCandidate(44),
+        testCandidate(45), testCandidate(46), testCandidate(47), testCandidate(48),
+    };
+    const second_batch = [_]Candidate{
+        testCandidate(1),  testCandidate(2),  testCandidate(3),  testCandidate(4),
+        testCandidate(5),  testCandidate(6),  testCandidate(7),  testCandidate(8),
+        testCandidate(9),  testCandidate(10), testCandidate(11), testCandidate(12),
+        testCandidate(13), testCandidate(14), testCandidate(15), testCandidate(16),
+    };
+    const third_batch = [_]Candidate{
+        testCandidate(17), testCandidate(18), testCandidate(19), testCandidate(20),
+        testCandidate(21), testCandidate(22), testCandidate(23), testCandidate(24),
+        testCandidate(25), testCandidate(26), testCandidate(27), testCandidate(28),
+        testCandidate(29), testCandidate(30), testCandidate(31), testCandidate(32),
+    };
+
+    var lookup = try Lookup.init(alloc, target, &seeds, 0, config);
+    defer lookup.deinit(alloc);
+
+    const first_peer = lookup.nextPeer(config).?;
+    lookup.onSuccess(&first_peer, &first_batch, config);
+    const second_peer = lookup.nextPeer(config).?;
+    lookup.onSuccess(&second_peer, &second_batch, config);
+    const third_peer = lookup.nextPeer(config).?;
+    lookup.onSuccess(&third_peer, &third_batch, config);
+
+    try std.testing.expectEqual(MAX_CANDIDATES, lookup.peers.items.len);
+    const first_index = lookup.findPeerIndex(&first_peer) orelse return error.ContactedPeerEvicted;
+    try std.testing.expectEqual(PeerState.succeeded, lookup.peers.items[first_index].state);
+    for (lookup.peers.items[1..], lookup.peers.items[0 .. lookup.peers.items.len - 1]) |*peer, *previous| {
+        const peer_distance = peer_store.xorDistance(&target, &peer.node_id);
+        const previous_distance = peer_store.xorDistance(&target, &previous.node_id);
+        try std.testing.expect(!std.mem.lessThan(u8, &peer_distance, &previous_distance));
+    }
+}
+
+test "discv5 lookup: invalid bounds fail before allocation" {
+    const alloc = std.testing.allocator;
+    const target = testNodeId(0);
+    const no_seeds = [_]NodeId{};
+
+    try std.testing.expectError(error.InvalidNumResults, Lookup.init(alloc, target, &no_seeds, 0, testConfig(0, 1)));
+    try std.testing.expectError(error.InvalidNumResults, Lookup.init(alloc, target, &no_seeds, 0, testConfig(MAX_RESULTS + 1, 1)));
+    try std.testing.expectError(error.InvalidParallelism, Lookup.init(alloc, target, &no_seeds, 0, testConfig(1, 0)));
+    try std.testing.expectError(error.InvalidParallelism, Lookup.init(alloc, target, &no_seeds, 0, testConfig(1, MAX_PARALLELISM + 1)));
+}
